@@ -1,6 +1,36 @@
 # Dispatcharr Stream Sort Plugin
 
-A focused Dispatcharr plugin that **only reorders streams already assigned to channels**. It does not match streams, create channels, rename channels, or change EPG assignments.
+Dispatcharr Stream Sort now combines **stream checking, scoring, and ordering** for streams already attached to Dispatcharr channels. It does not match streams, create channels, rename channels, move channels, delete channels, or alter EPG assignments.
+
+## Built-in stream analyzer
+
+The plugin no longer requires IPTV Checker to determine whether a stream is usable. **Analyze Streams** runs its own `ffprobe`/`ffmpeg` checks and updates Dispatcharr's `stream_stats` directly.
+
+Per stream it can determine:
+
+- reachable / failed / skipped status
+- resolution and frame rate
+- video/audio codecs and pixel format
+- measured video bitrate, including a packet-based fallback for live MPEG-TS/HLS
+- audio sample rate/channels/bitrate
+- fixed-duration placeholder files
+- black video
+- frozen video
+- silent audio
+
+Rate-limited responses, audio-only streams, and known Streamlink-only hosts are **Skipped**, not Dead. Transient network failures are retried after the first pass. Black/frozen/silent checks share one FFmpeg decode pass and fail open if FFmpeg itself cannot complete the content check.
+
+The analyzer writes detailed results to:
+
+```text
+/data/dispatcharr_stream_sort_analysis.json
+```
+
+Alive results refresh Dispatcharr stream metadata. Dead results clear `stream_stats` and stamp the check time so Stream Sort's viability gate can demote them. Skipped results preserve previously-known metadata.
+
+### No channel management
+
+The checker functionality is deliberately stream-focused. There are no actions to rename, move, restore, tag, or delete channels. The only channel mutation Stream Sort performs is updating `ChannelStream.order` when **Sort Streams**, **Analyze + Sort**, or **Probe + Sort** is explicitly run.
 
 ## Sorting model
 
@@ -11,19 +41,17 @@ A focused Dispatcharr plugin that **only reorders streams already assigned to ch
    - bitrate adequacy
    - frame rate
    - M3U source preference
-   - positive/negative stream-name prefix or regex rules
+   - stream-name prefix/regex rules
    - cached delivery-throughput health
 5. Existing `ChannelStream.order` is the final stable tie-breaker.
 
-This gives operator preferences enough weight to keep, for example, a slightly higher-bitrate `ROKU` stream below a preferred `US` stream, while still allowing a *materially* better same-resolution stream to win.
-
 ## Channel scope filters
 
-Every action can optionally be restricted to a subset of Dispatcharr channels.
+Every Analyze, Dry Run, Sort, and Throughput action can be restricted by channel group and/or channel profile.
 
-### Channel group filter
+Multiple values inside one filter are ORed. If both filters are populated, the result is their intersection. Empty filters mean all channels. Unknown names/IDs are configuration errors rather than silently selecting nothing.
 
-Enter one or more exact channel-group names or IDs, separated by commas, semicolons, or new lines:
+Examples:
 
 ```text
 Local
@@ -31,26 +59,15 @@ Sports
 id:7
 ```
 
-The filter uses the channel's **effective** group, so an explicit `ChannelOverride.channel_group` takes precedence over the raw channel group.
+## M3U source scores
 
-### Channel profile filter
+When the plugin is enabled, every configured M3U account is rendered as its own numeric score field. All accounts start at `0`.
 
-Enter one or more exact channel-profile names or IDs:
+Positive values promote a source, negative values demote it. Source account IDs are used internally so renaming an M3U account does not lose its score.
 
-```text
-Stream Sort Test
-id:3
-```
+## Stream-name scoring
 
-Only memberships with `enabled=true` are included.
-
-Multiple values inside one filter are ORed. If both filters are populated, the result is their intersection. For example, `Local` plus profile `Stream Sort Test` processes only enabled profile members that are also effectively in `Local`.
-
-Empty group/profile filters mean all channels. Unknown names/IDs are treated as configuration errors instead of silently producing an empty scope.
-
-The same scope applies to **Dry Run**, **Sort Streams**, **Probe Throughput**, and **Probe + Sort**, which makes a temporary profile or a high-stream-count group such as `Local` useful for controlled testing.
-
-## Default name rules
+Current text syntax remains:
 
 ```text
 US=20
@@ -60,7 +77,7 @@ PRIME=-10
 ROKU=-20
 ```
 
-`PREFIX=score` is shorthand for a case-insensitive anchored prefix match. Advanced rules use `score::regex`, for example:
+`PREFIX=score` is shorthand for a case-insensitive anchored prefix. Advanced rules use `score::regex`:
 
 ```text
 -50::\bBACKUP\b
@@ -69,45 +86,63 @@ ROKU=-20
 
 All matching name rules are additive.
 
-## M3U source scores
+## Delivery throughput
 
-Match by exact account name or account ID:
+Throughput remains a separate delivery-health measurement from content bitrate.
+
+**Probe Throughput** measures sustained delivery and writes:
 
 ```text
-Preferred Provider=20
-id:4=10
-Backup Provider=-10
+/data/dispatcharr_stream_sort_throughput.json
 ```
 
-The first matching source rule is used.
+Known-dead streams from the built-in analyzer are skipped. Each log line includes the current stream result, overall status counts, progress, and ETA.
+
+Classification:
+
+- Healthy: >= 1.50x nominal class bitrate
+- Marginal: >= 1.10x nominal
+- Insufficient: < 1.10x nominal
+- Unknown: no usable/current measurement
+
+Cached throughput expires after the configured TTL (30 minutes by default).
 
 ## Actions
 
-- **Dry Run** — generates `/data/dispatcharr_stream_sort_report.json` without changing stream order.
-- **Sort Streams** — updates only `ChannelStream.order` using a transaction and `bulk_update()`.
-- **Probe Throughput** — starts a background job that measures sustained delivery speed and caches it in `/data/dispatcharr_stream_sort_throughput.json`. The baseline uses an 8-second window, a 6-probe/minute global start cap, a 1-second per-M3U-source delay, and each source's configured Dispatcharr User-Agent.
-- **Probe + Sort** — runs the background throughput job and applies the sort when probing completes.
+- **Analyze Streams** — run the built-in checker and refresh stream health/metadata.
+- **Dry Run** — generate `/data/dispatcharr_stream_sort_report.json` without changing order.
+- **Sort Streams** — update only `ChannelStream.order`.
+- **Analyze + Sort** — analyze first, then apply ordering using refreshed health/metadata and any current throughput cache.
+- **Probe Throughput** — refresh delivery-throughput measurements.
+- **Probe + Sort** — refresh throughput and then apply ordering.
 
-Throughput is classified relative to a coarse nominal bitrate for the stream's resolution/FPS class (separate from IPTV Checker's measured content bitrate):
+Only one analyzer/throughput background job may run at a time across Dispatcharr workers.
 
-- Healthy: >= 1.50x nominal bitrate
-- Marginal: >= 1.10x nominal bitrate
-- Insufficient: < 1.10x nominal bitrate
-- Unknown: no usable/current measurement
+## Logging
 
-Cached throughput expires after the configured TTL (30 minutes by default) and then stops affecting ranking until refreshed. Only one throughput job can run at a time across Dispatcharr workers. Failed probes are treated as unknown/retryable rather than proof that a stream is dead.
+Stream Sort uses its own `plugins.stream_sorter` logger rather than Dispatcharr's shared plugin-loader logger. This prevents another plugin's logger filter from relabeling Stream Sort output.
 
-## Installation for development testing
+Typical analyzer line:
 
-Copy the `stream_sorter` directory into Dispatcharr's plugin directory (`/data/plugins/stream_sorter`), reload plugins, enable **Dispatcharr Stream Sort**, configure rules, and start with **Dry Run**.
+```text
+INFO plugins.stream_sorter [Stream Sort] [Analyze] 77% (67/87) stream=2674 health=alive reason=ok resolution=1920x1080 fps=59.9 bitrate=4583kbps | overall alive=65 dead=1 skipped=1 pending=20 | ETA=44s
+```
 
-A good first live test is to set `Channel group filter` to `Local`, or create a temporary channel profile containing several channels with many attached streams. Review `/data/dispatcharr_stream_sort_report.json` before applying the first sort.
+Typical throughput line:
 
-## Development
+```text
+INFO plugins.stream_sorter [Stream Sort] [Throughput] 77% (67/87) stream=2674 health=healthy throughput=12.9338Mbps nominal=6000kbps | overall healthy=64 marginal=2 insufficient=0 unknown=1 pending=20 | ETA=44s
+```
+
+## Development testing
+
+Development changes land on `dev-test` first. Refresh the dev-test plugin registry in Dispatcharr, install the advertised version, and test on a restricted channel group/profile before any promotion.
 
 ```bash
 python -m pytest
 python -m compileall -q stream_sorter tests
 ```
 
-Initial development is intended for the `dev-test` branch before promotion to `dev`/release branches.
+## Attribution
+
+The health-check behavior is adapted from the MIT-licensed **Dispatcharr IPTV Checker Plugin** by Pirates IRC. See `THIRD_PARTY_NOTICES.md` for the required license notice.

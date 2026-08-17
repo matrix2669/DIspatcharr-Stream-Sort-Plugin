@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import logging
 import os
 import threading
@@ -9,14 +10,35 @@ try:
 except ImportError:  # pragma: no cover - Dispatcharr runs on Linux
     fcntl = None
 
-from .scoring import DEFAULT_PREFIX_RULES
-from .sorter import REPORT_PATH, probe_assigned_streams, resolve_channel_scope, sort_channels
+from .analyzer import ANALYSIS_CACHE_PATH, analyze_assigned_streams, probe_assigned_streams
+from .sorter import REPORT_PATH, resolve_channel_scope, sort_channels
 from .throughput import DEFAULT_CACHE_PATH
 
 
 PROBE_LOCK_PATH = "/data/dispatcharr_stream_sort_probe.lock"
 _FALLBACK_JOB_LOCK = threading.Lock()
 M3U_SOURCE_SCORE_PREFIX = "m3u_source_score_"
+LOG_PREFIX = "[Stream Sort]"
+
+
+def _load_manifest() -> dict:
+    path = os.path.join(os.path.dirname(__file__), "plugin.json")
+    with open(path, "r", encoding="utf-8") as handle:
+        return json.load(handle)
+
+
+_MANIFEST = _load_manifest()
+
+
+class _StreamSortLogger(logging.LoggerAdapter):
+    def process(self, msg, kwargs):
+        text = str(msg)
+        if not text.startswith(LOG_PREFIX):
+            text = f"{LOG_PREFIX} {text}"
+        return text, kwargs
+
+
+LOGGER = _StreamSortLogger(logging.getLogger("plugins.stream_sorter"), {})
 
 
 def _build_m3u_source_score_fields(accounts):
@@ -49,12 +71,7 @@ def _build_m3u_source_score_fields(accounts):
 
 
 def _settings_with_dynamic_source_scores(settings):
-    """Translate per-account score fields into the existing source-rule format.
-
-    The sorter continues to consume source_scores, keeping the scoring engine
-    independent from the UI. If no dynamic fields have ever been saved, the
-    legacy source_scores text setting remains valid for dev-test migration.
-    """
+    """Translate per-account score fields into the existing source-rule format."""
     normalized = dict(settings or {})
     dynamic_scores = []
     for key, value in normalized.items():
@@ -80,7 +97,7 @@ def _settings_with_dynamic_source_scores(settings):
 
 
 def _acquire_job_lock():
-    """Acquire a cross-worker lock for the long-running probe job."""
+    """Acquire one cross-worker lock for analyzer/throughput jobs."""
     if fcntl is None:
         if not _FALLBACK_JOB_LOCK.acquire(blocking=False):
             return None
@@ -121,16 +138,51 @@ def _notify(message: str) -> None:
         pass
 
 
-def _background_probe_job(settings: dict, logger, lock_handle, *, sort_after: bool) -> None:
+def _background_analyze_job(settings: dict, lock_handle, *, sort_after: bool) -> None:
     from django.db import close_old_connections
 
     close_old_connections()
     try:
-        probe_result = probe_assigned_streams(settings, logger=logger)
+        result = analyze_assigned_streams(settings, logger=LOGGER)
         if sort_after:
-            sort_result = sort_channels(settings, apply=True, logger=logger)
-            logger.info(
-                "Stream Sort background probe+sort complete: probed=%s changed_channels=%s",
+            sort_result = sort_channels(settings, apply=True, logger=LOGGER)
+            LOGGER.info(
+                "[Analyze + Sort] complete analyzed=%s changed_channels=%s",
+                result["streams_analyzed"],
+                sort_result["channels_changed"],
+            )
+            _notify(
+                f"✅ Stream Sort: analyzed {result['streams_analyzed']} streams; "
+                f"sorted {sort_result['channels_changed']} changed channels."
+            )
+        else:
+            LOGGER.info(
+                "[Analyze] background job complete analyzed=%s status_counts=%s",
+                result["streams_analyzed"],
+                result["status_counts"],
+            )
+            _notify(
+                f"✅ Stream Sort: analysis complete for {result['streams_analyzed']} streams "
+                f"({result['status_counts']})."
+            )
+    except Exception:
+        LOGGER.exception("[Analyze] background job failed")
+        _notify("❌ Stream Sort: stream analysis failed. Check Dispatcharr logs.")
+    finally:
+        close_old_connections()
+        _release_job_lock(lock_handle)
+
+
+def _background_probe_job(settings: dict, lock_handle, *, sort_after: bool) -> None:
+    from django.db import close_old_connections
+
+    close_old_connections()
+    try:
+        probe_result = probe_assigned_streams(settings, logger=LOGGER)
+        if sort_after:
+            sort_result = sort_channels(settings, apply=True, logger=LOGGER)
+            LOGGER.info(
+                "[Throughput + Sort] complete probed=%s changed_channels=%s",
                 probe_result["streams_probed"],
                 sort_result["channels_changed"],
             )
@@ -139,8 +191,8 @@ def _background_probe_job(settings: dict, logger, lock_handle, *, sort_after: bo
                 f"sorted {sort_result['channels_changed']} changed channels."
             )
         else:
-            logger.info(
-                "Stream Sort background probe complete: probed=%s status_counts=%s",
+            LOGGER.info(
+                "[Throughput] background job complete probed=%s status_counts=%s",
                 probe_result["streams_probed"],
                 probe_result["status_counts"],
             )
@@ -149,30 +201,39 @@ def _background_probe_job(settings: dict, logger, lock_handle, *, sort_after: bo
                 f"{probe_result['streams_probed']} streams."
             )
     except Exception:
-        logger.exception("Stream Sort background %s failed", "probe+sort" if sort_after else "probe")
+        LOGGER.exception("[Throughput] background job failed")
         _notify("❌ Stream Sort: background throughput job failed. Check Dispatcharr logs.")
     finally:
         close_old_connections()
         _release_job_lock(lock_handle)
 
 
-def _start_background_probe(settings: dict, logger, *, sort_after: bool) -> dict:
-    # Resolve now so invalid group/profile names fail immediately in the action
-    # response instead of several seconds later inside the background worker.
+def _start_background_job(settings: dict, *, kind: str, sort_after: bool) -> dict:
     _channel_ids, scope = resolve_channel_scope(settings)
-
     lock_handle = _acquire_job_lock()
     if lock_handle is None:
         return {
             "status": "error",
-            "message": "A Stream Sort throughput job is already running.",
+            "message": "A Stream Sort analysis/throughput job is already running.",
         }
 
+    if kind == "analyze":
+        target = _background_analyze_job
+        thread_name = "dispatcharr-stream-sort-analyze"
+        action_text = "Stream analysis"
+    elif kind == "throughput":
+        target = _background_probe_job
+        thread_name = "dispatcharr-stream-sort-throughput"
+        action_text = "Throughput probe"
+    else:  # pragma: no cover - internal misuse only
+        _release_job_lock(lock_handle)
+        raise ValueError(f"Unknown background job kind: {kind}")
+
     worker = threading.Thread(
-        target=_background_probe_job,
-        args=(dict(settings), logger, lock_handle),
+        target=target,
+        args=(dict(settings), lock_handle),
         kwargs={"sort_after": sort_after},
-        name="dispatcharr-stream-sort-probe",
+        name=thread_name,
         daemon=True,
     )
     try:
@@ -186,9 +247,9 @@ def _start_background_probe(settings: dict, logger, *, sort_after: bool) -> dict
     return {
         "status": "ok",
         "message": (
-            f"Throughput probe + sort started in the background for {scope_text}."
+            f"{action_text} + sort started in the background for {scope_text}."
             if sort_after
-            else f"Throughput probe started in the background for {scope_text}."
+            else f"{action_text} started in the background for {scope_text}."
         ),
         "background": True,
         "filters": scope,
@@ -196,176 +257,13 @@ def _start_background_probe(settings: dict, logger, *, sort_after: bool) -> dict
 
 
 class Plugin:
-    name = "Dispatcharr Stream Sort"
-    version = "0.1.1"
-    description = (
-        "Ranks streams already assigned to Dispatcharr channels using hard resolution tiers "
-        "and configurable quality, M3U source, prefix/regex, and throughput scoring."
-    )
-    author = "matrix2669"
-    help_url = "https://github.com/matrix2669/DIspatcharr-Stream-Sort-Plugin"
-
-    fields = [
-        {
-            "id": "scoring_info",
-            "label": "Sorting model",
-            "type": "info",
-            "description": (
-                "Dead/stale streams are demoted first. Resolution is a hard tier (2160p > 1440p > "
-                "1080p > 720p > 576p > 480p). Inside a resolution tier, bitrate, frame rate, "
-                "M3U source, name rules, and cached throughput are added into one score."
-            ),
-        },
-        {
-            "id": "filter_info",
-            "label": "Channel scope",
-            "type": "info",
-            "description": (
-                "Optional group/profile filters limit every action: Dry Run, Sort Streams, Probe Throughput, "
-                "and Probe + Sort. Multiple values inside one filter are ORed; when both filters are set, "
-                "a channel must match both."
-            ),
-        },
-        {
-            "id": "channel_group_filter",
-            "label": "Channel group filter",
-            "type": "text",
-            "default": "",
-            "placeholder": "Local\nSports",
-            "help_text": (
-                "Optional exact Dispatcharr channel group names or IDs, separated by commas or new lines. "
-                "Examples: Local, id:4. Empty means all groups. Uses the channel's effective group, including overrides."
-            ),
-        },
-        {
-            "id": "channel_profile_filter",
-            "label": "Channel profile filter",
-            "type": "text",
-            "default": "",
-            "placeholder": "Stream Sort Test",
-            "help_text": (
-                "Optional exact Dispatcharr channel profile names or IDs, separated by commas or new lines. "
-                "Only enabled profile memberships are included. Empty means all profiles/channels."
-            ),
-        },
-        {
-            "id": "source_scores",
-            "label": "M3U source scores",
-            "type": "text",
-            "default": "",
-            "placeholder": "Preferred Provider=20\nid:4=10\nBackup Provider=-10",
-            "help_text": (
-                "One source=score per line. Match by exact M3U account name or account ID (4=20 or id:4=20). "
-                "Positive values promote; negative values demote. First matching rule wins."
-            ),
-        },
-        {
-            "id": "name_score_rules",
-            "label": "Stream name scoring rules",
-            "type": "text",
-            "default": DEFAULT_PREFIX_RULES,
-            "help_text": (
-                "PREFIX=score creates a case-insensitive anchored prefix rule (for example US=20 or ROKU=-20). "
-                "Advanced regex uses score::regex. All matching name rules are additive."
-            ),
-        },
-        {
-            "id": "throughput_cache_ttl_minutes",
-            "label": "Throughput cache TTL (minutes)",
-            "type": "number",
-            "default": 30,
-            "help_text": "Expired throughput probes become UNKNOWN and stop affecting score.",
-        },
-        {
-            "id": "probe_duration_seconds",
-            "label": "Throughput probe duration (seconds)",
-            "type": "number",
-            "default": 8,
-        },
-        {
-            "id": "probe_timeout_seconds",
-            "label": "Throughput probe timeout (seconds)",
-            "type": "number",
-            "default": 10,
-        },
-        {
-            "id": "probe_rate_per_minute",
-            "label": "Maximum throughput probes per minute",
-            "type": "number",
-            "default": 6,
-            "help_text": "Global start-rate cap. Default mirrors Stream-Mapparr and limits provider load.",
-        },
-        {
-            "id": "probe_per_account_delay_seconds",
-            "label": "Per-source probe delay (seconds)",
-            "type": "number",
-            "default": 1,
-            "help_text": "Minimum delay before starting another probe from the same M3U source.",
-        },
-        {
-            "id": "probe_max_streams",
-            "label": "Maximum streams per probe run",
-            "type": "number",
-            "default": 0,
-            "help_text": "0 means all unique streams attached to channels inside the selected channel scope.",
-        },
-        {
-            "id": "paths_info",
-            "label": "Files",
-            "type": "info",
-            "description": f"Dry-run/apply report: {REPORT_PATH} | Throughput cache: {DEFAULT_CACHE_PATH}",
-        },
-    ]
-
-    actions = [
-        {
-            "id": "dry_run",
-            "label": "Dry Run",
-            "description": "Calculate the proposed order for the selected channel scope without changing ChannelStream.order.",
-            "button_label": "Dry Run",
-            "button_variant": "outline",
-            "button_color": "blue",
-        },
-        {
-            "id": "sort_streams",
-            "label": "Sort Streams",
-            "description": "Apply the calculated order to streams already assigned to channels inside the selected scope.",
-            "button_label": "Sort Streams",
-            "button_variant": "filled",
-            "button_color": "blue",
-            "confirm": {
-                "required": True,
-                "title": "Apply stream ordering?",
-                "message": "This changes ChannelStream.order only for the selected channel scope. It does not add or remove stream matches.",
-            },
-        },
-        {
-            "id": "probe_throughput",
-            "label": "Probe Throughput",
-            "description": "Start a background delivery-throughput probe for unique streams in the selected channel scope.",
-            "button_label": "Probe Throughput",
-            "button_variant": "outline",
-            "button_color": "orange",
-            "confirm": {
-                "required": True,
-                "title": "Probe assigned streams?",
-                "message": "This opens provider stream connections for streams attached to channels inside the selected scope."
-            },
-        },
-        {
-            "id": "probe_and_sort",
-            "label": "Probe + Sort",
-            "description": "Probe streams in the selected channel scope, then apply ordering when probing completes.",
-            "button_label": "Probe + Sort",
-            "button_variant": "filled",
-            "button_color": "orange",
-            "confirm": {
-                "required": True,
-                "title": "Probe and sort streams?",
-                "message": "This probes provider streams in the selected channel scope and then changes ChannelStream.order."
-            },
-        },
-    ]
+    name = _MANIFEST["name"]
+    version = _MANIFEST["version"]
+    description = _MANIFEST["description"]
+    author = _MANIFEST.get("author", "")
+    help_url = _MANIFEST.get("help_url", "")
+    fields = _MANIFEST.get("fields", [])
+    actions = _MANIFEST.get("actions", [])
 
     def __init__(self):
         # Dispatcharr loads fields from the live Plugin instance for enabled
@@ -411,16 +309,18 @@ class Plugin:
                     + instance_fields[source_index + 1:]
                 )
             except Exception as exc:
-                logging.getLogger("plugins.stream_sorter").warning(
-                    "Unable to build dynamic M3U source score fields: %s", exc
-                )
+                LOGGER.warning("Unable to build dynamic M3U source score fields: %s", exc)
                 self.fields = instance_fields
         else:
             self.fields = instance_fields
 
     def run(self, action: str, params: dict, context: dict):
         settings = _settings_with_dynamic_source_scores(context.get("settings") or {})
-        logger = context.get("logger") or logging.getLogger("plugins.stream_sorter")
+        # Deliberately do not use context["logger"]. Dispatcharr passes a shared
+        # apps.plugins.loader logger, and IPTV Checker currently installs a
+        # persistent [IPTV Checker] filter on that shared object. A dedicated
+        # logger keeps Stream Sort identity correct even when both plugins run.
+        logger = LOGGER
 
         try:
             if action == "dry_run":
@@ -445,16 +345,22 @@ class Plugin:
                     **{k: result[k] for k in ("channels_evaluated", "channels_changed", "rows_changed", "filters")},
                 }
 
+            if action == "analyze_streams":
+                return _start_background_job(settings, kind="analyze", sort_after=False)
+
+            if action == "analyze_and_sort":
+                return _start_background_job(settings, kind="analyze", sort_after=True)
+
             if action == "probe_throughput":
-                return _start_background_probe(settings, logger, sort_after=False)
+                return _start_background_job(settings, kind="throughput", sort_after=False)
 
             if action == "probe_and_sort":
-                return _start_background_probe(settings, logger, sort_after=True)
+                return _start_background_job(settings, kind="throughput", sort_after=True)
 
             return {"status": "error", "message": f"Unknown action: {action}"}
         except ValueError as exc:
-            logger.warning("Stream Sort configuration error: %s", exc)
+            logger.warning("Configuration error: %s", exc)
             return {"status": "error", "message": f"Configuration error: {exc}"}
         except Exception as exc:
-            logger.exception("Stream Sort action %s failed", action)
+            logger.exception("Action %s failed", action)
             return {"status": "error", "message": f"{type(exc).__name__}: {exc}"}
