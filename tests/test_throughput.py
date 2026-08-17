@@ -1,4 +1,5 @@
 import json
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from stream_sorter.throughput import _split_url_headers, load_cache, probe_stream, save_cache
@@ -19,6 +20,51 @@ def test_cache_round_trip(tmp_path: Path):
     save_cache(payload, str(path))
     assert load_cache(str(path)) == payload
     assert json.loads(path.read_text()) == payload
+
+
+def test_unified_cache_extracts_nested_throughput_and_ignores_legacy_ttl_timestamp(tmp_path: Path):
+    path = tmp_path / "analysis.json"
+    expires = datetime.now(timezone.utc) + timedelta(hours=2)
+    path.write_text(
+        json.dumps(
+            {
+                "42": {
+                    "status": "alive",
+                    "stats": {"height": 1080},
+                    "throughput": {
+                        "status": "healthy",
+                        "measured_mbps": 12.3,
+                        "tested_at": datetime.now(timezone.utc).isoformat(),
+                        "expires_at": expires.isoformat(),
+                    },
+                }
+            }
+        )
+    )
+    loaded = load_cache(str(path))
+    assert loaded["42"]["status"] == "healthy"
+    assert loaded["42"]["measured_mbps"] == 12.3
+    assert "tested_at" not in loaded["42"]
+
+
+def test_unified_cache_marks_expired_throughput_unknown(tmp_path: Path):
+    path = tmp_path / "analysis.json"
+    expired = datetime.now(timezone.utc) - timedelta(seconds=1)
+    path.write_text(
+        json.dumps(
+            {
+                "42": {
+                    "status": "alive",
+                    "throughput": {
+                        "status": "healthy",
+                        "measured_mbps": 12.3,
+                        "expires_at": expired.isoformat(),
+                    },
+                }
+            }
+        )
+    )
+    assert load_cache(str(path))["42"]["status"] == "unknown"
 
 
 def test_corrupt_cache_returns_empty(tmp_path: Path):
