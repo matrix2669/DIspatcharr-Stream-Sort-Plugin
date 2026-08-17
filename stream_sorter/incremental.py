@@ -8,7 +8,7 @@ from typing import Any, Mapping
 
 from . import analyzer
 from .scoring import estimate_nominal_throughput_kbps, parse_fps, parse_resolution
-from .throughput import DEFAULT_USER_AGENT, probe_stream
+from .throughput import DEFAULT_USER_AGENT, LEGACY_CACHE_PATH, load_cache as load_throughput_cache, probe_stream
 
 
 def _parse_datetime(value: Any) -> datetime | None:
@@ -112,14 +112,7 @@ def _item_from_stream(stream) -> dict[str, Any]:
         user_agent = account.get_user_agent_string() if account else DEFAULT_USER_AGENT
     except Exception:
         user_agent = DEFAULT_USER_AGENT
-    return {
-        "id": stream.id,
-        "name": stream.name or "",
-        "url": stream.url or "",
-        "account_id": getattr(stream, "m3u_account_id", None),
-        "account_name": getattr(account, "name", "") if account else "",
-        "user_agent": user_agent or DEFAULT_USER_AGENT,
-    }
+    return {"id": stream.id, "name": stream.name or "", "url": stream.url or "", "account_id": getattr(stream, "m3u_account_id", None), "account_name": getattr(account, "name", "") if account else "", "user_agent": user_agent or DEFAULT_USER_AGENT}
 
 
 def _merge_media_result(item, previous, result) -> dict[str, Any]:
@@ -135,13 +128,7 @@ def _merge_media_result(item, previous, result) -> dict[str, Any]:
     status = str(result.get("status") or "unknown").lower()
     if status == "dead":
         checked = result.get("tested_at") or analyzer._utc_now_iso()
-        merged["throughput"] = {
-            "status": "unknown",
-            "tested_at": checked,
-            "checked_at": checked,
-            "url_hash": merged["url_hash"],
-            "error": "throughput invalidated because media analysis marked the stream dead",
-        }
+        merged["throughput"] = {"status": "unknown", "tested_at": checked, "checked_at": checked, "url_hash": merged["url_hash"], "error": "throughput invalidated because media analysis marked the stream dead"}
     elif isinstance(previous_throughput, Mapping):
         merged["throughput"] = dict(previous_throughput)
     else:
@@ -166,6 +153,31 @@ def _merge_throughput_result(item, entry, result, *, ttl_hours: float) -> dict[s
     return merged
 
 
+def _migrate_legacy_throughput(items, cache, *, ttl_hours: float) -> int:
+    """Adopt safe legacy throughput rows into the unified cache once.
+
+    A legacy result is reused only when the analysis cache already proves that
+    the current URL hash is the same. This avoids trusting a throughput result
+    after the stream URL changed.
+    """
+    legacy = load_throughput_cache(LEGACY_CACHE_PATH)
+    migrated = 0
+    for item in items:
+        key = str(item["id"])
+        entry = cache.get(key)
+        if not isinstance(entry, Mapping) or isinstance(entry.get("throughput"), Mapping):
+            continue
+        current_hash = analyzer._stream_url_hash(str(item.get("url") or ""))
+        if str(entry.get("url_hash") or "") != current_hash:
+            continue
+        result = legacy.get(key)
+        if not isinstance(result, Mapping):
+            continue
+        cache[key] = _merge_throughput_result(item, entry, result, ttl_hours=ttl_hours)
+        migrated += 1
+    return migrated
+
+
 def analyze_assigned_streams(settings: Mapping[str, Any], *, logger, cache_path: str = analyzer.ANALYSIS_CACHE_PATH) -> dict[str, Any]:
     from apps.channels.models import ChannelStream
     from .sorter import resolve_channel_scope
@@ -186,7 +198,6 @@ def analyze_assigned_streams(settings: Mapping[str, Any], *, logger, cache_path:
     if channel_ids is not None:
         queryset = queryset.filter(channel_id__in=channel_ids)
     rows = list(queryset)
-
     items = []
     seen = set()
     for row in rows:
@@ -200,15 +211,15 @@ def analyze_assigned_streams(settings: Mapping[str, Any], *, logger, cache_path:
 
     total = len(items)
     cache = analyzer.load_analysis_cache(cache_path)
+    migrated = _migrate_legacy_throughput(items, cache, ttl_hours=throughput_ttl_hours)
+    if migrated:
+        analyzer.save_analysis_cache(cache, cache_path)
+        logger.info("[Analyze] Migrated %d matching legacy throughput measurements into the unified cache", migrated)
+
     now = datetime.now(timezone.utc)
     media_due = []
     for item in items:
-        reason = media_check_reason(
-            cache.get(str(item["id"])),
-            url_hash=analyzer._stream_url_hash(str(item.get("url") or "")),
-            ttl_hours=media_ttl_hours,
-            now=now,
-        )
+        reason = media_check_reason(cache.get(str(item["id"])), url_hash=analyzer._stream_url_hash(str(item.get("url") or "")), ttl_hours=media_ttl_hours, now=now)
         if reason:
             media_due.append((item, reason))
 
@@ -219,12 +230,7 @@ def analyze_assigned_streams(settings: Mapping[str, Any], *, logger, cache_path:
         entry = cache.get(str(item["id"])) or {}
         status = str(entry.get("status") or "unknown").lower()
         if status == "alive":
-            reason = throughput_check_reason(
-                entry,
-                url_hash=analyzer._stream_url_hash(str(item.get("url") or "")),
-                ttl_hours=throughput_ttl_hours,
-                now=now,
-            )
+            reason = throughput_check_reason(entry, url_hash=analyzer._stream_url_hash(str(item.get("url") or "")), ttl_hours=throughput_ttl_hours, now=now)
             if reason:
                 initial_throughput_due += 1
             elif int(item["id"]) not in media_due_ids:
@@ -232,11 +238,7 @@ def analyze_assigned_streams(settings: Mapping[str, Any], *, logger, cache_path:
         elif int(item["id"]) not in media_due_ids:
             initial_fully_cached += 1
 
-    logger.info(
-        "[Analyze] Starting: streams=%d media_due=%d throughput_due=%d fully_cached=%d media_ttl=%.1fh healthy_throughput_ttl=%.1fh workers=%d",
-        total, len(media_due), initial_throughput_due, initial_fully_cached, media_ttl_hours, throughput_ttl_hours, workers,
-    )
-
+    logger.info("[Analyze] Starting: streams=%d media_due=%d throughput_due=%d fully_cached=%d media_ttl=%.1fh healthy_throughput_ttl=%.1fh workers=%d", total, len(media_due), initial_throughput_due, initial_fully_cached, media_ttl_hours, throughput_ttl_hours, workers)
     if not items:
         return {"streams_analyzed": 0, "streams_selected": 0, "media_checked": 0, "throughput_checked": 0, "fully_cached": 0, "channels_selected": len({row.channel_id for row in rows}), "filters": filter_summary, "status_counts": {}, "throughput_status_counts": {}, "cache_path": cache_path}
 
@@ -272,12 +274,7 @@ def analyze_assigned_streams(settings: Mapping[str, Any], *, logger, cache_path:
                 counts[old_status] -= 1
                 counts[new_status] += 1
                 stats = result.get("stats") or {}
-                logger.info(
-                    "[Analyze Media] %d%% (%d/%d) stream=%s reason=%s health=%s resolution=%s fps=%s bitrate=%skbps | overall %s cached_media=%d pending_media=%d | ETA=%s",
-                    int(round(completed / len(media_due) * 100)), completed, len(media_due), item["id"], reason_by_id[int(item["id"])], new_status,
-                    stats.get("resolution") or "n/a", f"{float(stats['source_fps']):.1f}" if stats.get("source_fps") is not None else "n/a", f"{float(stats['video_bitrate']):.0f}" if stats.get("video_bitrate") is not None else "n/a",
-                    _overall_health_text(counts), total - len(media_due), len(media_due) - completed, analyzer._format_eta(eta),
-                )
+                logger.info("[Analyze Media] %d%% (%d/%d) stream=%s reason=%s health=%s resolution=%s fps=%s bitrate=%skbps | overall %s cached_media=%d pending_media=%d | ETA=%s", int(round(completed / len(media_due) * 100)), completed, len(media_due), item["id"], reason_by_id[int(item["id"])], new_status, stats.get("resolution") or "n/a", f"{float(stats['source_fps']):.1f}" if stats.get("source_fps") is not None else "n/a", f"{float(stats['video_bitrate']):.0f}" if stats.get("video_bitrate") is not None else "n/a", _overall_health_text(counts), total - len(media_due), len(media_due) - completed, analyzer._format_eta(eta))
 
         by_id = {int(item["id"]): item for item, _ in media_due}
         for retry_pass in range(1, retries + 1):
@@ -343,32 +340,14 @@ def analyze_assigned_streams(settings: Mapping[str, Any], *, logger, cache_path:
             eta = elapsed / completed * (len(throughput_due) - completed) if completed < len(throughput_due) else 0.0
             counts = _throughput_counts(items, cache)
             alive_count = sum(1 for candidate in items if str((cache.get(str(candidate["id"])) or {}).get("status") or "unknown").lower() == "alive")
-            logger.info(
-                "[Analyze Throughput] %d%% (%d/%d) stream=%s reason=%s throughput=%s measured=%sMbps nominal=%skbps | overall %s cached_throughput=%d pending_throughput=%d | ETA=%s",
-                int(round(completed / len(throughput_due) * 100)), completed, len(throughput_due), item["id"], reason, result.get("status") or "unknown", result.get("measured_mbps", "n/a"), nominal,
-                _overall_throughput_text(counts), max(0, alive_count - len(throughput_due)), len(throughput_due) - completed, analyzer._format_eta(eta),
-            )
+            logger.info("[Analyze Throughput] %d%% (%d/%d) stream=%s reason=%s throughput=%s measured=%sMbps nominal=%skbps | overall %s cached_throughput=%d pending_throughput=%d | ETA=%s", int(round(completed / len(throughput_due) * 100)), completed, len(throughput_due), item["id"], reason, result.get("status") or "unknown", result.get("measured_mbps", "n/a"), nominal, _overall_throughput_text(counts), max(0, alive_count - len(throughput_due)), len(throughput_due) - completed, analyzer._format_eta(eta))
 
     media_checked_ids = set(media_results)
     fully_cached = sum(1 for item in items if int(item["id"]) not in media_checked_ids and int(item["id"]) not in throughput_checked_ids)
     health_counts = _status_counts(items, cache)
     throughput_counts = _throughput_counts(items, cache)
-    logger.info(
-        "[Analyze] Complete: streams=%d media_checked=%d throughput_checked=%d fully_cached=%d | health %s | throughput %s",
-        total, len(media_checked_ids), len(throughput_checked_ids), fully_cached, _overall_health_text(health_counts), _overall_throughput_text(throughput_counts),
-    )
-    return {
-        "streams_analyzed": total,
-        "streams_selected": total,
-        "media_checked": len(media_checked_ids),
-        "throughput_checked": len(throughput_checked_ids),
-        "fully_cached": fully_cached,
-        "channels_selected": len({row.channel_id for row in rows}),
-        "filters": filter_summary,
-        "status_counts": {key: value for key, value in health_counts.items() if value > 0},
-        "throughput_status_counts": {key: value for key, value in throughput_counts.items() if value > 0},
-        "cache_path": cache_path,
-    }
+    logger.info("[Analyze] Complete: streams=%d media_checked=%d throughput_checked=%d fully_cached=%d | health %s | throughput %s", total, len(media_checked_ids), len(throughput_checked_ids), fully_cached, _overall_health_text(health_counts), _overall_throughput_text(throughput_counts))
+    return {"streams_analyzed": total, "streams_selected": total, "media_checked": len(media_checked_ids), "throughput_checked": len(throughput_checked_ids), "fully_cached": fully_cached, "channels_selected": len({row.channel_id for row in rows}), "filters": filter_summary, "status_counts": {key: value for key, value in health_counts.items() if value > 0}, "throughput_status_counts": {key: value for key, value in throughput_counts.items() if value > 0}, "cache_path": cache_path}
 
 
 def install() -> None:
