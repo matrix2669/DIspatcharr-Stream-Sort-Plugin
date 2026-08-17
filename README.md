@@ -1,5 +1,7 @@
 # Dispatcharr Stream Sort Plugin
 
+> **Development status:** initial `0.1.0` baseline is on `dev-test` for live Dispatcharr testing. It has not been promoted to `dev` or published as a tagged release.
+
 A focused Dispatcharr plugin that **only reorders streams already assigned to channels**. It does not match streams, create channels, rename channels, or change EPG assignments.
 
 ## Sorting model
