@@ -10,7 +10,7 @@ except ImportError:  # pragma: no cover - Dispatcharr runs on Linux
     fcntl = None
 
 from .scoring import DEFAULT_PREFIX_RULES
-from .sorter import REPORT_PATH, probe_assigned_streams, sort_channels
+from .sorter import REPORT_PATH, probe_assigned_streams, resolve_channel_scope, sort_channels
 from .throughput import DEFAULT_CACHE_PATH
 
 
@@ -57,7 +57,6 @@ def _notify(message: str) -> None:
             {"type": "plugin", "plugin": "Dispatcharr Stream Sort", "message": message},
         )
     except Exception:
-        # Notifications are best-effort; the action result/log remains authoritative.
         pass
 
 
@@ -97,6 +96,10 @@ def _background_probe_job(settings: dict, logger, lock_handle, *, sort_after: bo
 
 
 def _start_background_probe(settings: dict, logger, *, sort_after: bool) -> dict:
+    # Resolve now so invalid group/profile names fail immediately in the action
+    # response instead of several seconds later inside the background worker.
+    _channel_ids, scope = resolve_channel_scope(settings)
+
     lock_handle = _acquire_job_lock()
     if lock_handle is None:
         return {
@@ -117,14 +120,17 @@ def _start_background_probe(settings: dict, logger, *, sort_after: bool) -> dict
         _release_job_lock(lock_handle)
         raise
 
+    selected = scope.get("selected_channel_count")
+    scope_text = "all channels" if selected is None else f"{selected} selected channels"
     return {
         "status": "ok",
         "message": (
-            "Throughput probe + sort started in the background."
+            f"Throughput probe + sort started in the background for {scope_text}."
             if sort_after
-            else "Throughput probe started in the background."
+            else f"Throughput probe started in the background for {scope_text}."
         ),
         "background": True,
+        "filters": scope,
     }
 
 
@@ -147,6 +153,38 @@ class Plugin:
                 "Dead/stale streams are demoted first. Resolution is a hard tier (2160p > 1440p > "
                 "1080p > 720p > 576p > 480p). Inside a resolution tier, bitrate, frame rate, "
                 "M3U source, name rules, and cached throughput are added into one score."
+            ),
+        },
+        {
+            "id": "filter_info",
+            "label": "Channel scope",
+            "type": "info",
+            "description": (
+                "Optional group/profile filters limit every action: Dry Run, Sort Streams, Probe Throughput, "
+                "and Probe + Sort. Multiple values inside one filter are ORed; when both filters are set, "
+                "a channel must match both."
+            ),
+        },
+        {
+            "id": "channel_group_filter",
+            "label": "Channel group filter",
+            "type": "text",
+            "default": "",
+            "placeholder": "Local\nSports",
+            "help_text": (
+                "Optional exact Dispatcharr channel group names or IDs, separated by commas or new lines. "
+                "Examples: Local, id:4. Empty means all groups. Uses the channel's effective group, including overrides."
+            ),
+        },
+        {
+            "id": "channel_profile_filter",
+            "label": "Channel profile filter",
+            "type": "text",
+            "default": "",
+            "placeholder": "Stream Sort Test",
+            "help_text": (
+                "Optional exact Dispatcharr channel profile names or IDs, separated by commas or new lines. "
+                "Only enabled profile memberships are included. Empty means all profiles/channels."
             ),
         },
         {
@@ -208,7 +246,7 @@ class Plugin:
             "label": "Maximum streams per probe run",
             "type": "number",
             "default": 0,
-            "help_text": "0 means all unique streams assigned to channels.",
+            "help_text": "0 means all unique streams attached to channels inside the selected channel scope.",
         },
         {
             "id": "paths_info",
@@ -222,7 +260,7 @@ class Plugin:
         {
             "id": "dry_run",
             "label": "Dry Run",
-            "description": "Calculate the proposed order without changing ChannelStream.order.",
+            "description": "Calculate the proposed order for the selected channel scope without changing ChannelStream.order.",
             "button_label": "Dry Run",
             "button_variant": "outline",
             "button_color": "blue",
@@ -230,40 +268,40 @@ class Plugin:
         {
             "id": "sort_streams",
             "label": "Sort Streams",
-            "description": "Apply the calculated order to streams already assigned to each channel.",
+            "description": "Apply the calculated order to streams already assigned to channels inside the selected scope.",
             "button_label": "Sort Streams",
             "button_variant": "filled",
             "button_color": "blue",
             "confirm": {
                 "required": True,
                 "title": "Apply stream ordering?",
-                "message": "This changes ChannelStream.order only. It does not add or remove stream matches.",
+                "message": "This changes ChannelStream.order only for the selected channel scope. It does not add or remove stream matches.",
             },
         },
         {
             "id": "probe_throughput",
             "label": "Probe Throughput",
-            "description": "Start a background delivery-throughput probe for unique streams assigned to channels and cache the results.",
+            "description": "Start a background delivery-throughput probe for unique streams in the selected channel scope.",
             "button_label": "Probe Throughput",
             "button_variant": "outline",
             "button_color": "orange",
             "confirm": {
                 "required": True,
                 "title": "Probe assigned streams?",
-                "message": "This opens provider stream connections to measure delivery throughput.",
+                "message": "This opens provider stream connections for streams attached to channels inside the selected scope."
             },
         },
         {
             "id": "probe_and_sort",
             "label": "Probe + Sort",
-            "description": "Start a background throughput probe, then apply stream ordering when probing completes.",
+            "description": "Probe streams in the selected channel scope, then apply ordering when probing completes.",
             "button_label": "Probe + Sort",
             "button_variant": "filled",
             "button_color": "orange",
             "confirm": {
                 "required": True,
                 "title": "Probe and sort streams?",
-                "message": "This opens provider streams for testing and then changes ChannelStream.order."
+                "message": "This probes provider streams in the selected channel scope and then changes ChannelStream.order."
             },
         },
     ]
@@ -281,7 +319,7 @@ class Plugin:
                         f"Dry run complete: {result['channels_evaluated']} channels evaluated; "
                         f"{result['channels_changed']} would change. Report: {REPORT_PATH}"
                     ),
-                    **{k: result[k] for k in ("channels_evaluated", "channels_changed", "rows_changed")},
+                    **{k: result[k] for k in ("channels_evaluated", "channels_changed", "rows_changed", "filters")},
                 }
 
             if action == "sort_streams":
@@ -292,7 +330,7 @@ class Plugin:
                         f"Sort complete: {result['channels_changed']} channels changed; "
                         f"{result['rows_changed']} order rows updated. Report: {REPORT_PATH}"
                     ),
-                    **{k: result[k] for k in ("channels_evaluated", "channels_changed", "rows_changed")},
+                    **{k: result[k] for k in ("channels_evaluated", "channels_changed", "rows_changed", "filters")},
                 }
 
             if action == "probe_throughput":

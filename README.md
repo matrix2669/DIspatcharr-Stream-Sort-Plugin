@@ -17,6 +17,39 @@ A focused Dispatcharr plugin that **only reorders streams already assigned to ch
 
 This gives operator preferences enough weight to keep, for example, a slightly higher-bitrate `ROKU` stream below a preferred `US` stream, while still allowing a *materially* better same-resolution stream to win.
 
+## Channel scope filters
+
+Every action can optionally be restricted to a subset of Dispatcharr channels.
+
+### Channel group filter
+
+Enter one or more exact channel-group names or IDs, separated by commas, semicolons, or new lines:
+
+```text
+Local
+Sports
+id:7
+```
+
+The filter uses the channel's **effective** group, so an explicit `ChannelOverride.channel_group` takes precedence over the raw channel group.
+
+### Channel profile filter
+
+Enter one or more exact channel-profile names or IDs:
+
+```text
+Stream Sort Test
+id:3
+```
+
+Only memberships with `enabled=true` are included.
+
+Multiple values inside one filter are ORed. If both filters are populated, the result is their intersection. For example, `Local` plus profile `Stream Sort Test` processes only enabled profile members that are also effectively in `Local`.
+
+Empty group/profile filters mean all channels. Unknown names/IDs are treated as configuration errors instead of silently producing an empty scope.
+
+The same scope applies to **Dry Run**, **Sort Streams**, **Probe Throughput**, and **Probe + Sort**, which makes a temporary profile or a high-stream-count group such as `Local` useful for controlled testing.
+
 ## Default name rules
 
 ```text
@@ -68,7 +101,7 @@ Cached throughput expires after the configured TTL (30 minutes by default) and t
 
 Copy the `stream_sorter` directory into Dispatcharr's plugin directory (`/data/plugins/stream_sorter`), reload plugins, enable **Dispatcharr Stream Sort**, configure rules, and start with **Dry Run**.
 
-Review `/data/dispatcharr_stream_sort_report.json` before applying the first sort.
+A good first live test is to set `Channel group filter` to `Local`, or create a temporary channel profile containing several channels with many attached streams. Review `/data/dispatcharr_stream_sort_report.json` before applying the first sort.
 
 ## Development
 

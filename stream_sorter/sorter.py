@@ -2,10 +2,11 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import tempfile
 import time
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, Iterable, Mapping
 
 from .scoring import (
     StreamCandidate,
@@ -44,7 +45,163 @@ def _as_int(value: Any, default: int) -> int:
         return default
 
 
-def _settings(settings: dict[str, Any]) -> dict[str, Any]:
+def _split_filter_values(value: Any) -> list[str]:
+    """Return normalized comma/newline/semicolon-separated filter tokens."""
+    if value is None:
+        return []
+    if isinstance(value, (list, tuple, set)):
+        parts: list[str] = []
+        for item in value:
+            parts.extend(re.split(r"[,;\n]+", str(item)))
+    else:
+        parts = re.split(r"[,;\n]+", str(value))
+
+    result: list[str] = []
+    seen: set[str] = set()
+    for part in parts:
+        token = part.strip()
+        if not token:
+            continue
+        dedupe_key = token.casefold()
+        if dedupe_key in seen:
+            continue
+        seen.add(dedupe_key)
+        result.append(token)
+    return result
+
+
+def _resolve_filter_tokens(
+    tokens: Iterable[str],
+    records: Iterable[Mapping[str, Any]],
+    *,
+    label: str,
+) -> tuple[set[int], list[dict[str, Any]]]:
+    """Resolve filter tokens against rows containing ``id`` and ``name``.
+
+    Supported syntax:
+      - Local           -> case-insensitive exact name
+      - 7 / id:7       -> database ID
+      - name:123       -> exact name even when the name is numeric
+    """
+    rows = [dict(record) for record in records]
+    by_id = {int(row["id"]): row for row in rows}
+    by_name = {str(row.get("name") or "").strip().casefold(): row for row in rows}
+
+    resolved_ids: set[int] = set()
+    resolved: list[dict[str, Any]] = []
+    unresolved: list[str] = []
+    seen_ids: set[int] = set()
+
+    for raw_token in tokens:
+        token = str(raw_token).strip()
+        token_cf = token.casefold()
+        row = None
+
+        if token_cf.startswith("name:"):
+            row = by_name.get(token[5:].strip().casefold())
+        else:
+            id_text = token[3:].strip() if token_cf.startswith("id:") else token
+            if id_text.isdigit():
+                row = by_id.get(int(id_text))
+            else:
+                row = by_name.get(token_cf)
+
+        if row is None:
+            unresolved.append(token)
+            continue
+
+        row_id = int(row["id"])
+        resolved_ids.add(row_id)
+        if row_id not in seen_ids:
+            seen_ids.add(row_id)
+            resolved.append({"id": row_id, "name": str(row.get("name") or "")})
+
+    if unresolved:
+        raise ValueError(
+            f"Unknown {label} filter value(s): {', '.join(unresolved)}. "
+            "Use an exact name, numeric ID, id:<ID>, or name:<NAME>."
+        )
+
+    return resolved_ids, resolved
+
+
+def resolve_channel_scope(settings: Mapping[str, Any]) -> tuple[set[int] | None, dict[str, Any]]:
+    """Resolve optional channel group/profile filters to a channel-ID scope.
+
+    Multiple values within one filter are ORed. If both group and profile
+    filters are configured, their channel sets are intersected. Channel group
+    matching honors an explicit ChannelOverride.channel_group when present.
+    """
+    from django.db.models import Q
+    from apps.channels.models import (
+        Channel,
+        ChannelGroup,
+        ChannelProfile,
+        ChannelProfileMembership,
+    )
+
+    group_tokens = _split_filter_values(settings.get("channel_group_filter", ""))
+    profile_tokens = _split_filter_values(settings.get("channel_profile_filter", ""))
+
+    summary: dict[str, Any] = {
+        "channel_groups": [],
+        "channel_profiles": [],
+        "match_mode": "all_channels",
+        "selected_channel_count": None,
+    }
+    allowed_channel_ids: set[int] | None = None
+
+    if group_tokens:
+        group_ids, resolved_groups = _resolve_filter_tokens(
+            group_tokens,
+            ChannelGroup.objects.values("id", "name"),
+            label="channel group",
+        )
+        # Effective group = override group when explicitly set; otherwise raw
+        # Channel.channel_group. A missing override row also satisfies the
+        # override__channel_group_id__isnull branch via the LEFT OUTER JOIN.
+        group_channel_ids = set(
+            Channel.objects.filter(
+                Q(override__channel_group_id__in=group_ids)
+                | Q(
+                    override__channel_group_id__isnull=True,
+                    channel_group_id__in=group_ids,
+                )
+            ).values_list("id", flat=True)
+        )
+        allowed_channel_ids = group_channel_ids
+        summary["channel_groups"] = resolved_groups
+        summary["match_mode"] = "channel_group"
+
+    if profile_tokens:
+        profile_ids, resolved_profiles = _resolve_filter_tokens(
+            profile_tokens,
+            ChannelProfile.objects.values("id", "name"),
+            label="channel profile",
+        )
+        profile_channel_ids = set(
+            ChannelProfileMembership.objects.filter(
+                channel_profile_id__in=profile_ids,
+                enabled=True,
+            ).values_list("channel_id", flat=True)
+        )
+        allowed_channel_ids = (
+            profile_channel_ids
+            if allowed_channel_ids is None
+            else allowed_channel_ids & profile_channel_ids
+        )
+        summary["channel_profiles"] = resolved_profiles
+        summary["match_mode"] = (
+            "intersection" if group_tokens else "channel_profile"
+        )
+
+    if allowed_channel_ids is not None:
+        summary["selected_channel_count"] = len(allowed_channel_ids)
+
+    return allowed_channel_ids, summary
+
+
+def _settings(settings: Mapping[str, Any]) -> dict[str, Any]:
     return {
         "source_rules": parse_source_rules(settings.get("source_scores", "")),
         "name_rules": parse_name_rules(settings.get("name_score_rules", "")),
@@ -57,13 +214,19 @@ def _settings(settings: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _load_channel_candidates(throughput_cache: dict[str, dict[str, Any]]):
+def _load_channel_candidates(
+    throughput_cache: dict[str, dict[str, Any]],
+    channel_ids: set[int] | None = None,
+):
     from apps.channels.models import ChannelStream
 
-    rows = list(
-        ChannelStream.objects.select_related("channel", "stream", "stream__m3u_account")
-        .order_by("channel_id", "order", "id")
-    )
+    queryset = ChannelStream.objects.select_related(
+        "channel", "stream", "stream__m3u_account"
+    ).order_by("channel_id", "order", "id")
+    if channel_ids is not None:
+        queryset = queryset.filter(channel_id__in=channel_ids)
+    rows = list(queryset)
+
     grouped: dict[int, list[Any]] = {}
     for row in rows:
         grouped.setdefault(row.channel_id, []).append(row)
@@ -151,8 +314,9 @@ def sort_channels(
     from apps.channels.models import ChannelStream
 
     cfg = _settings(settings)
+    channel_ids, filter_summary = resolve_channel_scope(settings)
     cache = load_cache(cache_path)
-    channels = _load_channel_candidates(cache)
+    channels = _load_channel_candidates(cache, channel_ids)
 
     changed_channels = 0
     changed_rows = 0
@@ -206,6 +370,7 @@ def sort_channels(
     payload = {
         "generated_at": now.isoformat(),
         "mode": "apply" if apply else "dry_run",
+        "filters": filter_summary,
         "channels_evaluated": len(channel_reports),
         "channels_changed": changed_channels,
         "rows_changed": changed_rows,
@@ -215,8 +380,10 @@ def sort_channels(
     _write_json_atomic(payload, report_path)
 
     logger.info(
-        "Stream Sort %s: evaluated=%s changed_channels=%s changed_rows=%s report=%s",
+        "Stream Sort %s: filter=%s selected=%s evaluated=%s changed_channels=%s changed_rows=%s report=%s",
         "apply" if apply else "dry-run",
+        filter_summary["match_mode"],
+        filter_summary["selected_channel_count"],
         len(channel_reports),
         changed_channels,
         changed_rows,
@@ -233,16 +400,21 @@ def probe_assigned_streams(
 ) -> dict[str, Any]:
     from apps.channels.models import ChannelStream
 
+    channel_ids, filter_summary = resolve_channel_scope(settings)
     duration = max(1.0, _as_float(settings.get("probe_duration_seconds"), 8.0))
     timeout = max(duration + 2.0, _as_float(settings.get("probe_timeout_seconds"), 10.0))
     rate_per_minute = max(1, _as_int(settings.get("probe_rate_per_minute"), 6))
     per_account_delay = max(0.0, _as_float(settings.get("probe_per_account_delay_seconds"), 1.0))
     max_streams = max(0, _as_int(settings.get("probe_max_streams"), 0))
 
-    rows = list(
-        ChannelStream.objects.select_related("stream", "stream__m3u_account", "stream__m3u_account__user_agent")
-        .order_by("channel_id", "order", "id")
-    )
+    queryset = ChannelStream.objects.select_related(
+        "stream", "stream__m3u_account", "stream__m3u_account__user_agent"
+    ).order_by("channel_id", "order", "id")
+    if channel_ids is not None:
+        queryset = queryset.filter(channel_id__in=channel_ids)
+    rows = list(queryset)
+
+    selected_channel_count = len({row.channel_id for row in rows})
     seen: set[int] = set()
     streams: list[dict[str, Any]] = []
     for row in rows:
@@ -250,7 +422,7 @@ def probe_assigned_streams(
         if stream.id in seen:
             continue
         seen.add(stream.id)
-        width, height = parse_resolution(stream.stream_stats)
+        _width, height = parse_resolution(stream.stream_stats)
         fps = parse_fps(stream.stream_stats)
         account = stream.m3u_account
         try:
@@ -302,7 +474,6 @@ def probe_assigned_streams(
             result.get("measured_mbps", "n/a"),
             item["nominal_video_kbps"],
         )
-        # Persist incrementally so partial work survives an interrupted run.
         save_cache(cache, cache_path)
 
     counts: dict[str, int] = {}
@@ -312,6 +483,8 @@ def probe_assigned_streams(
 
     return {
         "streams_probed": len(results),
+        "channels_selected": selected_channel_count,
+        "filters": filter_summary,
         "status_counts": counts,
         "cache_path": cache_path,
     }
