@@ -1,73 +1,79 @@
 # Dispatcharr Stream Sort Plugin
 
-Dispatcharr Stream Sort now combines **stream checking, scoring, and ordering** for streams already attached to Dispatcharr channels. It does not match streams, create channels, rename channels, move channels, delete channels, or alter EPG assignments.
+Dispatcharr Stream Sort analyzes the streams already attached to Dispatcharr channels, scores them, and updates only `ChannelStream.order` when sorting is explicitly requested. It does not match/create/delete streams or channels, rename channels, or change EPG/group assignments.
 
-## Built-in stream analyzer
+## Built-in incremental checker
 
-The plugin no longer requires IPTV Checker to determine whether a stream is usable. **Analyze Streams** runs its own `ffprobe`/`ffmpeg` checks and updates Dispatcharr's `stream_stats` directly.
+Stream Sort no longer requires IPTV Checker for sorting data. `Analyze Streams` owns the health/media and delivery measurements used by the sorter:
 
-Per stream it can determine:
+- reachability and Alive / Dead / Skipped classification
+- resolution, FPS, codecs, pixel format, audio details, and measured video bitrate
+- fixed-duration placeholder detection
+- black-video, frozen-video, and silent-audio detection
+- measured delivery throughput and throughput health
+- rate-limit-aware retry behavior
 
-- reachable / failed / skipped status
-- resolution and frame rate
-- video/audio codecs and pixel format
-- measured video bitrate, including a packet-based fallback for live MPEG-TS/HLS
-- audio sample rate/channels/bitrate
-- fixed-duration placeholder files
-- black video
-- frozen video
-- silent audio
+The analyzer is cache-aware rather than rechecking every stream on every run.
 
-Rate-limited responses, audio-only streams, and known Streamlink-only hosts are **Skipped**, not Dead. Transient network failures are retried after the first pass. Black/frozen/silent checks share one FFmpeg decode pass and fail open if FFmpeg itself cannot complete the content check.
+Default refresh policy:
 
-The analyzer writes detailed results to:
+- **Stream/media data TTL:** 12 hours
+- **Healthy throughput TTL:** 6 hours
+- **Dead or skipped media:** recheck every Analyze run
+- **Marginal / insufficient / unknown throughput:** recheck every Analyze run
+- **Changed stream URL:** invalidate and recheck both media and throughput
+- **Fresh alive media + fresh healthy throughput:** no provider connection is opened
+
+The two TTLs are independently configurable. A value of `0` forces that component to be rechecked on every Analyze run.
+
+Analysis and throughput now share one cache:
 
 ```text
 /data/dispatcharr_stream_sort_analysis.json
 ```
 
-Alive results refresh Dispatcharr stream metadata. Dead results clear `stream_stats` and stamp the check time so Stream Sort's viability gate can demote them. Skipped results preserve previously-known metadata.
+The previous `/data/dispatcharr_stream_sort_throughput.json` file is read as a migration fallback but is no longer the primary cache.
 
-### No channel management
+## Health ordering
 
-The checker functionality is deliberately stream-focused. There are no actions to rename, move, restore, tag, or delete channels. The only channel mutation Stream Sort performs is updating `ChannelStream.order` when **Sort Streams**, **Analyze + Sort**, or **Probe + Sort** is explicitly run.
+Viability is the first hard ordering gate:
 
-## Sorting model
+1. usable streams
+2. content-starved streams
+3. unusable streams such as known-dead, stale, inactive-source, or missing-URL streams
 
-1. Unusable streams are demoted first: stale, inactive-source, missing-URL, and known-dead streams.
-2. Extremely content-starved streams (video bitrate below 10% of the target for their reported resolution) are demoted below normal usable streams.
-3. Resolution is a hard tier: 2160p > 1440p > 1080p > 720p > 576p > 480p > lower/unknown.
-4. Streams inside the same resolution tier use an additive score:
-   - bitrate adequacy
-   - frame rate
-   - M3U source preference
-   - stream-name prefix/regex rules
-   - cached delivery-throughput health
-5. Existing `ChannelStream.order` is the final stable tie-breaker.
+That means a known-dead 2160p/1080p stream is placed below **all usable streams in the same channel**, not merely below usable streams of its own resolution.
 
-## Channel scope filters
-
-Every Analyze, Dry Run, Sort, and Throughput action can be restricted by channel group and/or channel profile.
-
-Multiple values inside one filter are ORed. If both filters are populated, the result is their intersection. Empty filters mean all channels. Unknown names/IDs are configuration errors rather than silently selecting nothing.
-
-Examples:
+Among streams with the same viability, resolution remains a hard tier:
 
 ```text
-Local
-Sports
-id:7
+2160 > 1440 > 1080 > 720 > 576 > 480 > 360 > 240/unknown
 ```
+
+Inside the same viability/resolution tier, the additive score uses bitrate adequacy, FPS, M3U source preference, stream-name rules, and current delivery-throughput health. Existing `ChannelStream.order` is the final stable tie-breaker.
+
+## Throughput scoring
+
+Throughput is delivery capacity, not the stream's encoded video bitrate.
+
+- Healthy: >= 1.50x nominal delivery requirement: **+15**
+- Marginal: >= 1.10x nominal: **+5**
+- Insufficient: < 1.10x nominal: **-30**
+- Unknown: **0**
+
+Healthy throughput is cached for the configured TTL. Any non-healthy throughput result is eligible for another probe on the next Analyze run.
+
+## Channel scope
+
+Every action can be restricted by channel group and/or channel profile. Multiple values within a filter are ORed. If both group and profile filters are set, a channel must match both. Group matching uses the channel's effective group, including overrides; profile membership must be enabled.
 
 ## M3U source scores
 
-When the plugin is enabled, every configured M3U account is rendered as its own numeric score field. All accounts start at `0`.
+When enabled, the plugin dynamically lists every configured M3U account with a numeric score box. All sources default to `0`. Positive values promote a source and negative values demote it.
 
-Positive values promote a source, negative values demote it. Source account IDs are used internally so renaming an M3U account does not lose its score.
+## Name rules
 
-## Stream-name scoring
-
-Current text syntax remains:
+Prefix shorthand:
 
 ```text
 US=20
@@ -77,72 +83,33 @@ PRIME=-10
 ROKU=-20
 ```
 
-`PREFIX=score` is shorthand for a case-insensitive anchored prefix. Advanced rules use `score::regex`:
+Advanced regex:
 
 ```text
+15::^USA?\s*[|:_-]
 -50::\bBACKUP\b
-10::^USA?\s*[|:_-]
 ```
 
 All matching name rules are additive.
 
-## Delivery throughput
-
-Throughput remains a separate delivery-health measurement from content bitrate.
-
-**Probe Throughput** measures sustained delivery and writes:
-
-```text
-/data/dispatcharr_stream_sort_throughput.json
-```
-
-Known-dead streams from the built-in analyzer are skipped. Each log line includes the current stream result, overall status counts, progress, and ETA.
-
-Classification:
-
-- Healthy: >= 1.50x nominal class bitrate
-- Marginal: >= 1.10x nominal
-- Insufficient: < 1.10x nominal
-- Unknown: no usable/current measurement
-
-Cached throughput expires after the configured TTL (30 minutes by default).
-
 ## Actions
 
-- **Analyze Streams** — run the built-in checker and refresh stream health/metadata.
-- **Dry Run** — generate `/data/dispatcharr_stream_sort_report.json` without changing order.
-- **Sort Streams** — update only `ChannelStream.order`.
-- **Analyze + Sort** — analyze first, then apply ordering using refreshed health/metadata and any current throughput cache.
-- **Probe Throughput** — refresh delivery-throughput measurements.
-- **Probe + Sort** — refresh throughput and then apply ordering.
+- **Analyze Streams** — incrementally refresh only media/health or throughput components that require checking.
+- **Dry Run** — write `/data/dispatcharr_stream_sort_report.json` without changing order.
+- **Sort Streams** — apply the calculated `ChannelStream.order` only.
+- **Analyze + Sort** — incrementally analyze, then apply the refreshed ordering.
 
-Only one analyzer/throughput background job may run at a time across Dispatcharr workers.
+Separate `Probe Throughput` actions are no longer shown because throughput is part of Analyze Streams.
 
 ## Logging
 
-Stream Sort uses its own `plugins.stream_sorter` logger rather than Dispatcharr's shared plugin-loader logger. This prevents another plugin's logger filter from relabeling Stream Sort output.
+The plugin owns the `plugins.stream_sorter` logger and prefixes its messages with `[Stream Sort]`. Incremental runs report media checks, throughput checks, cached counts, pending work, health totals, throughput totals, and ETA.
 
-Typical analyzer line:
-
-```text
-INFO plugins.stream_sorter [Stream Sort] [Analyze] 77% (67/87) stream=2674 health=alive reason=ok resolution=1920x1080 fps=59.9 bitrate=4583kbps | overall alive=65 dead=1 skipped=1 pending=20 | ETA=44s
-```
-
-Typical throughput line:
-
-```text
-INFO plugins.stream_sorter [Stream Sort] [Throughput] 77% (67/87) stream=2674 health=healthy throughput=12.9338Mbps nominal=6000kbps | overall healthy=64 marginal=2 insufficient=0 unknown=1 pending=20 | ETA=44s
-```
-
-## Development testing
-
-Development changes land on `dev-test` first. Refresh the dev-test plugin registry in Dispatcharr, install the advertised version, and test on a restricted channel group/profile before any promotion.
+## Development
 
 ```bash
 python -m pytest
 python -m compileall -q stream_sorter tests
 ```
 
-## Attribution
-
-The health-check behavior is adapted from the MIT-licensed **Dispatcharr IPTV Checker Plugin** by Pirates IRC. See `THIRD_PARTY_NOTICES.md` for the required license notice.
+Changes are validated on `dev-test` before promotion to `dev`.
