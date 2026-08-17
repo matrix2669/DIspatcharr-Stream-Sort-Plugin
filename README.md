@@ -4,7 +4,7 @@ Dispatcharr Stream Sort analyzes the streams already attached to Dispatcharr cha
 
 ## Built-in incremental checker
 
-Stream Sort no longer requires IPTV Checker for sorting data. `Analyze Streams` owns the health/media and delivery measurements used by the sorter:
+Stream Sort no longer requires IPTV Checker for sorting data. `Analyze Streams` owns the health/content and delivery measurements used by the sorter while also reusing newer basic media metadata already learned by Dispatcharr during playback.
 
 - reachability and Alive / Dead / Skipped classification
 - resolution, FPS, codecs, pixel format, audio details, and measured video bitrate
@@ -13,20 +13,17 @@ Stream Sort no longer requires IPTV Checker for sorting data. `Analyze Streams` 
 - measured delivery throughput and throughput health
 - rate-limit-aware retry behavior
 
-The analyzer is cache-aware rather than rechecking every stream on every run.
+The analyzer tracks three independent freshness components:
 
-Default refresh policy:
+- **Stream metadata TTL:** 12 hours by default. Newer `Stream.stream_stats` / `stream_stats_updated_at` from Dispatcharr playback can refresh resolution/FPS/codec/bitrate metadata without opening another Stream Sort connection.
+- **Health/content TTL:** 24 hours by default. Only Stream Sort's own checker refreshes this timer; playback does not count as a black/frozen/silent/placeholder check.
+- **Healthy throughput TTL:** 6 hours by default. Marginal, insufficient, and unknown throughput are rechecked on every Analyze run.
 
-- **Stream/media data TTL:** 12 hours
-- **Healthy throughput TTL:** 6 hours
-- **Dead or skipped media:** recheck every Analyze run
-- **Marginal / insufficient / unknown throughput:** recheck every Analyze run
-- **Changed stream URL:** invalidate and recheck both media and throughput
-- **Fresh alive media + fresh healthy throughput:** no provider connection is opened
+Dead, skipped, or unknown health states are rechecked on every Analyze run. A changed stream URL invalidates the cached components. A value of `0` forces the corresponding TTL-controlled component to be refreshed on every Analyze run.
 
-The two TTLs are independently configurable. A value of `0` forces that component to be rechecked on every Analyze run.
+When newer Dispatcharr stream data is imported, the cache records `metadata_source: "dispatcharr_stream_stats"` and updates only the metadata timestamp/stats. It does not change the Stream Sort health status or health timestamp. If the imported resolution/FPS/bitrate signature changed, throughput is rechecked so its delivery classification uses the new media characteristics.
 
-Analysis and throughput now share one cache:
+Analysis and throughput share one cache:
 
 ```text
 /data/dispatcharr_stream_sort_analysis.json
@@ -94,7 +91,7 @@ All matching name rules are additive.
 
 ## Actions
 
-- **Analyze Streams** — incrementally refresh only media/health or throughput components that require checking.
+- **Analyze Streams** — incrementally refresh only health/content, metadata, or throughput components that require checking.
 - **Dry Run** — write `/data/dispatcharr_stream_sort_report.json` without changing order.
 - **Sort Streams** — apply the calculated `ChannelStream.order` only.
 - **Analyze + Sort** — incrementally analyze, then apply the refreshed ordering.
@@ -103,7 +100,7 @@ Separate `Probe Throughput` actions are no longer shown because throughput is pa
 
 ## Logging
 
-The plugin owns the `plugins.stream_sorter` logger and prefixes its messages with `[Stream Sort]`. Incremental runs report media checks, throughput checks, cached counts, pending work, health totals, throughput totals, and ETA.
+The plugin owns the `plugins.stream_sorter` logger and prefixes its messages with `[Stream Sort]`. Incremental runs report media checks, throughput checks, Dispatcharr metadata refresh counts, cached counts, pending work, health totals, throughput totals, and ETA.
 
 ## Development
 
