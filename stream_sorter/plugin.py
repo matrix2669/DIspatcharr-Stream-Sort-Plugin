@@ -197,7 +197,7 @@ def _start_background_probe(settings: dict, logger, *, sort_after: bool) -> dict
 
 class Plugin:
     name = "Dispatcharr Stream Sort"
-    version = "0.1.0"
+    version = "0.1.1"
     description = (
         "Ranks streams already assigned to Dispatcharr channels using hard resolution tiers "
         "and configurable quality, M3U source, prefix/regex, and throughput scoring."

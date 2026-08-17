@@ -1,6 +1,6 @@
 {
   "name": "Dispatcharr Stream Sort",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Ranks streams already assigned to Dispatcharr channels using hard resolution tiers and configurable quality, M3U source, prefix/regex, and throughput scoring.",
   "author": "matrix2669",
   "help_url": "https://github.com/matrix2669/DIspatcharr-Stream-Sort-Plugin",
