@@ -1,300 +1,48 @@
 {
   "name": "Dispatcharr Stream Sort",
-  "version": "0.2.0",
-  "description": "Analyzes stream health and quality, scores candidate streams, and reorders streams already assigned to Dispatcharr channels.",
+  "version": "0.2.1",
+  "description": "Analyzes stream health, quality, and delivery performance, then scores and reorders streams already assigned to Dispatcharr channels.",
   "author": "matrix2669",
   "help_url": "https://github.com/matrix2669/DIspatcharr-Stream-Sort-Plugin",
   "fields": [
-    {
-      "id": "scoring_info",
-      "label": "Sorting model",
-      "type": "info",
-      "description": "Stream Sort now includes its own checker. Known-dead/stale streams are demoted first. Resolution remains a hard tier; bitrate, frame rate, M3U source, name rules, and cached delivery throughput score streams inside a tier."
-    },
-    {
-      "id": "filter_info",
-      "label": "Channel scope",
-      "type": "info",
-      "description": "Optional group/profile filters limit every Analyze, Dry Run, Sort, and Throughput action. Multiple values inside one filter are ORed; when both filters are set, a channel must match both."
-    },
-    {
-      "id": "channel_group_filter",
-      "label": "Channel group filter",
-      "type": "text",
-      "default": "",
-      "placeholder": "Local\nSports",
-      "help_text": "Optional exact Dispatcharr channel group names or IDs, separated by commas or new lines. Examples: Local, id:4. Empty means all groups. Uses the channel's effective group, including overrides."
-    },
-    {
-      "id": "channel_profile_filter",
-      "label": "Channel profile filter",
-      "type": "text",
-      "default": "",
-      "placeholder": "Stream Sort Test",
-      "help_text": "Optional exact Dispatcharr channel profile names or IDs, separated by commas or new lines. Only enabled profile memberships are included. Empty means all profiles/channels."
-    },
-    {
-      "id": "source_scores",
-      "label": "M3U source scores",
-      "type": "text",
-      "default": "",
-      "placeholder": "Preferred Provider=20\nid:4=10\nBackup Provider=-10",
-      "help_text": "Legacy fallback. When the plugin is enabled this is replaced by one numeric score box per configured M3U account."
-    },
-    {
-      "id": "name_score_rules",
-      "label": "Stream name scoring rules",
-      "type": "text",
-      "default": "# Prefix=score. Prefix rules are case-insensitive and anchored to the start of the stream name.\nUS=20\nGO=10\nTUBI=0\nPRIME=-10\nROKU=-20\n",
-      "help_text": "PREFIX=score creates a case-insensitive anchored prefix rule. Advanced regex uses score::regex. All matching name rules are additive."
-    },
-    {
-      "id": "analysis_info",
-      "label": "Built-in stream analyzer",
-      "type": "info",
-      "description": "Analyze Streams replaces the IPTV Checker dependency for sorting. It checks reachability, resolution, FPS, codecs, measured video bitrate, fixed-duration placeholder files, black video, frozen video, and silent audio. Rate-limited/audio-only/Streamlink-only sources are skipped rather than marked dead. It never renames, moves, creates, or deletes channels."
-    },
-    {
-      "id": "analysis_workers",
-      "label": "Analysis workers",
-      "type": "number",
-      "default": 2,
-      "help_text": "Number of streams analyzed in parallel. Keep this conservative if a provider limits simultaneous connections."
-    },
-    {
-      "id": "analysis_connection_timeout_seconds",
-      "label": "Analysis connection timeout (seconds)",
-      "type": "number",
-      "default": 10
-    },
-    {
-      "id": "analysis_probe_timeout_seconds",
-      "label": "Analysis probe timeout (seconds)",
-      "type": "number",
-      "default": 20
-    },
-    {
-      "id": "analysis_duration_seconds",
-      "label": "FFprobe sample duration (seconds)",
-      "type": "number",
-      "default": 5,
-      "help_text": "Packet sample used for bitrate and metadata analysis."
-    },
-    {
-      "id": "analysis_retries",
-      "label": "Retries for transient failures",
-      "type": "number",
-      "default": 3,
-      "help_text": "Retries timeouts, connection-refused, network-unreachable and server-error results after the first pass."
-    },
-    {
-      "id": "analysis_per_account_delay_seconds",
-      "label": "Per-source analysis start delay (seconds)",
-      "type": "number",
-      "default": 1,
-      "help_text": "Minimum delay between starting checks against the same M3U account."
-    },
-    {
-      "id": "analysis_max_streams",
-      "label": "Maximum streams per analysis run",
-      "type": "number",
-      "default": 0,
-      "help_text": "0 means all unique streams attached to channels inside the selected scope. Useful for controlled dev-test runs."
-    },
-    {
-      "id": "analysis_ffprobe_path",
-      "label": "FFprobe path",
-      "type": "string",
-      "default": "/usr/local/bin/ffprobe"
-    },
-    {
-      "id": "analysis_ffmpeg_path",
-      "label": "FFmpeg path",
-      "type": "string",
-      "default": "/usr/local/bin/ffmpeg"
-    },
-    {
-      "id": "placeholder_file_detection",
-      "label": "Detect fixed-duration placeholder files",
-      "type": "boolean",
-      "default": true,
-      "help_text": "A continuous live stream normally has no fixed container duration. This check adds no extra provider connection."
-    },
-    {
-      "id": "black_screen_detection",
-      "label": "Detect black video",
-      "type": "boolean",
-      "default": true
-    },
-    {
-      "id": "frozen_video_detection",
-      "label": "Detect frozen video",
-      "type": "boolean",
-      "default": true
-    },
-    {
-      "id": "silent_audio_detection",
-      "label": "Detect silent audio",
-      "type": "boolean",
-      "default": true,
-      "help_text": "Only applies when an audio track exists."
-    },
-    {
-      "id": "content_sample_seconds",
-      "label": "Content-check sample duration (seconds)",
-      "type": "number",
-      "default": 6,
-      "help_text": "Black/frozen/silent checks share one FFmpeg decode pass."
-    },
-    {
-      "id": "black_screen_min_seconds",
-      "label": "Minimum continuous black video (seconds)",
-      "type": "number",
-      "default": 3
-    },
-    {
-      "id": "frozen_video_min_seconds",
-      "label": "Minimum frozen video duration (seconds)",
-      "type": "number",
-      "default": 4
-    },
-    {
-      "id": "silent_audio_max_db",
-      "label": "Silent-audio threshold (dBFS)",
-      "type": "number",
-      "default": -70
-    },
-    {
-      "id": "content_ffmpeg_timeout_seconds",
-      "label": "Content-check FFmpeg timeout (seconds)",
-      "type": "number",
-      "default": 20
-    },
-    {
-      "id": "throughput_info",
-      "label": "Delivery throughput scoring",
-      "type": "info",
-      "description": "Throughput remains a separate delivery-health measurement. Run Probe Throughput when you want fresh delivery scores; known-dead streams from the built-in analyzer are skipped."
-    },
-    {
-      "id": "throughput_cache_ttl_minutes",
-      "label": "Throughput cache TTL (minutes)",
-      "type": "number",
-      "default": 30,
-      "help_text": "Expired throughput probes become UNKNOWN and stop affecting score."
-    },
-    {
-      "id": "probe_duration_seconds",
-      "label": "Throughput probe duration (seconds)",
-      "type": "number",
-      "default": 8
-    },
-    {
-      "id": "probe_timeout_seconds",
-      "label": "Throughput probe timeout (seconds)",
-      "type": "number",
-      "default": 10
-    },
-    {
-      "id": "probe_rate_per_minute",
-      "label": "Maximum throughput probes per minute",
-      "type": "number",
-      "default": 6,
-      "help_text": "Global start-rate cap used to limit provider load."
-    },
-    {
-      "id": "probe_per_account_delay_seconds",
-      "label": "Per-source throughput start delay (seconds)",
-      "type": "number",
-      "default": 1
-    },
-    {
-      "id": "probe_max_streams",
-      "label": "Maximum streams per throughput run",
-      "type": "number",
-      "default": 0,
-      "help_text": "0 means all unique non-dead streams attached to channels inside the selected scope."
-    },
-    {
-      "id": "paths_info",
-      "label": "Files",
-      "type": "info",
-      "description": "Analysis: /data/dispatcharr_stream_sort_analysis.json | Dry-run/apply report: /data/dispatcharr_stream_sort_report.json | Throughput: /data/dispatcharr_stream_sort_throughput.json"
-    }
+    {"id":"scoring_info","label":"Sorting model","type":"info","description":"Known-dead/stale streams are demoted below all usable streams before resolution is considered. Resolution remains a hard tier among streams with the same viability; bitrate, frame rate, M3U source, name rules, and delivery throughput score streams inside a tier."},
+    {"id":"filter_info","label":"Channel scope","type":"info","description":"Optional group/profile filters limit Analyze, Dry Run, Sort, and Analyze + Sort. Multiple values inside one filter are ORed; when both filters are set, a channel must match both."},
+    {"id":"channel_group_filter","label":"Channel group filter","type":"text","default":"","placeholder":"Local\nSports","help_text":"Optional exact Dispatcharr channel group names or IDs, separated by commas or new lines. Examples: Local, id:4. Empty means all groups. Uses the channel's effective group, including overrides."},
+    {"id":"channel_profile_filter","label":"Channel profile filter","type":"text","default":"","placeholder":"Stream Sort Test","help_text":"Optional exact Dispatcharr channel profile names or IDs, separated by commas or new lines. Only enabled profile memberships are included. Empty means all profiles/channels."},
+    {"id":"source_scores","label":"M3U source scores","type":"text","default":"","placeholder":"Preferred Provider=20\nid:4=10\nBackup Provider=-10","help_text":"Legacy fallback. When the plugin is enabled this is replaced by one numeric score box per configured M3U account."},
+    {"id":"name_score_rules","label":"Stream name scoring rules","type":"text","default":"# Prefix=score. Prefix rules are case-insensitive and anchored to the start of the stream name.\nUS=20\nGO=10\nTUBI=0\nPRIME=-10\nROKU=-20\n","help_text":"PREFIX=score creates a case-insensitive anchored prefix rule. Advanced regex uses score::regex. All matching name rules are additive."},
+    {"id":"analysis_info","label":"Built-in incremental stream analyzer","type":"info","description":"Analyze Streams is cache-aware. Fresh healthy streams are left alone. Dead/skipped streams are rechecked on every run; media metadata is refreshed when its TTL expires; throughput is rechecked whenever it is not healthy or its healthy TTL expires. URL changes invalidate both components."},
+    {"id":"stream_data_ttl_hours","label":"Stream data TTL (hours)","type":"number","default":12,"help_text":"Fresh ALIVE health/media data is reused until this TTL expires. Dead or skipped streams are rechecked every Analyze run. 0 forces media recheck on every Analyze run."},
+    {"id":"healthy_throughput_ttl_hours","label":"Healthy throughput TTL (hours)","type":"number","default":6,"help_text":"HEALTHY throughput is reused until this TTL expires. Marginal, insufficient, and unknown throughput are rechecked every Analyze run. 0 forces throughput recheck on every Analyze run."},
+    {"id":"analysis_workers","label":"Analysis workers","type":"number","default":2,"help_text":"Number of media checks analyzed in parallel. Keep this conservative if a provider limits simultaneous connections."},
+    {"id":"analysis_connection_timeout_seconds","label":"Analysis connection timeout (seconds)","type":"number","default":10},
+    {"id":"analysis_probe_timeout_seconds","label":"Analysis probe timeout (seconds)","type":"number","default":20},
+    {"id":"analysis_duration_seconds","label":"FFprobe sample duration (seconds)","type":"number","default":5,"help_text":"Packet sample used for bitrate and metadata analysis."},
+    {"id":"analysis_retries","label":"Retries for transient failures","type":"number","default":3,"help_text":"Retries timeouts, connection-refused, network-unreachable and server-error media results after the first pass."},
+    {"id":"analysis_per_account_delay_seconds","label":"Per-source analysis start delay (seconds)","type":"number","default":1,"help_text":"Minimum delay between starting media checks against the same M3U account."},
+    {"id":"analysis_max_streams","label":"Maximum streams per analysis run","type":"number","default":0,"help_text":"0 means all unique streams attached to channels inside the selected scope. Useful for controlled dev-test runs."},
+    {"id":"analysis_ffprobe_path","label":"FFprobe path","type":"string","default":"/usr/local/bin/ffprobe"},
+    {"id":"analysis_ffmpeg_path","label":"FFmpeg path","type":"string","default":"/usr/local/bin/ffmpeg"},
+    {"id":"placeholder_file_detection","label":"Detect fixed-duration placeholder files","type":"boolean","default":true,"help_text":"A continuous live stream normally has no fixed container duration. This check adds no extra provider connection."},
+    {"id":"black_screen_detection","label":"Detect black video","type":"boolean","default":true},
+    {"id":"frozen_video_detection","label":"Detect frozen video","type":"boolean","default":true},
+    {"id":"silent_audio_detection","label":"Detect silent audio","type":"boolean","default":true,"help_text":"Only applies when an audio track exists."},
+    {"id":"content_sample_seconds","label":"Content-check sample duration (seconds)","type":"number","default":6,"help_text":"Black/frozen/silent checks share one FFmpeg decode pass."},
+    {"id":"black_screen_min_seconds","label":"Minimum continuous black video (seconds)","type":"number","default":3},
+    {"id":"frozen_video_min_seconds","label":"Minimum frozen video duration (seconds)","type":"number","default":4},
+    {"id":"silent_audio_max_db","label":"Silent-audio threshold (dBFS)","type":"number","default":-70},
+    {"id":"content_ffmpeg_timeout_seconds","label":"Content-check FFmpeg timeout (seconds)","type":"number","default":20},
+    {"id":"throughput_info","label":"Integrated delivery throughput","type":"info","description":"Throughput is now part of Analyze Streams. Healthy cached delivery results are reused; marginal, insufficient, unknown, expired, or URL-changed results are probed again. Confirmed dead media streams are not throughput-probed."},
+    {"id":"probe_duration_seconds","label":"Throughput sample duration (seconds)","type":"number","default":8},
+    {"id":"probe_timeout_seconds","label":"Throughput probe timeout (seconds)","type":"number","default":10},
+    {"id":"probe_rate_per_minute","label":"Maximum throughput probes per minute","type":"number","default":6,"help_text":"Global start-rate cap used to limit provider load. Only streams whose throughput needs refreshing consume this allowance."},
+    {"id":"probe_per_account_delay_seconds","label":"Per-source throughput start delay (seconds)","type":"number","default":1},
+    {"id":"paths_info","label":"Files","type":"info","description":"Unified analysis/throughput cache: /data/dispatcharr_stream_sort_analysis.json | Dry-run/apply report: /data/dispatcharr_stream_sort_report.json. The old standalone throughput cache is read only as a migration fallback."}
   ],
   "actions": [
-    {
-      "id": "analyze_streams",
-      "label": "Analyze Streams",
-      "description": "Run the built-in stream checker for unique streams in the selected channel scope and update Dispatcharr stream metadata.",
-      "button_label": "Analyze Streams",
-      "button_variant": "outline",
-      "button_color": "orange",
-      "confirm": {
-        "required": true,
-        "title": "Analyze assigned streams?",
-        "message": "This opens provider stream connections and may decode short samples for black/frozen/silent detection. It does not rename, move, create, or delete channels."
-      }
-    },
-    {
-      "id": "dry_run",
-      "label": "Dry Run",
-      "description": "Calculate the proposed order for the selected channel scope without changing ChannelStream.order.",
-      "button_label": "Dry Run",
-      "button_variant": "outline",
-      "button_color": "blue"
-    },
-    {
-      "id": "sort_streams",
-      "label": "Sort Streams",
-      "description": "Apply the calculated order to streams already assigned to channels inside the selected scope.",
-      "button_label": "Sort Streams",
-      "button_variant": "filled",
-      "button_color": "blue",
-      "confirm": {
-        "required": true,
-        "title": "Apply stream ordering?",
-        "message": "This changes ChannelStream.order only for the selected channel scope. It does not add or remove streams."
-      }
-    },
-    {
-      "id": "analyze_and_sort",
-      "label": "Analyze + Sort",
-      "description": "Run the built-in checker, then apply stream ordering using the refreshed health/metadata and any current throughput cache.",
-      "button_label": "Analyze + Sort",
-      "button_variant": "filled",
-      "button_color": "orange",
-      "confirm": {
-        "required": true,
-        "title": "Analyze and sort streams?",
-        "message": "This analyzes provider streams and then changes ChannelStream.order. It does not rename, move, create, or delete channels."
-      }
-    },
-    {
-      "id": "probe_throughput",
-      "label": "Probe Throughput",
-      "description": "Start a background delivery-throughput probe for non-dead unique streams in the selected channel scope.",
-      "button_label": "Probe Throughput",
-      "button_variant": "outline",
-      "button_color": "orange",
-      "confirm": {
-        "required": true,
-        "title": "Probe assigned streams?",
-        "message": "This opens provider stream connections for streams attached to channels inside the selected scope."
-      }
-    },
-    {
-      "id": "probe_and_sort",
-      "label": "Probe + Sort",
-      "description": "Probe delivery throughput, then apply ordering when probing completes.",
-      "button_label": "Probe + Sort",
-      "button_variant": "filled",
-      "button_color": "orange",
-      "confirm": {
-        "required": true,
-        "title": "Probe and sort streams?",
-        "message": "This probes provider streams and then changes ChannelStream.order."
-      }
-    }
+    {"id":"analyze_streams","label":"Analyze Streams","description":"Incrementally refresh only stream health/media or throughput data that needs checking in the selected channel scope.","button_label":"Analyze Streams","button_variant":"outline","button_color":"orange","confirm":{"required":true,"title":"Analyze assigned streams?","message":"Fresh healthy cached data is reused. This only opens provider connections for dead/skipped, non-healthy throughput, URL-changed, or TTL-expired data. It does not rename, move, create, or delete channels."}},
+    {"id":"dry_run","label":"Dry Run","description":"Calculate the proposed order for the selected channel scope without changing ChannelStream.order.","button_label":"Dry Run","button_variant":"outline","button_color":"blue"},
+    {"id":"sort_streams","label":"Sort Streams","description":"Apply the calculated order to streams already assigned to channels inside the selected scope.","button_label":"Sort Streams","button_variant":"filled","button_color":"blue","confirm":{"required":true,"title":"Apply stream ordering?","message":"This changes ChannelStream.order only for the selected channel scope. It does not add or remove streams."}},
+    {"id":"analyze_and_sort","label":"Analyze + Sort","description":"Incrementally refresh required health/media/throughput data, then apply stream ordering.","button_label":"Analyze + Sort","button_variant":"filled","button_color":"orange","confirm":{"required":true,"title":"Analyze and sort streams?","message":"This refreshes only data that needs checking and then changes ChannelStream.order. It does not rename, move, create, or delete channels."}}
   ]
 }
