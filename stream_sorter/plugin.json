@@ -1,7 +1,7 @@
 {
   "name": "Dispatcharr Stream Sort",
-  "version": "0.2.1",
-  "description": "Analyzes stream health, quality, and delivery performance, then scores and reorders streams already assigned to Dispatcharr channels.",
+  "version": "0.2.2",
+  "description": "Analyzes stream health, quality, and delivery performance, reuses fresh Dispatcharr playback metadata, then scores and reorders streams already assigned to channels.",
   "author": "matrix2669",
   "help_url": "https://github.com/matrix2669/DIspatcharr-Stream-Sort-Plugin",
   "fields": [
@@ -11,8 +11,9 @@
     {"id":"channel_profile_filter","label":"Channel profile filter","type":"text","default":"","placeholder":"Stream Sort Test","help_text":"Optional exact Dispatcharr channel profile names or IDs, separated by commas or new lines. Only enabled profile memberships are included. Empty means all profiles/channels."},
     {"id":"source_scores","label":"M3U source scores","type":"text","default":"","placeholder":"Preferred Provider=20\nid:4=10\nBackup Provider=-10","help_text":"Legacy fallback. When the plugin is enabled this is replaced by one numeric score box per configured M3U account."},
     {"id":"name_score_rules","label":"Stream name scoring rules","type":"text","default":"# Prefix=score. Prefix rules are case-insensitive and anchored to the start of the stream name.\nUS=20\nGO=10\nTUBI=0\nPRIME=-10\nROKU=-20\n","help_text":"PREFIX=score creates a case-insensitive anchored prefix rule. Advanced regex uses score::regex. All matching name rules are additive."},
-    {"id":"analysis_info","label":"Built-in incremental stream analyzer","type":"info","description":"Analyze Streams is cache-aware. Fresh healthy streams are left alone. Dead/skipped streams are rechecked on every run; media metadata is refreshed when its TTL expires; throughput is rechecked whenever it is not healthy or its healthy TTL expires. URL changes invalidate both components."},
-    {"id":"stream_data_ttl_hours","label":"Stream data TTL (hours)","type":"number","default":12,"help_text":"Fresh ALIVE health/media data is reused until this TTL expires. Dead or skipped streams are rechecked every Analyze run. 0 forces media recheck on every Analyze run."},
+    {"id":"analysis_info","label":"Built-in incremental stream analyzer","type":"info","description":"Analyze Streams tracks health/content, basic media metadata, and throughput independently. Newer Dispatcharr stream_stats (including data learned during playback) refresh basic metadata without resetting Stream Sort's health/content timestamp. Dead/skipped streams are always rechecked; URL changes invalidate all components."},
+    {"id":"stream_data_ttl_hours","label":"Stream metadata TTL (hours)","type":"number","default":12,"help_text":"Resolution/FPS/codec/bitrate metadata is reused until this TTL expires. Newer Dispatcharr stream_stats can refresh this timestamp without another Stream Sort connection. 0 forces metadata refresh on every Analyze run."},
+    {"id":"health_content_ttl_hours","label":"Health/content TTL (hours)","type":"number","default":24,"help_text":"How long a successful Stream Sort health/content check remains valid. Playback metadata does not refresh this timer. Dead, skipped, or unknown streams are rechecked every Analyze run. 0 forces a full health/content check every run."},
     {"id":"healthy_throughput_ttl_hours","label":"Healthy throughput TTL (hours)","type":"number","default":6,"help_text":"HEALTHY throughput is reused until this TTL expires. Marginal, insufficient, and unknown throughput are rechecked every Analyze run. 0 forces throughput recheck on every Analyze run."},
     {"id":"analysis_workers","label":"Analysis workers","type":"number","default":2,"help_text":"Number of media checks analyzed in parallel. Keep this conservative if a provider limits simultaneous connections."},
     {"id":"analysis_connection_timeout_seconds","label":"Analysis connection timeout (seconds)","type":"number","default":10},
@@ -32,7 +33,7 @@
     {"id":"frozen_video_min_seconds","label":"Minimum frozen video duration (seconds)","type":"number","default":4},
     {"id":"silent_audio_max_db","label":"Silent-audio threshold (dBFS)","type":"number","default":-70},
     {"id":"content_ffmpeg_timeout_seconds","label":"Content-check FFmpeg timeout (seconds)","type":"number","default":20},
-    {"id":"throughput_info","label":"Integrated delivery throughput","type":"info","description":"Throughput is now part of Analyze Streams. Healthy cached delivery results are reused; marginal, insufficient, unknown, expired, or URL-changed results are probed again. Confirmed dead media streams are not throughput-probed."},
+    {"id":"throughput_info","label":"Integrated delivery throughput","type":"info","description":"Throughput is part of Analyze Streams. Healthy cached delivery results are reused; marginal, insufficient, unknown, expired, URL-changed, or metadata-changed results are probed again. Confirmed dead media streams are not throughput-probed."},
     {"id":"probe_duration_seconds","label":"Throughput sample duration (seconds)","type":"number","default":8},
     {"id":"probe_timeout_seconds","label":"Throughput probe timeout (seconds)","type":"number","default":10},
     {"id":"probe_rate_per_minute","label":"Maximum throughput probes per minute","type":"number","default":6,"help_text":"Global start-rate cap used to limit provider load. Only streams whose throughput needs refreshing consume this allowance."},
@@ -40,9 +41,9 @@
     {"id":"paths_info","label":"Files","type":"info","description":"Unified analysis/throughput cache: /data/dispatcharr_stream_sort_analysis.json | Dry-run/apply report: /data/dispatcharr_stream_sort_report.json. The old standalone throughput cache is read only as a migration fallback."}
   ],
   "actions": [
-    {"id":"analyze_streams","label":"Analyze Streams","description":"Incrementally refresh only stream health/media or throughput data that needs checking in the selected channel scope.","button_label":"Analyze Streams","button_variant":"outline","button_color":"orange","confirm":{"required":true,"title":"Analyze assigned streams?","message":"Fresh healthy cached data is reused. This only opens provider connections for dead/skipped, non-healthy throughput, URL-changed, or TTL-expired data. It does not rename, move, create, or delete channels."}},
+    {"id":"analyze_streams","label":"Analyze Streams","description":"Incrementally refresh only health/content, metadata, or throughput data that needs checking in the selected channel scope.","button_label":"Analyze Streams","button_variant":"outline","button_color":"orange","confirm":{"required":true,"title":"Analyze assigned streams?","message":"Fresh cached data and newer Dispatcharr playback metadata are reused. Provider connections are opened only for components that need refreshing. It does not rename, move, create, or delete channels."}},
     {"id":"dry_run","label":"Dry Run","description":"Calculate the proposed order for the selected channel scope without changing ChannelStream.order.","button_label":"Dry Run","button_variant":"outline","button_color":"blue"},
     {"id":"sort_streams","label":"Sort Streams","description":"Apply the calculated order to streams already assigned to channels inside the selected scope.","button_label":"Sort Streams","button_variant":"filled","button_color":"blue","confirm":{"required":true,"title":"Apply stream ordering?","message":"This changes ChannelStream.order only for the selected channel scope. It does not add or remove streams."}},
-    {"id":"analyze_and_sort","label":"Analyze + Sort","description":"Incrementally refresh required health/media/throughput data, then apply stream ordering.","button_label":"Analyze + Sort","button_variant":"filled","button_color":"orange","confirm":{"required":true,"title":"Analyze and sort streams?","message":"This refreshes only data that needs checking and then changes ChannelStream.order. It does not rename, move, create, or delete channels."}}
+    {"id":"analyze_and_sort","label":"Analyze + Sort","description":"Incrementally refresh required health/content/metadata/throughput data, then apply stream ordering.","button_label":"Analyze + Sort","button_variant":"filled","button_color":"orange","confirm":{"required":true,"title":"Analyze and sort streams?","message":"This refreshes only data that needs checking and then changes ChannelStream.order. It does not rename, move, create, or delete channels."}}
   ]
 }
