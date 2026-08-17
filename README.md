@@ -52,8 +52,8 @@ The first matching source rule is used.
 
 - **Dry Run** — generates `/data/dispatcharr_stream_sort_report.json` without changing stream order.
 - **Sort Streams** — updates only `ChannelStream.order` using a transaction and `bulk_update()`.
-- **Probe Throughput** — measures sustained delivery speed and caches it in `/data/dispatcharr_stream_sort_throughput.json`. The baseline uses an 8-second window, a 6-probe/minute global start cap, and a 1-second per-M3U-source delay.
-- **Probe + Sort** — refreshes throughput data and immediately sorts.
+- **Probe Throughput** — starts a background job that measures sustained delivery speed and caches it in `/data/dispatcharr_stream_sort_throughput.json`. The baseline uses an 8-second window, a 6-probe/minute global start cap, and a 1-second per-M3U-source delay.
+- **Probe + Sort** — runs the background throughput job and applies the sort when probing completes.
 
 Throughput is classified relative to a coarse nominal bitrate for the stream's resolution/FPS class (separate from IPTV Checker's measured content bitrate):
 
@@ -62,7 +62,7 @@ Throughput is classified relative to a coarse nominal bitrate for the stream's r
 - Insufficient: < 1.10x nominal bitrate
 - Unknown: no usable/current measurement
 
-Cached throughput expires after the configured TTL (30 minutes by default) and then stops affecting ranking until refreshed. Failed probes are treated as unknown/retryable rather than proof that a stream is dead.
+Cached throughput expires after the configured TTL (30 minutes by default) and then stops affecting ranking until refreshed. Only one throughput job can run at a time across Dispatcharr workers. Failed probes are treated as unknown/retryable rather than proof that a stream is dead.
 
 ## Installation for development testing
 

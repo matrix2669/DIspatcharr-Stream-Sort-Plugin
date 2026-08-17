@@ -1,8 +1,131 @@
 from __future__ import annotations
 
+import logging
+import os
+import threading
+
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - Dispatcharr runs on Linux
+    fcntl = None
+
 from .scoring import DEFAULT_PREFIX_RULES
 from .sorter import REPORT_PATH, probe_assigned_streams, sort_channels
 from .throughput import DEFAULT_CACHE_PATH
+
+
+PROBE_LOCK_PATH = "/data/dispatcharr_stream_sort_probe.lock"
+_FALLBACK_JOB_LOCK = threading.Lock()
+
+
+def _acquire_job_lock():
+    """Acquire a cross-worker lock for the long-running probe job."""
+    if fcntl is None:
+        if not _FALLBACK_JOB_LOCK.acquire(blocking=False):
+            return None
+        return False
+
+    os.makedirs(os.path.dirname(PROBE_LOCK_PATH), exist_ok=True)
+    handle = open(PROBE_LOCK_PATH, "a+", encoding="utf-8")
+    try:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        handle.close()
+        return None
+    return handle
+
+
+def _release_job_lock(lock_handle) -> None:
+    if lock_handle is False:
+        _FALLBACK_JOB_LOCK.release()
+        return
+    if lock_handle is None:
+        return
+    try:
+        fcntl.flock(lock_handle.fileno(), fcntl.LOCK_UN)
+    finally:
+        lock_handle.close()
+
+
+def _notify(message: str) -> None:
+    try:
+        from core.utils import send_websocket_update
+
+        send_websocket_update(
+            "updates",
+            "update",
+            {"type": "plugin", "plugin": "Dispatcharr Stream Sort", "message": message},
+        )
+    except Exception:
+        # Notifications are best-effort; the action result/log remains authoritative.
+        pass
+
+
+def _background_probe_job(settings: dict, logger, lock_handle, *, sort_after: bool) -> None:
+    from django.db import close_old_connections
+
+    close_old_connections()
+    try:
+        probe_result = probe_assigned_streams(settings, logger=logger)
+        if sort_after:
+            sort_result = sort_channels(settings, apply=True, logger=logger)
+            logger.info(
+                "Stream Sort background probe+sort complete: probed=%s changed_channels=%s",
+                probe_result["streams_probed"],
+                sort_result["channels_changed"],
+            )
+            _notify(
+                f"✅ Stream Sort: probed {probe_result['streams_probed']} streams; "
+                f"sorted {sort_result['channels_changed']} changed channels."
+            )
+        else:
+            logger.info(
+                "Stream Sort background probe complete: probed=%s status_counts=%s",
+                probe_result["streams_probed"],
+                probe_result["status_counts"],
+            )
+            _notify(
+                f"✅ Stream Sort: throughput probe complete for "
+                f"{probe_result['streams_probed']} streams."
+            )
+    except Exception:
+        logger.exception("Stream Sort background %s failed", "probe+sort" if sort_after else "probe")
+        _notify("❌ Stream Sort: background throughput job failed. Check Dispatcharr logs.")
+    finally:
+        close_old_connections()
+        _release_job_lock(lock_handle)
+
+
+def _start_background_probe(settings: dict, logger, *, sort_after: bool) -> dict:
+    lock_handle = _acquire_job_lock()
+    if lock_handle is None:
+        return {
+            "status": "error",
+            "message": "A Stream Sort throughput job is already running.",
+        }
+
+    worker = threading.Thread(
+        target=_background_probe_job,
+        args=(dict(settings), logger, lock_handle),
+        kwargs={"sort_after": sort_after},
+        name="dispatcharr-stream-sort-probe",
+        daemon=True,
+    )
+    try:
+        worker.start()
+    except Exception:
+        _release_job_lock(lock_handle)
+        raise
+
+    return {
+        "status": "ok",
+        "message": (
+            "Throughput probe + sort started in the background."
+            if sort_after
+            else "Throughput probe started in the background."
+        ),
+        "background": True,
+    }
 
 
 class Plugin:
@@ -120,7 +243,7 @@ class Plugin:
         {
             "id": "probe_throughput",
             "label": "Probe Throughput",
-            "description": "Measure delivery throughput for unique streams assigned to channels and cache the results.",
+            "description": "Start a background delivery-throughput probe for unique streams assigned to channels and cache the results.",
             "button_label": "Probe Throughput",
             "button_variant": "outline",
             "button_color": "orange",
@@ -133,21 +256,21 @@ class Plugin:
         {
             "id": "probe_and_sort",
             "label": "Probe + Sort",
-            "description": "Refresh throughput measurements, then immediately apply stream ordering.",
+            "description": "Start a background throughput probe, then apply stream ordering when probing completes.",
             "button_label": "Probe + Sort",
             "button_variant": "filled",
             "button_color": "orange",
             "confirm": {
                 "required": True,
                 "title": "Probe and sort streams?",
-                "message": "This opens provider streams for testing and then changes ChannelStream.order.",
+                "message": "This opens provider streams for testing and then changes ChannelStream.order."
             },
         },
     ]
 
     def run(self, action: str, params: dict, context: dict):
         settings = context.get("settings") or {}
-        logger = context.get("logger")
+        logger = context.get("logger") or logging.getLogger("plugins.stream_sorter")
 
         try:
             if action == "dry_run":
@@ -173,31 +296,10 @@ class Plugin:
                 }
 
             if action == "probe_throughput":
-                result = probe_assigned_streams(settings, logger=logger)
-                return {
-                    "status": "ok",
-                    "message": (
-                        f"Throughput probe complete: {result['streams_probed']} streams. "
-                        f"Results: {result['status_counts']}"
-                    ),
-                    **result,
-                }
+                return _start_background_probe(settings, logger, sort_after=False)
 
             if action == "probe_and_sort":
-                probe_result = probe_assigned_streams(settings, logger=logger)
-                sort_result = sort_channels(settings, apply=True, logger=logger)
-                return {
-                    "status": "ok",
-                    "message": (
-                        f"Probed {probe_result['streams_probed']} streams; "
-                        f"sorted {sort_result['channels_changed']} changed channels."
-                    ),
-                    "probe": probe_result,
-                    "sort": {
-                        k: sort_result[k]
-                        for k in ("channels_evaluated", "channels_changed", "rows_changed")
-                    },
-                }
+                return _start_background_probe(settings, logger, sort_after=True)
 
             return {"status": "error", "message": f"Unknown action: {action}"}
         except ValueError as exc:

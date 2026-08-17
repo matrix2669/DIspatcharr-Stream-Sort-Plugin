@@ -98,7 +98,7 @@
     {
       "id": "probe_throughput",
       "label": "Probe Throughput",
-      "description": "Measure delivery throughput for unique streams assigned to channels and cache the results.",
+      "description": "Start a background delivery-throughput probe for unique streams assigned to channels and cache the results.",
       "button_label": "Probe Throughput",
       "button_variant": "outline",
       "button_color": "orange",
@@ -111,7 +111,7 @@
     {
       "id": "probe_and_sort",
       "label": "Probe + Sort",
-      "description": "Refresh throughput measurements, then immediately apply stream ordering.",
+      "description": "Start a background throughput probe, then apply stream ordering when probing completes.",
       "button_label": "Probe + Sort",
       "button_variant": "filled",
       "button_color": "orange",
