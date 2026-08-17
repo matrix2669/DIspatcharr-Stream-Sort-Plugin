@@ -1,0 +1,118 @@
+{
+  "name": "Dispatcharr Stream Sort",
+  "version": "0.1.0",
+  "description": "Ranks streams already assigned to Dispatcharr channels using hard resolution tiers and configurable quality, M3U source, prefix/regex, and throughput scoring.",
+  "author": "matrix2669",
+  "help_url": "https://github.com/matrix2669/DIspatcharr-Stream-Sort-Plugin",
+  "fields": [
+    {
+      "id": "scoring_info",
+      "label": "Sorting model",
+      "type": "info",
+      "description": "Dead/stale streams are demoted first. Resolution is a hard tier (2160p > 1440p > 1080p > 720p > 576p > 480p). Inside a resolution tier, bitrate, frame rate, M3U source, name rules, and cached throughput are added into one score."
+    },
+    {
+      "id": "source_scores",
+      "label": "M3U source scores",
+      "type": "text",
+      "default": "",
+      "placeholder": "Preferred Provider=20\nid:4=10\nBackup Provider=-10",
+      "help_text": "One source=score per line. Match by exact M3U account name or account ID (4=20 or id:4=20). Positive values promote; negative values demote. First matching rule wins."
+    },
+    {
+      "id": "name_score_rules",
+      "label": "Stream name scoring rules",
+      "type": "text",
+      "default": "# Prefix=score. Prefix rules are case-insensitive and anchored to the start of the stream name.\nUS=20\nGO=10\nTUBI=0\nPRIME=-10\nROKU=-20\n",
+      "help_text": "PREFIX=score creates a case-insensitive anchored prefix rule (for example US=20 or ROKU=-20). Advanced regex uses score::regex. All matching name rules are additive."
+    },
+    {
+      "id": "throughput_cache_ttl_hours",
+      "label": "Throughput cache TTL (hours)",
+      "type": "number",
+      "default": 24,
+      "help_text": "Expired throughput probes become UNKNOWN and stop affecting score."
+    },
+    {
+      "id": "probe_duration_seconds",
+      "label": "Throughput probe duration (seconds)",
+      "type": "number",
+      "default": 2.5
+    },
+    {
+      "id": "probe_timeout_seconds",
+      "label": "Throughput probe timeout (seconds)",
+      "type": "number",
+      "default": 6
+    },
+    {
+      "id": "probe_workers",
+      "label": "Concurrent throughput probes",
+      "type": "number",
+      "default": 2,
+      "help_text": "Capped at 8. Lower values reduce simultaneous provider connections."
+    },
+    {
+      "id": "probe_max_streams",
+      "label": "Maximum streams per probe run",
+      "type": "number",
+      "default": 0,
+      "help_text": "0 means all unique streams assigned to channels."
+    },
+    {
+      "id": "paths_info",
+      "label": "Files",
+      "type": "info",
+      "description": "Dry-run/apply report: /data/dispatcharr_stream_sort_report.json | Throughput cache: /data/dispatcharr_stream_sort_throughput.json"
+    }
+  ],
+  "actions": [
+    {
+      "id": "dry_run",
+      "label": "Dry Run",
+      "description": "Calculate the proposed order without changing ChannelStream.order.",
+      "button_label": "Dry Run",
+      "button_variant": "outline",
+      "button_color": "blue"
+    },
+    {
+      "id": "sort_streams",
+      "label": "Sort Streams",
+      "description": "Apply the calculated order to streams already assigned to each channel.",
+      "button_label": "Sort Streams",
+      "button_variant": "filled",
+      "button_color": "blue",
+      "confirm": {
+        "required": true,
+        "title": "Apply stream ordering?",
+        "message": "This changes ChannelStream.order only. It does not add or remove stream matches."
+      }
+    },
+    {
+      "id": "probe_throughput",
+      "label": "Probe Throughput",
+      "description": "Measure delivery throughput for unique streams assigned to channels and cache the results.",
+      "button_label": "Probe Throughput",
+      "button_variant": "outline",
+      "button_color": "orange",
+      "confirm": {
+        "required": true,
+        "title": "Probe assigned streams?",
+        "message": "This opens provider stream connections to measure delivery throughput."
+      }
+    },
+    {
+      "id": "probe_and_sort",
+      "label": "Probe + Sort",
+      "description": "Refresh throughput measurements, then immediately apply stream ordering.",
+      "button_label": "Probe + Sort",
+      "button_variant": "filled",
+      "button_color": "orange",
+      "confirm": {
+        "required": true,
+        "title": "Probe and sort streams?",
+        "message": "This opens provider streams for testing and then changes ChannelStream.order."
+      }
+    }
+  ]
+}
