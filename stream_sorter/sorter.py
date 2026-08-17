@@ -16,7 +16,7 @@ from .scoring import (
     parse_source_rules,
     rank_candidates,
 )
-from .throughput import DEFAULT_CACHE_PATH, load_cache, probe_stream, save_cache
+from .throughput import DEFAULT_CACHE_PATH, DEFAULT_USER_AGENT, load_cache, probe_stream, save_cache
 
 
 REPORT_PATH = "/data/dispatcharr_stream_sort_report.json"
@@ -240,7 +240,7 @@ def probe_assigned_streams(
     max_streams = max(0, _as_int(settings.get("probe_max_streams"), 0))
 
     rows = list(
-        ChannelStream.objects.select_related("stream", "stream__m3u_account")
+        ChannelStream.objects.select_related("stream", "stream__m3u_account", "stream__m3u_account__user_agent")
         .order_by("channel_id", "order", "id")
     )
     seen: set[int] = set()
@@ -252,12 +252,18 @@ def probe_assigned_streams(
         seen.add(stream.id)
         width, height = parse_resolution(stream.stream_stats)
         fps = parse_fps(stream.stream_stats)
+        account = stream.m3u_account
+        try:
+            user_agent = account.get_user_agent_string() if account else DEFAULT_USER_AGENT
+        except Exception:
+            user_agent = DEFAULT_USER_AGENT
         streams.append(
             {
                 "id": stream.id,
                 "name": stream.name or "",
                 "url": stream.url or "",
                 "account_id": getattr(stream, "m3u_account_id", None),
+                "user_agent": user_agent or DEFAULT_USER_AGENT,
                 "nominal_video_kbps": estimate_nominal_throughput_kbps(height, fps),
             }
         )
@@ -284,6 +290,7 @@ def probe_assigned_streams(
             nominal_video_kbps=item["nominal_video_kbps"],
             duration_seconds=duration,
             timeout_seconds=timeout,
+            user_agent=item["user_agent"],
         )
         account_next_eligible[account_id] = time.monotonic() + per_account_delay
         cache[str(item["id"])] = result

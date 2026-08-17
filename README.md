@@ -52,7 +52,7 @@ The first matching source rule is used.
 
 - **Dry Run** — generates `/data/dispatcharr_stream_sort_report.json` without changing stream order.
 - **Sort Streams** — updates only `ChannelStream.order` using a transaction and `bulk_update()`.
-- **Probe Throughput** — starts a background job that measures sustained delivery speed and caches it in `/data/dispatcharr_stream_sort_throughput.json`. The baseline uses an 8-second window, a 6-probe/minute global start cap, and a 1-second per-M3U-source delay.
+- **Probe Throughput** — starts a background job that measures sustained delivery speed and caches it in `/data/dispatcharr_stream_sort_throughput.json`. The baseline uses an 8-second window, a 6-probe/minute global start cap, a 1-second per-M3U-source delay, and each source's configured Dispatcharr User-Agent.
 - **Probe + Sort** — runs the background throughput job and applies the sort when probing completes.
 
 Throughput is classified relative to a coarse nominal bitrate for the stream's resolution/FPS class (separate from IPTV Checker's measured content bitrate):
