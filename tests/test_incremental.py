@@ -1,6 +1,6 @@
 from datetime import datetime, timedelta, timezone
 
-from stream_sorter import analyzer
+from stream_sorter import analyzer, incremental
 from stream_sorter.incremental import (
     analyze_assigned_streams,
     media_check_reason,
@@ -66,3 +66,27 @@ def test_zero_ttl_forces_recheck():
     throughput = {"throughput": {"status": "healthy", "url_hash": "abc", "checked_at": now.isoformat()}}
     assert media_check_reason(media, url_hash="abc", ttl_hours=0, now=now) == "ttl_forced"
     assert throughput_check_reason(throughput, url_hash="abc", ttl_hours=0, now=now) == "ttl_forced"
+
+
+def test_matching_legacy_throughput_is_migrated(monkeypatch):
+    url = "http://example.test/live"
+    url_hash = analyzer._stream_url_hash(url)
+    item = {"id": 42, "url": url, "account_id": 3, "account_name": "Provider"}
+    cache = {"42": {"status": "alive", "url_hash": url_hash, "stats": {"height": 1080}}}
+    monkeypatch.setattr(
+        incremental,
+        "load_throughput_cache",
+        lambda _path: {"42": {"status": "healthy", "measured_mbps": 12.3, "tested_at": _now().isoformat()}},
+    )
+    assert incremental._migrate_legacy_throughput([item], cache, ttl_hours=6) == 1
+    assert cache["42"]["throughput"]["status"] == "healthy"
+    assert cache["42"]["throughput"]["url_hash"] == url_hash
+    assert "expires_at" in cache["42"]["throughput"]
+
+
+def test_legacy_throughput_is_not_migrated_after_url_change(monkeypatch):
+    item = {"id": 42, "url": "http://example.test/new", "account_id": 3, "account_name": "Provider"}
+    cache = {"42": {"status": "alive", "url_hash": analyzer._stream_url_hash("http://example.test/old")}}
+    monkeypatch.setattr(incremental, "load_throughput_cache", lambda _path: {"42": {"status": "healthy", "tested_at": _now().isoformat()}})
+    assert incremental._migrate_legacy_throughput([item], cache, ttl_hours=6) == 0
+    assert "throughput" not in cache["42"]
