@@ -1,12 +1,10 @@
 # Dispatcharr Stream Sort Plugin
 
-> **Development status:** initial `0.1.0` baseline is on `dev-test` for live Dispatcharr testing. It has not been promoted to `dev` or published as a tagged release.
-
 A focused Dispatcharr plugin that **only reorders streams already assigned to channels**. It does not match streams, create channels, rename channels, or change EPG assignments.
 
 ## Sorting model
 
-1. Unusable streams are demoted first: stale, inactive-source, missing-URL, known-dead, and throughput-probe-dead streams.
+1. Unusable streams are demoted first: stale, inactive-source, missing-URL, and known-dead streams.
 2. Extremely content-starved streams (video bitrate below 10% of the target for their reported resolution) are demoted below normal usable streams.
 3. Resolution is a hard tier: 2160p > 1440p > 1080p > 720p > 576p > 480p > lower/unknown.
 4. Streams inside the same resolution tier use an additive score:
@@ -54,17 +52,17 @@ The first matching source rule is used.
 
 - **Dry Run** — generates `/data/dispatcharr_stream_sort_report.json` without changing stream order.
 - **Sort Streams** — updates only `ChannelStream.order` using a transaction and `bulk_update()`.
-- **Probe Throughput** — measures delivery speed and caches it in `/data/dispatcharr_stream_sort_throughput.json`.
+- **Probe Throughput** — measures sustained delivery speed and caches it in `/data/dispatcharr_stream_sort_throughput.json`. The baseline uses an 8-second window, a 6-probe/minute global start cap, and a 1-second per-M3U-source delay.
 - **Probe + Sort** — refreshes throughput data and immediately sorts.
 
-Throughput is classified relative to the stream's measured video bitrate:
+Throughput is classified relative to a coarse nominal bitrate for the stream's resolution/FPS class (separate from IPTV Checker's measured content bitrate):
 
 - Healthy: >= 1.50x nominal bitrate
 - Marginal: >= 1.10x nominal bitrate
 - Insufficient: < 1.10x nominal bitrate
 - Unknown: no usable/current measurement
 
-Cached throughput expires after the configured TTL and then stops affecting ranking until refreshed.
+Cached throughput expires after the configured TTL (30 minutes by default) and then stops affecting ranking until refreshed. Failed probes are treated as unknown/retryable rather than proof that a stream is dead.
 
 ## Installation for development testing
 
