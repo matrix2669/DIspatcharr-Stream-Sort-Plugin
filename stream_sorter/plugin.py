@@ -16,6 +16,67 @@ from .throughput import DEFAULT_CACHE_PATH
 
 PROBE_LOCK_PATH = "/data/dispatcharr_stream_sort_probe.lock"
 _FALLBACK_JOB_LOCK = threading.Lock()
+M3U_SOURCE_SCORE_PREFIX = "m3u_source_score_"
+
+
+def _build_m3u_source_score_fields(accounts):
+    """Return one neutral numeric score field per configured M3U account."""
+    rows = sorted(
+        (dict(account) for account in accounts),
+        key=lambda row: (
+            str(row.get("name") or "").casefold(),
+            int(row.get("id") or 0),
+        ),
+    )
+    fields = []
+    for row in rows:
+        account_id = int(row["id"])
+        name = str(row.get("name") or f"M3U {account_id}")
+        active = bool(row.get("is_active", True))
+        fields.append(
+            {
+                "id": f"{M3U_SOURCE_SCORE_PREFIX}{account_id}",
+                "label": name if active else f"{name} (inactive)",
+                "type": "number",
+                "default": 0,
+                "help_text": (
+                    f"M3U source ID {account_id}. Positive values promote this source, "
+                    "negative values demote it, and 0 is neutral."
+                ),
+            }
+        )
+    return fields
+
+
+def _settings_with_dynamic_source_scores(settings):
+    """Translate per-account score fields into the existing source-rule format.
+
+    The sorter continues to consume source_scores, keeping the scoring engine
+    independent from the UI. If no dynamic fields have ever been saved, the
+    legacy source_scores text setting remains valid for dev-test migration.
+    """
+    normalized = dict(settings or {})
+    dynamic_scores = []
+    for key, value in normalized.items():
+        if not str(key).startswith(M3U_SOURCE_SCORE_PREFIX):
+            continue
+        account_id = str(key)[len(M3U_SOURCE_SCORE_PREFIX):]
+        if not account_id.isdigit():
+            continue
+        try:
+            score = float(value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"Invalid score for M3U source ID {account_id}: {value!r}"
+            ) from exc
+        dynamic_scores.append((int(account_id), score))
+
+    if dynamic_scores:
+        dynamic_scores.sort(key=lambda item: item[0])
+        normalized["source_scores"] = "\n".join(
+            f"id:{account_id}={score:g}" for account_id, score in dynamic_scores
+        )
+    return normalized
 
 
 def _acquire_job_lock():
@@ -306,8 +367,59 @@ class Plugin:
         },
     ]
 
+    def __init__(self):
+        # Dispatcharr loads fields from the live Plugin instance for enabled
+        # plugins. Replace the legacy free-form source_scores textarea with one
+        # numeric input per current M3U account while retaining the old setting
+        # internally for migration compatibility.
+        instance_fields = [dict(field) for field in type(self).fields]
+        source_index = next(
+            (index for index, field in enumerate(instance_fields) if field.get("id") == "source_scores"),
+            None,
+        )
+        if source_index is not None:
+            try:
+                from apps.m3u.models import M3UAccount
+
+                accounts = list(M3UAccount.objects.all().values("id", "name", "is_active"))
+                replacement = [
+                    {
+                        "id": "m3u_source_scores_info",
+                        "label": "M3U source scores",
+                        "type": "info",
+                        "description": (
+                            "All configured M3U sources are listed below. Every source starts at 0 (neutral). "
+                            "Use positive values to promote a source and negative values to demote it."
+                        ),
+                    }
+                ]
+                source_fields = _build_m3u_source_score_fields(accounts)
+                if source_fields:
+                    replacement.extend(source_fields)
+                else:
+                    replacement.append(
+                        {
+                            "id": "m3u_source_scores_empty",
+                            "label": "No M3U sources found",
+                            "type": "info",
+                            "description": "No Dispatcharr M3U accounts are currently configured.",
+                        }
+                    )
+                self.fields = (
+                    instance_fields[:source_index]
+                    + replacement
+                    + instance_fields[source_index + 1:]
+                )
+            except Exception as exc:
+                logging.getLogger("plugins.stream_sorter").warning(
+                    "Unable to build dynamic M3U source score fields: %s", exc
+                )
+                self.fields = instance_fields
+        else:
+            self.fields = instance_fields
+
     def run(self, action: str, params: dict, context: dict):
-        settings = context.get("settings") or {}
+        settings = _settings_with_dynamic_source_scores(context.get("settings") or {})
         logger = context.get("logger") or logging.getLogger("plugins.stream_sorter")
 
         try:
