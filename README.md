@@ -43,7 +43,9 @@ The collector tracks playback starts/stops, estimated active playback seconds, r
 
 When Dispatcharr switches streams before emitting a failover event, Stream Sort remembers the stream being left so a `buffering_timeout` failover can still be attributed to the failing stream. It also resolves missing stream IDs from Dispatcharr stream metadata when possible.
 
-**Reliability telemetry is collection-only in v0.2.3. It does not alter sorting scores or stream order.** This lets the data accumulate and be validated before a reliability scoring policy is introduced.
+Dispatcharr can emit a `channel_reconnect` immediately after a normal stream switch while the event payload still identifies the stream being left. Stream Sort recognizes that narrow pattern when it occurs within two seconds of the switch, keeps the event in `recent_events` as `classification: "switch_internal"` with `counted: false`, and increments `reconnects_suppressed` instead of the reliability `reconnects` counter. A reconnect that identifies the new stream, or a reconnect outside that suppression window, is still counted normally.
+
+**Reliability telemetry is collection-only in v0.2.4. It does not alter sorting scores or stream order.** This lets the data accumulate and be validated before a reliability scoring policy is introduced.
 
 ## Health ordering
 
@@ -115,7 +117,7 @@ Separate `Probe Throughput` actions are no longer shown because throughput is pa
 
 ## Logging
 
-The plugin owns the `plugins.stream_sorter` logger and prefixes its messages with `[Stream Sort]`. Incremental runs report media checks, throughput checks, Dispatcharr metadata refresh counts, cached counts, pending work, health totals, throughput totals, and ETA. Runtime telemetry is logged with `[Reliability]` inside the Stream Sort logger.
+The plugin owns the `plugins.stream_sorter` logger and prefixes its messages with `[Stream Sort]`. Incremental runs report media checks, throughput checks, Dispatcharr metadata refresh counts, cached counts, pending work, health totals, throughput totals, and ETA. Runtime telemetry is logged with `[Reliability]` inside the Stream Sort logger, including whether an event was counted and its classification.
 
 ## Development
 
