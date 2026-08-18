@@ -1,6 +1,6 @@
 {
   "name": "Dispatcharr Stream Sort",
-  "version": "0.2.4",
+  "version": "0.2.5",
   "description": "Analyzes stream health, quality, delivery performance, and runtime reliability telemetry, reuses fresh Dispatcharr playback metadata, then scores and reorders streams already assigned to channels.",
   "author": "matrix2669",
   "help_url": "https://github.com/matrix2669/DIspatcharr-Stream-Sort-Plugin",
@@ -38,7 +38,7 @@
     {"id":"probe_timeout_seconds","label":"Throughput probe timeout (seconds)","type":"number","default":10},
     {"id":"probe_rate_per_minute","label":"Maximum throughput probes per minute","type":"number","default":6,"help_text":"Global start-rate cap used to limit provider load. Only streams whose throughput needs refreshing consume this allowance."},
     {"id":"probe_per_account_delay_seconds","label":"Per-source throughput start delay (seconds)","type":"number","default":1},
-    {"id":"reliability_info","label":"Runtime reliability telemetry","type":"info","description":"Stream Sort automatically collects Dispatcharr runtime events for starts/stops, reconnects, errors, failovers, stream switches, and buffering when Dispatcharr exposes that event. Reconnect events that immediately follow a switch and still identify the stream being left are retained as switch_internal telemetry but are not counted as reliability reconnects. Reliability telemetry is collection-only in v0.2.4 and does not affect sorting scores."},
+    {"id":"reliability_info","label":"Runtime reliability telemetry","type":"info","description":"Stream Sort automatically collects Dispatcharr runtime events for starts/stops, reconnects, errors, failovers, stream switches, and buffering when Dispatcharr exposes that event. Reconnect events that immediately follow a switch and still identify the stream being left are retained as switch_internal telemetry but are not counted as reliability reconnects. Reliability telemetry is collection-only in v0.2.5 and does not affect sorting scores."},
     {"id":"paths_info","label":"Files","type":"info","description":"Unified analysis/throughput cache: /data/dispatcharr_stream_sort_analysis.json | Runtime reliability telemetry: /data/dispatcharr_stream_sort_reliability.json | Dry-run/apply report: /data/dispatcharr_stream_sort_report.json. The old standalone throughput cache is read only as a migration fallback."}
   ],
   "actions": [
