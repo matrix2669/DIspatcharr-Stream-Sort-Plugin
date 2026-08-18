@@ -10,7 +10,8 @@ try:
 except ImportError:  # pragma: no cover - Dispatcharr runs on Linux
     fcntl = None
 
-from .analyzer import ANALYSIS_CACHE_PATH, analyze_assigned_streams, probe_assigned_streams
+from .analyzer import ANALYSIS_CACHE_PATH, probe_assigned_streams
+from .incremental import analyze_assigned_streams
 from .reliability import RELIABILITY_PATH, record_runtime_event
 from .sorter import REPORT_PATH, resolve_channel_scope, sort_channels
 from .throughput import DEFAULT_CACHE_PATH
