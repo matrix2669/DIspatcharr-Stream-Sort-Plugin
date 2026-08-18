@@ -17,6 +17,7 @@ except ImportError:  # pragma: no cover - Dispatcharr runs on Linux
 RELIABILITY_PATH = "/data/dispatcharr_stream_sort_reliability.json"
 MAX_RECENT_EVENTS = 25
 SWITCH_FAILOVER_WINDOW_SECONDS = 15.0
+SWITCH_RECONNECT_SUPPRESSION_SECONDS = 2.0
 TRACKED_EVENTS = {
     "channel_start",
     "channel_stop",
@@ -210,6 +211,7 @@ def _new_stream_entry(stream_id: int) -> dict[str, Any]:
         "buffering_failover_seconds": 0.0,
         "failovers": 0,
         "reconnects": 0,
+        "reconnects_suppressed": 0,
         "errors": 0,
         "last_event_at": None,
         "last_failure_at": None,
@@ -232,10 +234,23 @@ def _ensure_stream(data: dict[str, Any], info: Mapping[str, Any] | None, stream_
     return entry
 
 
-def _append_recent(entry: dict[str, Any], *, event: str, at: str, payload: Mapping[str, Any], role: str | None = None) -> None:
+def _append_recent(
+    entry: dict[str, Any],
+    *,
+    event: str,
+    at: str,
+    payload: Mapping[str, Any],
+    role: str | None = None,
+    classification: str | None = None,
+    counted: bool | None = None,
+) -> None:
     item: dict[str, Any] = {"event": event, "timestamp": at}
     if role:
         item["role"] = role
+    if classification:
+        item["classification"] = classification
+    if counted is not None:
+        item["counted"] = bool(counted)
     for key in ("channel_name", "reason", "duration", "speed"):
         value = payload.get(key)
         if value not in (None, ""):
@@ -264,6 +279,18 @@ def _touch_failure(entry: dict[str, Any], at: str, reason: str) -> None:
     entry["last_failure_reason"] = reason or "unknown"
 
 
+def _switch_context(channel_state: Mapping[str, Any], now: datetime) -> tuple[int | None, int | None, float | None]:
+    switch_at = _parse_datetime(channel_state.get("last_switch_at"))
+    if switch_at is None:
+        return None, None, None
+    age = (now - switch_at).total_seconds()
+    return (
+        _as_int(channel_state.get("last_switch_previous_stream_id")),
+        _as_int(channel_state.get("last_switch_stream_id")),
+        age,
+    )
+
+
 def record_runtime_event(
     event_name: str | None,
     payload: Mapping[str, Any] | None,
@@ -279,6 +306,8 @@ def record_runtime_event(
             "status": "ok",
             "message": "Runtime reliability collector is event-driven; no supported event was supplied.",
             "recorded": False,
+            "counted": False,
+            "classification": None,
             "scoring_applied": False,
             "path": path,
         }
@@ -287,6 +316,8 @@ def record_runtime_event(
     now_dt = _now_utc(now)
     now_iso = now_dt.isoformat()
     recorded_stream_id: int | None = None
+    event_counted = True
+    event_classification: str | None = None
 
     with _locked_cache(path):
         data = load_reliability_cache(path)
@@ -296,6 +327,8 @@ def record_runtime_event(
                 "status": "ok",
                 "message": f"Ignored {event}: event payload did not identify a channel.",
                 "recorded": False,
+                "counted": False,
+                "classification": None,
                 "scoring_applied": False,
                 "path": path,
             }
@@ -382,15 +415,52 @@ def record_runtime_event(
             channel_state["last_switch_stream_id"] = None
             channel_state["last_switch_at"] = None
 
-        elif event in {"channel_buffering", "channel_reconnect", "channel_error"}:
+        elif event == "channel_reconnect":
+            previous_sid, switch_sid, switch_age = _switch_context(channel_state, now_dt)
+            reported_sid = resolved_stream_id or direct_stream_id
+            switch_internal = (
+                switch_age is not None
+                and 0.0 <= switch_age <= SWITCH_RECONNECT_SUPPRESSION_SECONDS
+                and previous_sid is not None
+                and switch_sid is not None
+                and current_stream_id == switch_sid
+                and reported_sid == previous_sid
+            )
+            if switch_internal:
+                info = direct_info or _resolve_stream(previous_sid, payload_dict, resolver)
+                entry = _ensure_stream(data, info, previous_sid)
+                if entry is not None:
+                    entry["reconnects_suppressed"] = int(entry.get("reconnects_suppressed") or 0) + 1
+                    _append_recent(
+                        entry,
+                        event=event,
+                        at=now_iso,
+                        payload=payload_dict,
+                        classification="switch_internal",
+                        counted=False,
+                    )
+                    recorded_stream_id = int(entry["stream_id"])
+                event_counted = False
+                event_classification = "switch_internal"
+            else:
+                # Once Stream Sort has observed a switch, its active stream state is
+                # more current than a reconnect payload that may have been resolved
+                # from stale Redis metadata.
+                sid = current_stream_id or resolved_stream_id or direct_stream_id
+                info = direct_info if sid == resolved_stream_id else _resolve_stream(sid, payload_dict, resolver)
+                entry = _ensure_stream(data, info, sid)
+                if entry is not None:
+                    entry["reconnects"] = int(entry.get("reconnects") or 0) + 1
+                    _append_recent(entry, event=event, at=now_iso, payload=payload_dict)
+                    recorded_stream_id = int(entry["stream_id"])
+
+        elif event in {"channel_buffering", "channel_error"}:
             sid = direct_stream_id or current_stream_id or resolved_stream_id
             info = direct_info or _resolve_stream(sid, payload_dict, resolver)
             entry = _ensure_stream(data, info, sid)
             if entry is not None:
                 if event == "channel_buffering":
                     entry["buffering_events"] = int(entry.get("buffering_events") or 0) + 1
-                elif event == "channel_reconnect":
-                    entry["reconnects"] = int(entry.get("reconnects") or 0) + 1
                 else:
                     entry["errors"] = int(entry.get("errors") or 0) + 1
                     _touch_failure(entry, now_iso, str(payload_dict.get("reason") or "channel_error"))
@@ -401,7 +471,7 @@ def record_runtime_event(
             sid = current_stream_id or direct_stream_id or resolved_stream_id
             if sid is not None:
                 _add_playback_seconds(data, channel_state, sid, now_dt)
-            info = direct_info or _resolve_stream(sid, payload_dict, resolver)
+            info = direct_info if sid == resolved_stream_id else _resolve_stream(sid, payload_dict, resolver)
             entry = _ensure_stream(data, info, sid)
             if entry is not None:
                 entry["playback_stops"] = int(entry.get("playback_stops") or 0) + 1
@@ -418,13 +488,17 @@ def record_runtime_event(
         data["scoring_enabled"] = False
         _save_reliability_cache(data, path)
 
+    if recorded_stream_id is None:
+        event_counted = False
     if logger is not None:
         logger.info(
-            "[Reliability] event=%s stream=%s channel=%s recorded=%s scoring=disabled",
+            "[Reliability] event=%s stream=%s channel=%s recorded=%s counted=%s classification=%s scoring=disabled",
             event,
             recorded_stream_id or "unknown",
             payload_dict.get("channel_name") or payload_dict.get("channel_id") or "unknown",
             recorded_stream_id is not None,
+            event_counted,
+            event_classification or "normal",
         )
     return {
         "status": "ok",
@@ -432,6 +506,8 @@ def record_runtime_event(
         "event": event,
         "stream_id": recorded_stream_id,
         "recorded": recorded_stream_id is not None,
+        "counted": event_counted,
+        "classification": event_classification,
         "scoring_applied": False,
         "path": path,
     }
