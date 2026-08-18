@@ -132,3 +132,89 @@ def test_channel_buffering_is_collection_only(tmp_path):
     assert result["scoring_applied"] is False
     assert data["streams"]["50"]["buffering_events"] == 1
     assert data["scoring_enabled"] is False
+
+
+def test_switch_internal_reconnect_is_retained_but_not_counted(tmp_path):
+    path = tmp_path / "reliability.json"
+    started = datetime(2026, 8, 18, 1, 0, tzinfo=timezone.utc)
+    record_runtime_event(
+        "channel_start",
+        {"channel_name": "NBC", "stream_id": 10},
+        path=str(path), resolver=_resolver, now=started,
+    )
+    record_runtime_event(
+        "stream_switch",
+        {"channel_name": "NBC", "stream_id": 11},
+        path=str(path), resolver=_resolver, now=started + timedelta(seconds=30),
+    )
+    result = record_runtime_event(
+        "channel_reconnect",
+        {"channel_name": "NBC", "stream_id": 10},
+        path=str(path), resolver=_resolver, now=started + timedelta(seconds=30.35),
+    )
+
+    data = _load(path)
+    old_stream = data["streams"]["10"]
+    assert old_stream["reconnects"] == 0
+    assert old_stream["reconnects_suppressed"] == 1
+    assert data["streams"]["11"]["reconnects"] == 0
+    assert old_stream["recent_events"][-1]["event"] == "channel_reconnect"
+    assert old_stream["recent_events"][-1]["classification"] == "switch_internal"
+    assert old_stream["recent_events"][-1]["counted"] is False
+    assert result["stream_id"] == 10
+    assert result["counted"] is False
+    assert result["classification"] == "switch_internal"
+
+
+def test_stale_reconnect_after_suppression_window_counts_against_active_stream(tmp_path):
+    path = tmp_path / "reliability.json"
+    started = datetime(2026, 8, 18, 1, 0, tzinfo=timezone.utc)
+    record_runtime_event(
+        "channel_start",
+        {"channel_name": "NBC", "stream_id": 10},
+        path=str(path), resolver=_resolver, now=started,
+    )
+    record_runtime_event(
+        "stream_switch",
+        {"channel_name": "NBC", "stream_id": 11},
+        path=str(path), resolver=_resolver, now=started + timedelta(seconds=30),
+    )
+    result = record_runtime_event(
+        "channel_reconnect",
+        {"channel_name": "NBC", "stream_id": 10},
+        path=str(path), resolver=_resolver, now=started + timedelta(seconds=33),
+    )
+
+    data = _load(path)
+    assert data["streams"]["10"]["reconnects"] == 0
+    assert data["streams"]["11"]["reconnects"] == 1
+    assert result["stream_id"] == 11
+    assert result["counted"] is True
+    assert result["classification"] is None
+
+
+def test_immediate_reconnect_for_new_stream_is_not_suppressed(tmp_path):
+    path = tmp_path / "reliability.json"
+    started = datetime(2026, 8, 18, 1, 0, tzinfo=timezone.utc)
+    record_runtime_event(
+        "channel_start",
+        {"channel_name": "NBC", "stream_id": 10},
+        path=str(path), resolver=_resolver, now=started,
+    )
+    record_runtime_event(
+        "stream_switch",
+        {"channel_name": "NBC", "stream_id": 11},
+        path=str(path), resolver=_resolver, now=started + timedelta(seconds=30),
+    )
+    result = record_runtime_event(
+        "channel_reconnect",
+        {"channel_name": "NBC", "stream_id": 11},
+        path=str(path), resolver=_resolver, now=started + timedelta(seconds=30.35),
+    )
+
+    data = _load(path)
+    assert data["streams"]["10"]["reconnects"] == 0
+    assert data["streams"]["11"]["reconnects"] == 1
+    assert result["stream_id"] == 11
+    assert result["counted"] is True
+    assert result["classification"] is None
