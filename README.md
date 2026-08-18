@@ -31,6 +31,20 @@ Analysis and throughput share one cache:
 
 The previous `/data/dispatcharr_stream_sort_throughput.json` file is read as a migration fallback but is no longer the primary cache.
 
+## Runtime reliability telemetry
+
+Stream Sort also subscribes to Dispatcharr's runtime channel events and keeps a separate per-stream reliability history in:
+
+```text
+/data/dispatcharr_stream_sort_reliability.json
+```
+
+The collector tracks playback starts/stops, estimated active playback seconds, reconnects, errors, failovers, buffering-triggered failovers, stream switches, and `channel_buffering` events when the installed Dispatcharr version exposes that event through Connect/plugin hooks.
+
+When Dispatcharr switches streams before emitting a failover event, Stream Sort remembers the stream being left so a `buffering_timeout` failover can still be attributed to the failing stream. It also resolves missing stream IDs from Dispatcharr stream metadata when possible.
+
+**Reliability telemetry is collection-only in v0.2.3. It does not alter sorting scores or stream order.** This lets the data accumulate and be validated before a reliability scoring policy is introduced.
+
 ## Health ordering
 
 Viability is the first hard ordering gate:
@@ -95,12 +109,13 @@ All matching name rules are additive.
 - **Dry Run** — write `/data/dispatcharr_stream_sort_report.json` without changing order.
 - **Sort Streams** — apply the calculated `ChannelStream.order` only.
 - **Analyze + Sort** — incrementally analyze, then apply the refreshed ordering.
+- **Runtime Reliability Collector** — automatic event-triggered collector for Dispatcharr runtime telemetry; manual invocation does not synthesize reliability events.
 
 Separate `Probe Throughput` actions are no longer shown because throughput is part of Analyze Streams.
 
 ## Logging
 
-The plugin owns the `plugins.stream_sorter` logger and prefixes its messages with `[Stream Sort]`. Incremental runs report media checks, throughput checks, Dispatcharr metadata refresh counts, cached counts, pending work, health totals, throughput totals, and ETA.
+The plugin owns the `plugins.stream_sorter` logger and prefixes its messages with `[Stream Sort]`. Incremental runs report media checks, throughput checks, Dispatcharr metadata refresh counts, cached counts, pending work, health totals, throughput totals, and ETA. Runtime telemetry is logged with `[Reliability]` inside the Stream Sort logger.
 
 ## Development
 

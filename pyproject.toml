@@ -1,7 +1,7 @@
 [project]
 name = "dispatcharr-stream-sort-plugin"
-version = "0.2.2"
-description = "Stream health analysis, scoring, and ordering for Dispatcharr"
+version = "0.2.3"
+description = "Stream health analysis, scoring, ordering, and runtime reliability telemetry for Dispatcharr"
 requires-python = ">=3.11"
 
 [tool.pytest.ini_options]

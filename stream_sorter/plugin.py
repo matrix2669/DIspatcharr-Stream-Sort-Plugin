@@ -11,6 +11,7 @@ except ImportError:  # pragma: no cover - Dispatcharr runs on Linux
     fcntl = None
 
 from .analyzer import ANALYSIS_CACHE_PATH, analyze_assigned_streams, probe_assigned_streams
+from .reliability import RELIABILITY_PATH, record_runtime_event
 from .sorter import REPORT_PATH, resolve_channel_scope, sort_channels
 from .throughput import DEFAULT_CACHE_PATH
 
@@ -323,6 +324,14 @@ class Plugin:
         logger = LOGGER
 
         try:
+            if action == "record_runtime_event":
+                return record_runtime_event(
+                    (params or {}).get("event"),
+                    (params or {}).get("payload") or {},
+                    logger=logger,
+                    path=RELIABILITY_PATH,
+                )
+
             if action == "dry_run":
                 result = sort_channels(settings, apply=False, logger=logger)
                 return {
