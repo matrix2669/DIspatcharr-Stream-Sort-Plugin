@@ -179,6 +179,7 @@ def _fair_account_futures(
     max_workers: int,
     thread_name_prefix: str,
     capacity_manager=None,
+    max_per_account: int | None = None,
 ):
     """Yield completed work while balancing active slots across M3U accounts."""
     queues: dict[tuple[str, Any], collections.deque] = {}
@@ -197,7 +198,12 @@ def _fair_account_futures(
         futures = {}
         while futures or any(queues[key] for key in account_order):
             while len(futures) < worker_count:
-                pending = [key for key in account_order if queues[key]]
+                pending = [
+                    key
+                    for key in account_order
+                    if queues[key]
+                    and (max_per_account is None or running[key] < max_per_account)
+                ]
                 if not pending:
                     break
                 # Prefer an account with fewer active slots; lifetime launch
@@ -221,8 +227,14 @@ def _fair_account_futures(
                     if not acquired:
                         continue
                     item = queues[key].popleft()
+                    worker_item = (
+                        capacity_manager.prepare_item(item, reservation)
+                        if capacity_manager is not None
+                        and hasattr(capacity_manager, "prepare_item")
+                        else item
+                    )
                     try:
-                        future = executor.submit(worker, item)
+                        future = executor.submit(worker, worker_item)
                     except Exception:
                         if capacity_manager is not None:
                             capacity_manager.release(reservation)
@@ -708,6 +720,7 @@ def analyze_assigned_streams(settings: Mapping[str, Any], *, logger, cache_path:
                 max_workers=workers,
                 thread_name_prefix="stream-sort-media-retry",
                 capacity_manager=capacity_manager,
+                max_per_account=1,
             ):
                 if future is None:
                     logger.info(

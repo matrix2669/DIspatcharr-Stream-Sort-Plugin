@@ -83,9 +83,11 @@ Healthy throughput is cached for the configured TTL. Any non-healthy throughput 
 
 The **Parallel tests** setting controls both media checks and integrated throughput probes (maximum 16). When the worker count is less than or equal to the number of M3U sources with pending work, every active worker uses a different source. Additional workers are distributed round-robin across sources, and capacity is reassigned when a source runs out of pending streams. The per-source start delay still applies, but different M3U sources can start throughput probes at the same time.
 
-Before a worker opens a limited M3U source, it reserves a slot using Dispatcharr's atomic profile and shared-credential connection pool. Connections already held by viewers therefore reduce analyzer capacity. A source with `max_streams = 0` remains unlimited. If every remaining source is at capacity, those checks are deferred without replacing their cached health or throughput data and are eligible again on the next Analyze run.
+Before a worker opens an M3U source, it selects from all active profiles using Dispatcharr's atomic profile and shared-credential connection pool. Connections already held by viewers therefore reduce analyzer capacity, while two one-stream profiles provide two analyzer slots when both are free. The selected profile's native Dispatcharr URL resolver applies its regex or Xtream credential rewrite before the probe connects. A profile with `max_streams = 0` remains unlimited. If every remaining profile is at capacity, those checks are deferred without replacing their cached health or throughput data and are eligible again on the next Analyze run.
 
 Analysis runs in the background. Use **Check Status** to see the active media, retry, throughput, or sorting phase and its latest progress, or to review the outcome of the last run.
+
+Retry passes run at most one recheck per M3U source at a time, while different sources may retry in parallel. This prevents a provider-wide connection burst from being repeated while confirming an initial failure.
 
 ## Channel scope
 
