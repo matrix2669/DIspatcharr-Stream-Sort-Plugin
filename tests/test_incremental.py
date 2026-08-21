@@ -1,7 +1,10 @@
+import collections
+import threading
 from datetime import datetime, timedelta, timezone
 
 from stream_sorter import analyzer, incremental
 from stream_sorter.incremental import (
+    _fair_account_futures,
     _sync_runtime_playback_health,
     analyze_assigned_streams,
     health_check_reason,
@@ -12,6 +15,65 @@ from stream_sorter.incremental import (
 
 def _now():
     return datetime(2026, 8, 17, 20, 0, tzinfo=timezone.utc)
+
+
+def _scheduled_accounts(items, workers):
+    starts = []
+    starts_lock = threading.Lock()
+    first_wave = threading.Barrier(workers)
+
+    def worker(item):
+        with starts_lock:
+            position = len(starts)
+            starts.append(item["account_id"])
+        if position < workers:
+            first_wave.wait(timeout=2)
+        return item["id"]
+
+    completed = list(
+        _fair_account_futures(
+            items,
+            worker,
+            max_workers=workers,
+            thread_name_prefix="test-fair-scheduler",
+        )
+    )
+    assert sorted(future.result() for _item, future in completed) == sorted(item["id"] for item in items)
+    return starts
+
+
+def test_parallel_tests_use_distinct_m3u_sources_before_reusing_one():
+    items = [
+        {"id": 1, "account_id": 10},
+        {"id": 2, "account_id": 10},
+        {"id": 3, "account_id": 20},
+        {"id": 4, "account_id": 20},
+        {"id": 5, "account_id": 30},
+        {"id": 6, "account_id": 30},
+    ]
+    starts = _scheduled_accounts(items, workers=2)
+    assert len(set(starts[:2])) == 2
+
+
+def test_parallel_tests_split_extra_workers_evenly_across_m3u_sources():
+    items = [
+        {"id": index, "account_id": account_id}
+        for index, account_id in enumerate([10, 10, 10, 10, 20, 20, 20, 20], start=1)
+    ]
+    starts = _scheduled_accounts(items, workers=5)
+    assert collections.Counter(starts[:5]) == {10: 3, 20: 2}
+
+
+def test_parallel_tests_reassign_capacity_when_an_m3u_source_runs_out():
+    items = [
+        {"id": 1, "account_id": 10},
+        {"id": 2, "account_id": 20},
+        {"id": 3, "account_id": 20},
+        {"id": 4, "account_id": 20},
+        {"id": 5, "account_id": 20},
+    ]
+    starts = _scheduled_accounts(items, workers=3)
+    assert collections.Counter(starts[:3]) == {20: 2, 10: 1}
 
 
 def test_incremental_analyzer_is_installed_for_plugin_compatibility():

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import collections
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from datetime import datetime, timedelta, timezone
 from typing import Any, Mapping
 
@@ -162,6 +162,50 @@ def _overall_health_text(counts) -> str:
 
 def _overall_throughput_text(counts) -> str:
     return f"healthy={counts.get('healthy', 0)} marginal={counts.get('marginal', 0)} insufficient={counts.get('insufficient', 0)} unknown={counts.get('unknown', 0)}"
+
+
+def _account_key(item: Mapping[str, Any]) -> tuple[str, Any]:
+    account_id = item.get("account_id")
+    if account_id is not None:
+        return "id", account_id
+    return "unknown", str(item.get("account_name") or "unknown")
+
+
+def _fair_account_futures(items, worker, *, max_workers: int, thread_name_prefix: str):
+    """Yield completed work while balancing active slots across M3U accounts."""
+    queues: dict[tuple[str, Any], collections.deque] = {}
+    account_order: list[tuple[str, Any]] = []
+    for item in items:
+        key = _account_key(item)
+        if key not in queues:
+            queues[key] = collections.deque()
+            account_order.append(key)
+        queues[key].append(item)
+
+    running: collections.Counter = collections.Counter()
+    launched: collections.Counter = collections.Counter()
+    worker_count = max(1, int(max_workers))
+    with ThreadPoolExecutor(max_workers=worker_count, thread_name_prefix=thread_name_prefix) as executor:
+        futures = {}
+        while futures or any(queues[key] for key in account_order):
+            while len(futures) < worker_count:
+                pending = [key for key in account_order if queues[key]]
+                if not pending:
+                    break
+                # Prefer an account with fewer active slots; lifetime launch
+                # counts make ties round-robin instead of favoring list order.
+                key = min(pending, key=lambda candidate: (running[candidate], launched[candidate], account_order.index(candidate)))
+                item = queues[key].popleft()
+                future = executor.submit(worker, item)
+                futures[future] = (item, key)
+                running[key] += 1
+                launched[key] += 1
+
+            done, _pending = wait(futures, return_when=FIRST_COMPLETED)
+            for future in done:
+                item, key = futures.pop(future)
+                running[key] -= 1
+                yield item, future
 
 
 def _item_from_stream(stream) -> dict[str, Any]:
@@ -540,38 +584,44 @@ def analyze_assigned_streams(settings: Mapping[str, Any], *, logger, cache_path:
         return result
 
     if media_due:
-        with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="stream-sort-media") as executor:
-            futures = {executor.submit(run_media, item): item for item, _ in media_due}
-            for completed, future in enumerate(as_completed(futures), start=1):
-                item = futures[future]
-                try:
-                    result = future.result()
-                except Exception as exc:
-                    result = {
-                        "tested_at": analyzer._utc_now_iso(),
-                        "status": "dead",
-                        "error_type": "other",
-                        "error": str(exc),
-                        "stats": {},
-                        "details": {},
-                    }
-                media_results[int(item["id"])] = dict(result)
-                elapsed = max(time.monotonic() - media_started, 0.001)
-                eta = elapsed / completed * (len(media_due) - completed) if completed < len(media_due) else 0.0
-                counts = _status_counts(items, cache)
-                old_status = str((cache.get(str(item["id"])) or {}).get("status") or "unknown").lower()
-                new_status = str(result.get("status") or "unknown").lower()
-                counts[old_status] -= 1
-                counts[new_status] += 1
-                stats = result.get("stats") or {}
-                logger.info(
-                    "[Analyze Media] %d%% (%d/%d) stream=%s reason=%s health=%s resolution=%s fps=%s bitrate=%skbps | overall %s cached_media=%d pending_media=%d | ETA=%s",
-                    int(round(completed / len(media_due) * 100)), completed, len(media_due), item["id"],
-                    reason_by_id[int(item["id"])], new_status, stats.get("resolution") or "n/a",
-                    f"{float(stats['source_fps']):.1f}" if stats.get("source_fps") is not None else "n/a",
-                    f"{float(stats['video_bitrate']):.0f}" if stats.get("video_bitrate") is not None else "n/a",
-                    _overall_health_text(counts), total - len(media_due), len(media_due) - completed, analyzer._format_eta(eta),
-                )
+        media_items = [item for item, _reason in media_due]
+        for completed, (item, future) in enumerate(
+            _fair_account_futures(
+                media_items,
+                run_media,
+                max_workers=workers,
+                thread_name_prefix="stream-sort-media",
+            ),
+            start=1,
+        ):
+            try:
+                result = future.result()
+            except Exception as exc:
+                result = {
+                    "tested_at": analyzer._utc_now_iso(),
+                    "status": "dead",
+                    "error_type": "other",
+                    "error": str(exc),
+                    "stats": {},
+                    "details": {},
+                }
+            media_results[int(item["id"])] = dict(result)
+            elapsed = max(time.monotonic() - media_started, 0.001)
+            eta = elapsed / completed * (len(media_due) - completed) if completed < len(media_due) else 0.0
+            counts = _status_counts(items, cache)
+            old_status = str((cache.get(str(item["id"])) or {}).get("status") or "unknown").lower()
+            new_status = str(result.get("status") or "unknown").lower()
+            counts[old_status] -= 1
+            counts[new_status] += 1
+            stats = result.get("stats") or {}
+            logger.info(
+                "[Analyze Media] %d%% (%d/%d) stream=%s reason=%s health=%s resolution=%s fps=%s bitrate=%skbps | overall %s cached_media=%d pending_media=%d | ETA=%s",
+                int(round(completed / len(media_due) * 100)), completed, len(media_due), item["id"],
+                reason_by_id[int(item["id"])], new_status, stats.get("resolution") or "n/a",
+                f"{float(stats['source_fps']):.1f}" if stats.get("source_fps") is not None else "n/a",
+                f"{float(stats['video_bitrate']):.0f}" if stats.get("video_bitrate") is not None else "n/a",
+                _overall_health_text(counts), total - len(media_due), len(media_due) - completed, analyzer._format_eta(eta),
+            )
 
         by_id = {int(item["id"]): item for item, _ in media_due}
         for retry_pass in range(1, retries + 1):
@@ -584,21 +634,24 @@ def analyze_assigned_streams(settings: Mapping[str, Any], *, logger, cache_path:
             backoff = max(1.0, account_delay * 3.0)
             logger.info("[Analyze Retry %d/%d] waiting %.1fs before retrying %d media checks", retry_pass, retries, backoff, len(retry_ids))
             time.sleep(backoff)
-            with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="stream-sort-media-retry") as executor:
-                futures = {executor.submit(run_media, by_id[sid]): by_id[sid] for sid in retry_ids}
-                for future in as_completed(futures):
-                    item = futures[future]
-                    try:
-                        media_results[int(item["id"])] = dict(future.result())
-                    except Exception as exc:
-                        media_results[int(item["id"])] = {
-                            "tested_at": analyzer._utc_now_iso(),
-                            "status": "dead",
-                            "error_type": "other",
-                            "error": str(exc),
-                            "stats": {},
-                            "details": {},
-                        }
+            retry_items = [by_id[sid] for sid in retry_ids]
+            for item, future in _fair_account_futures(
+                retry_items,
+                run_media,
+                max_workers=workers,
+                thread_name_prefix="stream-sort-media-retry",
+            ):
+                try:
+                    media_results[int(item["id"])] = dict(future.result())
+                except Exception as exc:
+                    media_results[int(item["id"])] = {
+                        "tested_at": analyzer._utc_now_iso(),
+                        "status": "dead",
+                        "error_type": "other",
+                        "error": str(exc),
+                        "stats": {},
+                        "details": {},
+                    }
 
         for item, _ in media_due:
             sid = int(item["id"])
@@ -635,17 +688,13 @@ def analyze_assigned_streams(settings: Mapping[str, Any], *, logger, cache_path:
     if throughput_due:
         throughput_started = time.monotonic()
         min_start_interval = 60.0 / float(throughput_rate_per_minute)
-        last_probe_started = 0.0
-        account_next_eligible = {}
-        for completed, (item, reason) in enumerate(throughput_due, start=1):
-            account_id = item.get("account_id")
-            wait_until = max(
-                last_probe_started + min_start_interval if last_probe_started else 0.0,
-                account_next_eligible.get(account_id, 0.0),
-            )
-            while time.monotonic() < wait_until:
-                time.sleep(min(0.25, wait_until - time.monotonic()))
-            last_probe_started = time.monotonic()
+        global_probe_limiter = analyzer._PerAccountStartLimiter(min_start_interval)
+        account_probe_limiter = analyzer._PerAccountStartLimiter(throughput_account_delay)
+        throughput_reason_by_id = {int(item["id"]): reason for item, reason in throughput_due}
+
+        def run_throughput(item):
+            account_probe_limiter.wait(item.get("account_id"))
+            global_probe_limiter.wait(None)
             entry = cache.get(str(item["id"])) or {}
             stats = entry.get("stats") or {}
             _width, height = parse_resolution(stats)
@@ -658,7 +707,29 @@ def analyze_assigned_streams(settings: Mapping[str, Any], *, logger, cache_path:
                 timeout_seconds=throughput_timeout,
                 user_agent=str(item.get("user_agent") or DEFAULT_USER_AGENT),
             )
-            account_next_eligible[account_id] = time.monotonic() + throughput_account_delay
+            return result, nominal
+
+        throughput_items = [item for item, _reason in throughput_due]
+        for completed, (item, future) in enumerate(
+            _fair_account_futures(
+                throughput_items,
+                run_throughput,
+                max_workers=workers,
+                thread_name_prefix="stream-sort-throughput",
+            ),
+            start=1,
+        ):
+            reason = throughput_reason_by_id[int(item["id"])]
+            try:
+                result, nominal = future.result()
+            except Exception as exc:
+                result = {
+                    "status": "unknown",
+                    "tested_at": analyzer._utc_now_iso(),
+                    "error": f"{type(exc).__name__}: {exc}",
+                }
+                nominal = None
+            entry = cache.get(str(item["id"])) or {}
             cache[str(item["id"])] = _merge_throughput_result(item, entry, result, ttl_hours=throughput_ttl_hours)
             analyzer.save_analysis_cache(cache, cache_path)
             throughput_checked_ids.add(int(item["id"]))

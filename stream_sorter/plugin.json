@@ -1,6 +1,6 @@
 {
   "name": "Dispatcharr Stream Sort",
-  "version": "0.3.1",
+  "version": "0.3.2",
   "description": "Analyzes stream health, quality, delivery performance, and runtime reliability telemetry, reuses fresh Dispatcharr playback metadata, then scores and reorders streams already assigned to channels.",
   "author": "matrix2669",
   "help_url": "https://github.com/matrix2669/DIspatcharr-Stream-Sort-Plugin",
@@ -20,7 +20,7 @@
     {"id":"playback_health_ttl_hours","label":"Playback reachability TTL (hours)","type":"number","default":6,"help_text":"How recently qualifying playback must have occurred to replace a direct reachability probe."},
     {"id":"content_validation_ttl_hours","label":"Content validation interval (hours)","type":"number","default":168,"help_text":"Black, frozen, and silent checks still run periodically. Recent playback defers an initially missing content check until this interval expires."},
     {"id":"healthy_throughput_ttl_hours","label":"Healthy throughput TTL (hours)","type":"number","default":6,"help_text":"HEALTHY throughput is reused until this TTL expires. Marginal, insufficient, and unknown throughput are rechecked every Analyze run. 0 forces throughput recheck on every Analyze run."},
-    {"id":"analysis_workers","label":"Analysis workers","type":"number","default":2,"help_text":"Number of media checks analyzed in parallel. Keep this conservative if a provider limits simultaneous connections."},
+    {"id":"analysis_workers","label":"Parallel tests","type":"number","default":2,"help_text":"Total concurrent media and throughput tests (maximum 16). Active slots are balanced across M3U sources: distinct sources are preferred before a source receives another slot."},
     {"id":"analysis_connection_timeout_seconds","label":"Analysis connection timeout (seconds)","type":"number","default":10},
     {"id":"analysis_probe_timeout_seconds","label":"Analysis probe timeout (seconds)","type":"number","default":20},
     {"id":"analysis_duration_seconds","label":"FFprobe sample duration (seconds)","type":"number","default":5,"help_text":"Packet sample used for bitrate and metadata analysis."},
@@ -45,10 +45,11 @@
     {"id":"probe_per_account_delay_seconds","label":"Per-source throughput start delay (seconds)","type":"number","default":1},
     {"id":"reliability_info","label":"Runtime reliability telemetry","type":"info","description":"Stream Sort collects runtime events and applies a bounded soft reliability score after at least 30 minutes of new playback or three new starts. Evidence decays with a 14-day half-life. Legacy v0.2.x counters are preserved but excluded because channel errors could be misattributed."},
     {"id":"reliability_scoring_enabled","label":"Use runtime reliability in sorting","type":"boolean","default":true,"help_text":"Reliability contributes at most +/-20 points inside the existing viability and resolution tiers. Streams without enough new evidence remain neutral."},
-    {"id":"paths_info","label":"Files","type":"info","description":"Unified analysis/throughput cache: /data/dispatcharr_stream_sort_analysis.json | Runtime reliability telemetry: /data/dispatcharr_stream_sort_reliability.json | Dry-run/apply report: /data/dispatcharr_stream_sort_report.json. The old standalone throughput cache is read only as a migration fallback."}
+    {"id":"paths_info","label":"Files","type":"info","description":"Unified analysis/throughput cache: /data/dispatcharr_stream_sort_analysis.json | Analysis status: /data/dispatcharr_stream_sort_status.json | Runtime reliability telemetry: /data/dispatcharr_stream_sort_reliability.json | Dry-run/apply report: /data/dispatcharr_stream_sort_report.json. The old standalone throughput cache is read only as a migration fallback."}
   ],
   "actions": [
     {"id":"analyze_streams","label":"Analyze Streams","description":"Incrementally refresh only health/content, metadata, or throughput data that needs checking in the selected channel scope.","button_label":"Analyze Streams","button_variant":"outline","button_color":"orange","confirm":{"required":true,"title":"Analyze assigned streams?","message":"Fresh cached data and newer Dispatcharr playback metadata are reused. Provider connections are opened only for components that need refreshing. It does not rename, move, create, or delete channels."}},
+    {"id":"check_analysis_status","label":"Check Analysis Status","description":"Show the current phase and progress of the active analysis, or the outcome of the last analysis.","button_label":"Check Status","button_variant":"outline","button_color":"gray"},
     {"id":"dry_run","label":"Dry Run","description":"Calculate the proposed order for the selected channel scope without changing ChannelStream.order.","button_label":"Dry Run","button_variant":"outline","button_color":"blue"},
     {"id":"sort_streams","label":"Sort Streams","description":"Apply the calculated order to streams already assigned to channels inside the selected scope.","button_label":"Sort Streams","button_variant":"filled","button_color":"blue","confirm":{"required":true,"title":"Apply stream ordering?","message":"This changes ChannelStream.order only for the selected channel scope. It does not add or remove streams."}},
     {"id":"analyze_and_sort","label":"Analyze + Sort","description":"Incrementally refresh required health/content/metadata/throughput data, then apply stream ordering.","button_label":"Analyze + Sort","button_variant":"filled","button_color":"orange","confirm":{"required":true,"title":"Analyze and sort streams?","message":"This refreshes only data that needs checking and then changes ChannelStream.order. It does not rename, move, create, or delete channels."}},
