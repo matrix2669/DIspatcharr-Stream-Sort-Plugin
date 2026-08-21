@@ -268,6 +268,7 @@ def _analysis_status() -> dict:
             f"Last Stream Sort analysis completed: {result.get('streams_analyzed', 0)} streams; "
             f"{result.get('media_checked', 0)} media checks; "
             f"{result.get('throughput_checked', 0)} throughput checks; "
+            f"{result.get('capacity_deferred', 0)} capacity-deferred checks; "
             f"{result.get('playback_health_refreshed', 0)} playback reachability reuses."
         )
     elif job_status == "failed":

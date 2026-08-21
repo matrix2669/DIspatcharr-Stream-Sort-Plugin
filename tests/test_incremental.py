@@ -138,6 +138,19 @@ def test_throughput_parallelism_is_limited_per_source_not_globally(tmp_path, mon
     })
     monkeypatch.setattr("stream_sorter.sorter.resolve_channel_scope", lambda _settings: (None, {}))
 
+    class UnlimitedCapacity:
+        def try_acquire(self, _item):
+            return True, None
+
+        def release(self, _reservation):
+            pass
+
+    monkeypatch.setattr(
+        incremental,
+        "build_capacity_manager",
+        lambda _items, logger: UnlimitedCapacity(),
+    )
+
     limiter_waits = []
 
     class RecordingLimiter:

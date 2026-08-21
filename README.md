@@ -13,6 +13,7 @@ Stream Sort no longer requires IPTV Checker for sorting data. `Analyze Streams` 
 - measured delivery throughput and throughput health
 - rate-limit-aware retry behavior
 - account-aware parallel scheduling that distributes active tests evenly across M3U sources
+- atomic Dispatcharr connection-pool reservations that preserve capacity for active viewers
 
 The analyzer tracks four independent freshness components:
 
@@ -81,6 +82,8 @@ Throughput is delivery capacity, not the stream's encoded video bitrate.
 Healthy throughput is cached for the configured TTL. Any non-healthy throughput result is eligible for another probe on the next Analyze run.
 
 The **Parallel tests** setting controls both media checks and integrated throughput probes (maximum 16). When the worker count is less than or equal to the number of M3U sources with pending work, every active worker uses a different source. Additional workers are distributed round-robin across sources, and capacity is reassigned when a source runs out of pending streams. The per-source start delay still applies, but different M3U sources can start throughput probes at the same time.
+
+Before a worker opens a limited M3U source, it reserves a slot using Dispatcharr's atomic profile and shared-credential connection pool. Connections already held by viewers therefore reduce analyzer capacity. A source with `max_streams = 0` remains unlimited. If every remaining source is at capacity, those checks are deferred without replacing their cached health or throughput data and are eligible again on the next Analyze run.
 
 Analysis runs in the background. Use **Check Status** to see the active media, retry, throughput, or sorting phase and its latest progress, or to review the outcome of the last run.
 

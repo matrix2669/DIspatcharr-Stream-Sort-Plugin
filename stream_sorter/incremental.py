@@ -7,6 +7,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Mapping
 
 from . import analyzer
+from .capacity import build_capacity_manager
 from .scoring import estimate_nominal_throughput_kbps, parse_fps, parse_resolution
 from .reliability import RELIABILITY_PATH, load_reliability_cache
 from .throughput import (
@@ -171,7 +172,14 @@ def _account_key(item: Mapping[str, Any]) -> tuple[str, Any]:
     return "unknown", str(item.get("account_name") or "unknown")
 
 
-def _fair_account_futures(items, worker, *, max_workers: int, thread_name_prefix: str):
+def _fair_account_futures(
+    items,
+    worker,
+    *,
+    max_workers: int,
+    thread_name_prefix: str,
+    capacity_manager=None,
+):
     """Yield completed work while balancing active slots across M3U accounts."""
     queues: dict[tuple[str, Any], collections.deque] = {}
     account_order: list[tuple[str, Any]] = []
@@ -194,17 +202,57 @@ def _fair_account_futures(items, worker, *, max_workers: int, thread_name_prefix
                     break
                 # Prefer an account with fewer active slots; lifetime launch
                 # counts make ties round-robin instead of favoring list order.
-                key = min(pending, key=lambda candidate: (running[candidate], launched[candidate], account_order.index(candidate)))
-                item = queues[key].popleft()
-                future = executor.submit(worker, item)
-                futures[future] = (item, key)
-                running[key] += 1
-                launched[key] += 1
+                candidates = sorted(
+                    pending,
+                    key=lambda candidate: (
+                        running[candidate],
+                        launched[candidate],
+                        account_order.index(candidate),
+                    ),
+                )
+                submitted = False
+                for key in candidates:
+                    item = queues[key][0]
+                    acquired, reservation = (
+                        capacity_manager.try_acquire(item)
+                        if capacity_manager is not None
+                        else (True, None)
+                    )
+                    if not acquired:
+                        continue
+                    item = queues[key].popleft()
+                    try:
+                        future = executor.submit(worker, item)
+                    except Exception:
+                        if capacity_manager is not None:
+                            capacity_manager.release(reservation)
+                        raise
+                    futures[future] = (item, key, reservation)
+                    running[key] += 1
+                    launched[key] += 1
+                    submitted = True
+                    break
+                if not submitted:
+                    break
+
+            if not futures:
+                # Every remaining limited source is currently occupied by
+                # viewers or other reserved connections. Leave its cached
+                # result unchanged and retry it on the next analysis run.
+                for key in account_order:
+                    while queues[key]:
+                        yield queues[key].popleft(), None
+                break
 
             done, _pending = wait(futures, return_when=FIRST_COMPLETED)
+            completed_rows = []
             for future in done:
-                item, key = futures.pop(future)
+                item, key, reservation = futures.pop(future)
                 running[key] -= 1
+                if capacity_manager is not None:
+                    capacity_manager.release(reservation)
+                completed_rows.append((item, future))
+            for item, future in completed_rows:
                 yield item, future
 
 
@@ -548,6 +596,7 @@ def analyze_assigned_streams(settings: Mapping[str, Any], *, logger, cache_path:
             "streams_selected": 0,
             "media_checked": 0,
             "throughput_checked": 0,
+            "capacity_deferred": 0,
             "fully_cached": 0,
             "dispatcharr_metadata_refreshed": 0,
             "playback_health_refreshed": 0,
@@ -558,7 +607,10 @@ def analyze_assigned_streams(settings: Mapping[str, Any], *, logger, cache_path:
             "cache_path": cache_path,
         }
 
+    capacity_manager = build_capacity_manager(items, logger=logger)
+
     media_results = {}
+    media_capacity_deferred_ids = set()
     old_signatures = {
         int(item["id"]): _stats_signature((cache.get(str(item["id"])) or {}).get("stats"))
         for item, _ in media_due
@@ -590,9 +642,25 @@ def analyze_assigned_streams(settings: Mapping[str, Any], *, logger, cache_path:
                 run_media,
                 max_workers=workers,
                 thread_name_prefix="stream-sort-media",
+                capacity_manager=capacity_manager,
             ),
             start=1,
         ):
+            if future is None:
+                sid = int(item["id"])
+                media_capacity_deferred_ids.add(sid)
+                elapsed = max(time.monotonic() - media_started, 0.001)
+                eta = elapsed / completed * (len(media_due) - completed) if completed < len(media_due) else 0.0
+                logger.info(
+                    "[Analyze Media] %d%% (%d/%d) stream=%s reason=%s health=deferred_capacity | M3U connection limit is occupied; cached result preserved | ETA=%s",
+                    int(round(completed / len(media_due) * 100)),
+                    completed,
+                    len(media_due),
+                    sid,
+                    reason_by_id[sid],
+                    analyzer._format_eta(eta),
+                )
+                continue
             try:
                 result = future.result()
             except Exception as exc:
@@ -639,7 +707,16 @@ def analyze_assigned_streams(settings: Mapping[str, Any], *, logger, cache_path:
                 run_media,
                 max_workers=workers,
                 thread_name_prefix="stream-sort-media-retry",
+                capacity_manager=capacity_manager,
             ):
+                if future is None:
+                    logger.info(
+                        "[Analyze Retry %d/%d] stream=%s deferred because its M3U connection limit is occupied",
+                        retry_pass,
+                        retries,
+                        item["id"],
+                    )
+                    continue
                 try:
                     media_results[int(item["id"])] = dict(future.result())
                 except Exception as exc:
@@ -654,6 +731,8 @@ def analyze_assigned_streams(settings: Mapping[str, Any], *, logger, cache_path:
 
         for item, _ in media_due:
             sid = int(item["id"])
+            if sid not in media_results:
+                continue
             result = media_results[sid]
             cache[str(sid)] = _merge_media_result(item, cache.get(str(sid)), result)
             analyzer._persist_dispatcharr_result(sid, result, logger)
@@ -684,6 +763,7 @@ def analyze_assigned_streams(settings: Mapping[str, Any], *, logger, cache_path:
             throughput_due.append((item, reason))
 
     throughput_checked_ids = set()
+    throughput_capacity_deferred_ids = set()
     if throughput_due:
         throughput_started = time.monotonic()
         account_probe_limiter = analyzer._PerAccountStartLimiter(throughput_account_delay)
@@ -712,10 +792,26 @@ def analyze_assigned_streams(settings: Mapping[str, Any], *, logger, cache_path:
                 run_throughput,
                 max_workers=workers,
                 thread_name_prefix="stream-sort-throughput",
+                capacity_manager=capacity_manager,
             ),
             start=1,
         ):
             reason = throughput_reason_by_id[int(item["id"])]
+            if future is None:
+                sid = int(item["id"])
+                throughput_capacity_deferred_ids.add(sid)
+                elapsed = max(time.monotonic() - throughput_started, 0.001)
+                eta = elapsed / completed * (len(throughput_due) - completed) if completed < len(throughput_due) else 0.0
+                logger.info(
+                    "[Analyze Throughput] %d%% (%d/%d) stream=%s reason=%s throughput=deferred_capacity measured=n/aMbps nominal=n/akbps | M3U connection limit is occupied; cached result preserved | ETA=%s",
+                    int(round(completed / len(throughput_due) * 100)),
+                    completed,
+                    len(throughput_due),
+                    sid,
+                    reason,
+                    analyzer._format_eta(eta),
+                )
+                continue
             try:
                 result, nominal = future.result()
             except Exception as exc:
@@ -745,15 +841,18 @@ def analyze_assigned_streams(settings: Mapping[str, Any], *, logger, cache_path:
             )
 
     media_checked_ids = set(media_results)
+    capacity_deferred_ids = media_capacity_deferred_ids | throughput_capacity_deferred_ids
     fully_cached = sum(
         1 for item in items
-        if int(item["id"]) not in media_checked_ids and int(item["id"]) not in throughput_checked_ids
+        if int(item["id"]) not in media_checked_ids
+        and int(item["id"]) not in throughput_checked_ids
+        and int(item["id"]) not in capacity_deferred_ids
     )
     health_counts = _status_counts(items, cache)
     throughput_counts = _throughput_counts(items, cache)
     logger.info(
-        "[Analyze] Complete: streams=%d media_checked=%d throughput_checked=%d fully_cached=%d playback_health_refreshed=%d dispatcharr_metadata_refreshed=%d | health %s | throughput %s",
-        total, len(media_checked_ids), len(throughput_checked_ids), fully_cached, playback_health_refreshed, dispatcharr_metadata_refreshed,
+        "[Analyze] Complete: streams=%d media_checked=%d throughput_checked=%d capacity_deferred=%d fully_cached=%d playback_health_refreshed=%d dispatcharr_metadata_refreshed=%d | health %s | throughput %s",
+        total, len(media_checked_ids), len(throughput_checked_ids), len(capacity_deferred_ids), fully_cached, playback_health_refreshed, dispatcharr_metadata_refreshed,
         _overall_health_text(health_counts), _overall_throughput_text(throughput_counts),
     )
     return {
@@ -761,6 +860,7 @@ def analyze_assigned_streams(settings: Mapping[str, Any], *, logger, cache_path:
         "streams_selected": total,
         "media_checked": len(media_checked_ids),
         "throughput_checked": len(throughput_checked_ids),
+        "capacity_deferred": len(capacity_deferred_ids),
         "fully_cached": fully_cached,
         "dispatcharr_metadata_refreshed": dispatcharr_metadata_refreshed,
         "playback_health_refreshed": playback_health_refreshed,
