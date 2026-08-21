@@ -18,6 +18,7 @@ from .scoring import (
     rank_candidates,
 )
 from .throughput import DEFAULT_CACHE_PATH, DEFAULT_USER_AGENT, load_cache, probe_stream, save_cache
+from .reliability import RELIABILITY_PATH, load_reliability_cache
 
 
 REPORT_PATH = "/data/dispatcharr_stream_sort_report.json"
@@ -211,11 +212,15 @@ def _settings(settings: Mapping[str, Any]) -> dict[str, Any]:
         "include_single_stream_channels": _as_bool(
             settings.get("include_single_stream_channels"), False
         ),
+        "reliability_scoring_enabled": _as_bool(
+            settings.get("reliability_scoring_enabled"), True
+        ),
     }
 
 
 def _load_channel_candidates(
     throughput_cache: dict[str, dict[str, Any]],
+    reliability_cache: dict[str, Any],
     channel_ids: set[int] | None = None,
 ):
     from apps.channels.models import ChannelStream
@@ -251,6 +256,7 @@ def _load_channel_candidates(
                     is_stale=bool(getattr(stream, "is_stale", False)),
                     url=stream.url,
                     throughput=throughput_cache.get(str(stream.id)),
+                    reliability=(reliability_cache.get("streams") or {}).get(str(stream.id)),
                 )
             )
         results.append((channel, channel_rows, candidates))
@@ -277,6 +283,7 @@ def _evaluation_json(evaluation) -> dict[str, Any]:
             else None
         ),
         "throughput_status": evaluation.throughput_status,
+        "reliability_status": evaluation.reliability_status,
         "score": evaluation.total_score,
         "score_breakdown": evaluation.breakdown,
         "matched_name_rules": evaluation.matched_name_rules,
@@ -316,7 +323,8 @@ def sort_channels(
     cfg = _settings(settings)
     channel_ids, filter_summary = resolve_channel_scope(settings)
     cache = load_cache(cache_path)
-    channels = _load_channel_candidates(cache, channel_ids)
+    reliability_cache = load_reliability_cache(RELIABILITY_PATH)
+    channels = _load_channel_candidates(cache, reliability_cache, channel_ids)
 
     changed_channels = 0
     changed_rows = 0
@@ -335,6 +343,7 @@ def sort_channels(
             source_rules=cfg["source_rules"],
             name_rules=cfg["name_rules"],
             throughput_cache_ttl_minutes=cfg["throughput_cache_ttl_minutes"],
+            reliability_scoring_enabled=cfg["reliability_scoring_enabled"],
             now=now,
         )
         old_ids = [row.stream_id for row in sorted(channel_rows, key=lambda r: (r.order, r.id))]

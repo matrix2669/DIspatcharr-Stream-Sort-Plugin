@@ -4,7 +4,7 @@ Dispatcharr Stream Sort analyzes the streams already attached to Dispatcharr cha
 
 ## Built-in incremental checker
 
-Stream Sort no longer requires IPTV Checker for sorting data. `Analyze Streams` owns the health/content and delivery measurements used by the sorter while also reusing newer basic media metadata already learned by Dispatcharr during playback.
+Stream Sort no longer requires IPTV Checker for sorting data. `Analyze Streams` owns direct health/content and delivery measurements while reusing newer media metadata and successful reachability evidence already learned during Dispatcharr playback.
 
 - reachability and Alive / Dead / Skipped classification
 - resolution, FPS, codecs, pixel format, audio details, and measured video bitrate
@@ -13,15 +13,16 @@ Stream Sort no longer requires IPTV Checker for sorting data. `Analyze Streams` 
 - measured delivery throughput and throughput health
 - rate-limit-aware retry behavior
 
-The analyzer tracks three independent freshness components:
+The analyzer tracks four independent freshness components:
 
 - **Stream metadata TTL:** 12 hours by default. Newer `Stream.stream_stats` / `stream_stats_updated_at` from Dispatcharr playback can refresh resolution/FPS/codec/bitrate metadata without opening another Stream Sort connection.
-- **Health/content TTL:** 24 hours by default. Only Stream Sort's own checker refreshes this timer; playback does not count as a black/frozen/silent/placeholder check.
+- **Reachability TTL:** 24 hours after a direct analyzer check. A clean runtime session of at least 60 seconds, or five minutes of established playback, can independently satisfy reachability for 6 hours without another provider connection.
+- **Content validation interval:** 7 days by default. Reused playback does not claim that black/frozen/silent checks ran; it only defers an initially missing content validation until this interval expires.
 - **Healthy throughput TTL:** 6 hours by default. Marginal, insufficient, and unknown throughput are rechecked on every Analyze run.
 
 Dead, skipped, or unknown health states are rechecked on every Analyze run. A changed stream URL invalidates the cached components. A value of `0` forces the corresponding TTL-controlled component to be refreshed on every Analyze run.
 
-When newer Dispatcharr stream data is imported, the cache records `metadata_source: "dispatcharr_stream_stats"` and updates only the metadata timestamp/stats. It does not change the Stream Sort health status or health timestamp. If the imported resolution/FPS/bitrate signature changed, throughput is rechecked so its delivery classification uses the new media characteristics.
+When newer Dispatcharr stream data is imported, the cache records `metadata_source: "dispatcharr_stream_stats"`. Qualifying runtime playback records `health_source: "runtime_playback"`; sessions containing a channel error or failover do not qualify as clean. If the imported resolution/FPS/bitrate signature changed, throughput is rechecked so its delivery classification uses the new media characteristics.
 
 Analysis and throughput share one cache:
 
@@ -45,7 +46,9 @@ When Dispatcharr switches streams before emitting a failover event, Stream Sort 
 
 Dispatcharr can emit a `channel_reconnect` immediately after a normal stream switch while the event payload still identifies the stream being left. Stream Sort recognizes that narrow pattern when it occurs within two seconds of the switch, keeps the event in `recent_events` as `classification: "switch_internal"` with `counted: false`, and increments `reconnects_suppressed` instead of the reliability `reconnects` counter. A reconnect that identifies the new stream, or a reconnect outside that suppression window, is still counted normally.
 
-**Reliability telemetry is collection-only in v0.2.4. It does not alter sorting scores or stream order.** This lets the data accumulate and be validated before a reliability scoring policy is introduced.
+Version 0.3 introduces a bounded reliability contribution of **-20 to +20 points** inside the existing viability and resolution tiers. Legacy v0.2 counters remain visible but are excluded because older `channel_error` events could be attributed from stale channel state. New evidence uses a 14-day half-life and remains neutral until a stream has at least 30 minutes of playback or three starts.
+
+`channel_error` events now resolve Dispatcharr's failing `url` back to the stream before falling back to cached channel state. The collector preserves `error_type`, attempts, and exception details and classifies failures occurring inside the first 60 seconds as startup failures.
 
 ## Health ordering
 

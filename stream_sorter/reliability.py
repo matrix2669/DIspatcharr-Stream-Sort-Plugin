@@ -6,6 +6,7 @@ import tempfile
 import threading
 from contextlib import contextmanager
 from datetime import datetime, timezone
+import math
 from typing import Any, Callable, Mapping
 
 try:
@@ -15,7 +16,10 @@ except ImportError:  # pragma: no cover - Dispatcharr runs on Linux
 
 
 RELIABILITY_PATH = "/data/dispatcharr_stream_sort_reliability.json"
-MAX_RECENT_EVENTS = 25
+MAX_RECENT_EVENTS = 200
+SCHEMA_VERSION = 2
+EVIDENCE_HALF_LIFE_DAYS = 14.0
+STARTUP_WINDOW_SECONDS = 60.0
 SWITCH_FAILOVER_WINDOW_SECONDS = 15.0
 SWITCH_RECONNECT_SUPPRESSION_SECONDS = 2.0
 TRACKED_EVENTS = {
@@ -69,9 +73,9 @@ def _as_float(value: Any) -> float | None:
 
 def _empty_cache() -> dict[str, Any]:
     return {
-        "schema_version": 1,
+        "schema_version": SCHEMA_VERSION,
         "updated_at": None,
-        "scoring_enabled": False,
+        "scoring_enabled": True,
         "channels": {},
         "streams": {},
     }
@@ -91,7 +95,10 @@ def load_reliability_cache(path: str = RELIABILITY_PATH) -> dict[str, Any]:
         data["channels"] = {}
     if not isinstance(data.get("streams"), dict):
         data["streams"] = {}
-    data["scoring_enabled"] = False
+    # Schema-1 counters are preserved but excluded from scoring because older
+    # channel_error events could be attributed to stale channel state.
+    data["schema_version"] = SCHEMA_VERSION
+    data["scoring_enabled"] = True
     return data
 
 
@@ -138,7 +145,7 @@ def _default_stream_resolver(stream_id: int | None, payload: Mapping[str, Any]) 
     queryset = Stream.objects.select_related("m3u_account")
     stream = queryset.filter(id=stream_id).first() if stream_id is not None else None
     if stream is None:
-        for key in ("stream_url", "channel_url", "new_url"):
+        for key in ("stream_url", "channel_url", "new_url", "url"):
             url = str(payload.get(key) or "").strip()
             if not url:
                 continue
@@ -217,7 +224,41 @@ def _new_stream_entry(stream_id: int) -> dict[str, Any]:
         "last_failure_at": None,
         "last_failure_reason": None,
         "recent_events": [],
+        "reliability_evidence": _new_evidence(),
     }
+
+
+def _new_evidence() -> dict[str, Any]:
+    return {
+        "updated_at": None,
+        "playback_seconds": 0.0,
+        "starts": 0.0,
+        "clean_stops": 0.0,
+        "startup_failures": 0.0,
+        "playback_failures": 0.0,
+        "reconnects": 0.0,
+        "buffering_events": 0.0,
+        "failovers": 0.0,
+    }
+
+
+def _evidence(entry: dict[str, Any], now: datetime) -> dict[str, Any]:
+    evidence = entry.setdefault("reliability_evidence", _new_evidence())
+    previous = _parse_datetime(evidence.get("updated_at"))
+    if previous is not None:
+        age_days = max(0.0, (now - previous).total_seconds()) / 86400.0
+        factor = math.pow(0.5, age_days / EVIDENCE_HALF_LIFE_DAYS)
+        for key in _new_evidence():
+            if key != "updated_at":
+                evidence[key] = round(float(evidence.get(key) or 0.0) * factor, 6)
+    evidence["updated_at"] = now.isoformat()
+    return evidence
+
+
+def _add_evidence(entry: dict[str, Any], now: datetime, **values: float) -> None:
+    evidence = _evidence(entry, now)
+    for key, value in values.items():
+        evidence[key] = round(float(evidence.get(key) or 0.0) + float(value), 6)
 
 
 def _ensure_stream(data: dict[str, Any], info: Mapping[str, Any] | None, stream_id: int | None) -> dict[str, Any] | None:
@@ -226,6 +267,7 @@ def _ensure_stream(data: dict[str, Any], info: Mapping[str, Any] | None, stream_
         return None
     streams = data["streams"]
     entry = streams.setdefault(str(sid), _new_stream_entry(sid))
+    entry.setdefault("reliability_evidence", _new_evidence())
     if info:
         for key in ("stream_name", "m3u_account_id", "m3u_account_name"):
             value = info.get(key)
@@ -251,7 +293,7 @@ def _append_recent(
         item["classification"] = classification
     if counted is not None:
         item["counted"] = bool(counted)
-    for key in ("channel_name", "reason", "duration", "speed"):
+    for key in ("channel_name", "reason", "error_type", "error_message", "attempts", "duration", "speed"):
         value = payload.get(key)
         if value not in (None, ""):
             item[key] = value
@@ -272,6 +314,7 @@ def _add_playback_seconds(data: dict[str, Any], channel_state: Mapping[str, Any]
     entry = _ensure_stream(data, None, stream_id)
     if entry is not None:
         entry["playback_seconds"] = round(float(entry.get("playback_seconds") or 0.0) + seconds, 3)
+        _add_evidence(entry, now, playback_seconds=seconds)
 
 
 def _touch_failure(entry: dict[str, Any], at: str, reason: str) -> None:
@@ -342,6 +385,7 @@ def record_runtime_event(
                 "last_switch_previous_stream_id": None,
                 "last_switch_stream_id": None,
                 "last_switch_at": None,
+                "session_failure_at": None,
             },
         )
         if payload_dict.get("channel_name"):
@@ -360,10 +404,12 @@ def record_runtime_event(
             entry = _ensure_stream(data, info, sid)
             if entry is not None:
                 entry["playback_starts"] = int(entry.get("playback_starts") or 0) + 1
+                _add_evidence(entry, now_dt, starts=1)
                 _append_recent(entry, event=event, at=now_iso, payload=payload_dict)
                 sid = int(entry["stream_id"])
                 channel_state["active_stream_id"] = sid
                 channel_state["active_since"] = now_iso
+                channel_state["session_failure_at"] = None
                 recorded_stream_id = sid
 
         elif event == "stream_switch":
@@ -384,6 +430,7 @@ def record_runtime_event(
                 _append_recent(new_entry, event=event, at=now_iso, payload=payload_dict, role="to")
                 channel_state["active_stream_id"] = new_sid
                 channel_state["active_since"] = now_iso
+                channel_state["session_failure_at"] = None
                 recorded_stream_id = new_sid
             channel_state["last_switch_previous_stream_id"] = previous_sid
             channel_state["last_switch_stream_id"] = new_sid
@@ -401,6 +448,7 @@ def record_runtime_event(
             if entry is not None:
                 reason = str(payload_dict.get("reason") or "failover")
                 entry["failovers"] = int(entry.get("failovers") or 0) + 1
+                _add_evidence(entry, now_dt, failovers=1)
                 if reason == "buffering_timeout":
                     entry["buffering_failovers"] = int(entry.get("buffering_failovers") or 0) + 1
                     duration = _as_float(payload_dict.get("duration"))
@@ -409,6 +457,7 @@ def record_runtime_event(
                             float(entry.get("buffering_failover_seconds") or 0.0) + max(0.0, duration), 3
                         )
                 _touch_failure(entry, now_iso, reason)
+                channel_state["session_failure_at"] = now_iso
                 _append_recent(entry, event=event, at=now_iso, payload=payload_dict)
                 recorded_stream_id = int(entry["stream_id"])
             channel_state["last_switch_previous_stream_id"] = None
@@ -451,20 +500,31 @@ def record_runtime_event(
                 entry = _ensure_stream(data, info, sid)
                 if entry is not None:
                     entry["reconnects"] = int(entry.get("reconnects") or 0) + 1
+                    _add_evidence(entry, now_dt, reconnects=1)
                     _append_recent(entry, event=event, at=now_iso, payload=payload_dict)
                     recorded_stream_id = int(entry["stream_id"])
 
         elif event in {"channel_buffering", "channel_error"}:
-            sid = direct_stream_id or current_stream_id or resolved_stream_id
+            # channel_error omits stream_id in current Dispatcharr releases but
+            # includes the failing URL. Prefer URL resolution over cached state.
+            sid = resolved_stream_id or direct_stream_id or current_stream_id
             info = direct_info or _resolve_stream(sid, payload_dict, resolver)
             entry = _ensure_stream(data, info, sid)
             if entry is not None:
                 if event == "channel_buffering":
                     entry["buffering_events"] = int(entry.get("buffering_events") or 0) + 1
+                    _add_evidence(entry, now_dt, buffering_events=1)
                 else:
                     entry["errors"] = int(entry.get("errors") or 0) + 1
-                    _touch_failure(entry, now_iso, str(payload_dict.get("reason") or "channel_error"))
-                _append_recent(entry, event=event, at=now_iso, payload=payload_dict)
+                    reason = str(payload_dict.get("reason") or payload_dict.get("error_type") or "channel_error")
+                    _touch_failure(entry, now_iso, reason)
+                    channel_state["session_failure_at"] = now_iso
+                    started = _parse_datetime(channel_state.get("active_since"))
+                    age = (now_dt - started).total_seconds() if started is not None and sid == current_stream_id else None
+                    classification = "startup_failure" if age is None or age < STARTUP_WINDOW_SECONDS else "playback_failure"
+                    _add_evidence(entry, now_dt, **{f"{classification}s": 1})
+                    event_classification = classification
+                _append_recent(entry, event=event, at=now_iso, payload=payload_dict, classification=event_classification)
                 recorded_stream_id = int(entry["stream_id"])
 
         elif event == "channel_stop":
@@ -475,6 +535,18 @@ def record_runtime_event(
             entry = _ensure_stream(data, info, sid)
             if entry is not None:
                 entry["playback_stops"] = int(entry.get("playback_stops") or 0) + 1
+                started = _parse_datetime(channel_state.get("active_since"))
+                session_failure = _parse_datetime(channel_state.get("session_failure_at"))
+                clean_seconds = (now_dt - started).total_seconds() if started is not None else 0.0
+                clean_session = (
+                    started is not None
+                    and clean_seconds >= STARTUP_WINDOW_SECONDS
+                    and (session_failure is None or session_failure < started)
+                )
+                if clean_session:
+                    _add_evidence(entry, now_dt, clean_stops=1)
+                    entry["last_clean_playback_at"] = now_iso
+                    entry["last_clean_playback_seconds"] = round(clean_seconds, 3)
                 _append_recent(entry, event=event, at=now_iso, payload=payload_dict)
                 recorded_stream_id = int(entry["stream_id"])
             channel_state["active_stream_id"] = None
@@ -482,17 +554,18 @@ def record_runtime_event(
             channel_state["last_switch_previous_stream_id"] = None
             channel_state["last_switch_stream_id"] = None
             channel_state["last_switch_at"] = None
+            channel_state["session_failure_at"] = None
 
         channel_state["updated_at"] = now_iso
         data["updated_at"] = now_iso
-        data["scoring_enabled"] = False
+        data["scoring_enabled"] = True
         _save_reliability_cache(data, path)
 
     if recorded_stream_id is None:
         event_counted = False
     if logger is not None:
         logger.info(
-            "[Reliability] event=%s stream=%s channel=%s recorded=%s counted=%s classification=%s scoring=disabled",
+            "[Reliability] event=%s stream=%s channel=%s recorded=%s counted=%s classification=%s scoring=enabled",
             event,
             recorded_stream_id or "unknown",
             payload_dict.get("channel_name") or payload_dict.get("channel_id") or "unknown",
@@ -508,6 +581,6 @@ def record_runtime_event(
         "recorded": recorded_stream_id is not None,
         "counted": event_counted,
         "classification": event_classification,
-        "scoring_applied": False,
+        "scoring_applied": True,
         "path": path,
     }

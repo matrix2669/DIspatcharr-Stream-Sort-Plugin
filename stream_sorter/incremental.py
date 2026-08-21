@@ -8,6 +8,7 @@ from typing import Any, Mapping
 
 from . import analyzer
 from .scoring import estimate_nominal_throughput_kbps, parse_fps, parse_resolution
+from .reliability import RELIABILITY_PATH, load_reliability_cache
 from .throughput import (
     DEFAULT_USER_AGENT,
     LEGACY_CACHE_PATH,
@@ -40,7 +41,14 @@ def _age_hours(value: Any, now: datetime) -> float | None:
     return max(0.0, (now - parsed).total_seconds() / 3600.0)
 
 
-def health_check_reason(entry: Mapping[str, Any] | None, *, url_hash: str, ttl_hours: float, now: datetime) -> str | None:
+def health_check_reason(
+    entry: Mapping[str, Any] | None,
+    *,
+    url_hash: str,
+    ttl_hours: float,
+    content_ttl_hours: float | None = None,
+    now: datetime,
+) -> str | None:
     if not entry:
         return "missing"
     if str(entry.get("url_hash") or "") != url_hash:
@@ -50,12 +58,30 @@ def health_check_reason(entry: Mapping[str, Any] | None, *, url_hash: str, ttl_h
         return f"status_{status or 'unknown'}"
     if ttl_hours <= 0:
         return "ttl_forced"
-    checked_at = entry.get("health_checked_at") or entry.get("media_checked_at") or entry.get("tested_at")
+    checked_at = (
+        entry.get("playback_health_checked_at")
+        or entry.get("health_checked_at")
+        or entry.get("media_checked_at")
+        or entry.get("tested_at")
+    )
     age = _age_hours(checked_at, now)
     if age is None:
         return "missing_timestamp"
     if age >= ttl_hours:
         return "ttl_expired"
+    if content_ttl_hours is not None:
+        content_checked_at = entry.get("content_checked_at")
+        if not content_checked_at and entry.get("health_source") != "runtime_playback":
+            content_checked_at = entry.get("health_checked_at") or entry.get("media_checked_at") or entry.get("tested_at")
+        content_age = _age_hours(content_checked_at, now)
+        # Recent successful playback defers the first content-only validation;
+        # it does not claim that black/frozen/silent checks were performed.
+        if content_age is None:
+            playback_age = _age_hours(entry.get("playback_health_checked_at"), now)
+            if playback_age is None or playback_age >= content_ttl_hours:
+                return "content_missing"
+        elif content_ttl_hours <= 0 or content_age >= content_ttl_hours:
+            return "content_ttl_expired"
     return None
 
 
@@ -204,6 +230,77 @@ def _sync_dispatcharr_metadata(items, cache) -> tuple[int, set[int]]:
     return refreshed, changed_ids
 
 
+def _sync_runtime_playback_health(
+    items,
+    cache,
+    reliability_cache,
+    *,
+    min_playback_seconds: float,
+    min_clean_playback_seconds: float,
+    ttl_hours: float,
+    now: datetime,
+) -> int:
+    """Use fresh schema-2 playback evidence as a reachability observation."""
+    refreshed = 0
+    streams = reliability_cache.get("streams") if isinstance(reliability_cache, Mapping) else {}
+    streams = streams if isinstance(streams, Mapping) else {}
+    for item in items:
+        telemetry = streams.get(str(item["id"]))
+        evidence = telemetry.get("reliability_evidence") if isinstance(telemetry, Mapping) else None
+        if not isinstance(evidence, Mapping):
+            continue
+        try:
+            playback_seconds = float(evidence.get("playback_seconds") or 0.0)
+        except (TypeError, ValueError):
+            continue
+        evidence_observed_at = _parse_datetime(evidence.get("updated_at"))
+        clean_observed_at = _parse_datetime(telemetry.get("last_clean_playback_at"))
+        try:
+            clean_seconds = float(telemetry.get("last_clean_playback_seconds") or 0.0)
+        except (TypeError, ValueError):
+            clean_seconds = 0.0
+        clean_qualifies = clean_seconds >= min_clean_playback_seconds and clean_observed_at is not None
+        long_qualifies = playback_seconds >= min_playback_seconds and evidence_observed_at is not None
+        if not clean_qualifies and not long_qualifies:
+            continue
+        observed_at = clean_observed_at if clean_qualifies else evidence_observed_at
+        assert observed_at is not None
+        if ttl_hours > 0 and (now - observed_at).total_seconds() / 3600.0 >= ttl_hours:
+            continue
+
+        key = str(item["id"])
+        current_hash = analyzer._stream_url_hash(str(item.get("url") or ""))
+        previous = cache.get(key)
+        entry = dict(previous) if isinstance(previous, Mapping) and str(previous.get("url_hash") or "") == current_hash else {}
+        previous_observation = _parse_datetime(entry.get("playback_health_checked_at"))
+        if previous_observation is not None and previous_observation >= observed_at:
+            continue
+        entry.update({
+            "status": "alive",
+            "error": "",
+            "error_type": None,
+            "stream_id": item.get("id"),
+            "stream_name": item.get("name"),
+            "m3u_account_id": item.get("account_id"),
+            "m3u_account_name": item.get("account_name"),
+            "url_hash": current_hash,
+            "playback_health_checked_at": observed_at.isoformat(),
+            "health_source": "runtime_playback",
+            "playback_evidence_seconds": round(playback_seconds, 3),
+            "clean_playback_seconds": round(clean_seconds, 3) if clean_qualifies else None,
+        })
+        dispatcharr_stats = item.get("dispatcharr_stats")
+        dispatcharr_updated_at = _parse_datetime(item.get("dispatcharr_stats_updated_at"))
+        if isinstance(dispatcharr_stats, Mapping) and dispatcharr_stats and dispatcharr_updated_at is not None:
+            entry["stats"] = dict(dispatcharr_stats)
+            entry["metadata_updated_at"] = dispatcharr_updated_at.isoformat()
+            entry["metadata_source"] = "dispatcharr_stream_stats"
+            entry["dispatcharr_stats_updated_at"] = dispatcharr_updated_at.isoformat()
+        cache[key] = entry
+        refreshed += 1
+    return refreshed
+
+
 def _merge_media_result(item, previous, result) -> dict[str, Any]:
     merged = dict(previous or {})
     previous_throughput = merged.get("throughput")
@@ -212,6 +309,8 @@ def _merge_media_result(item, previous, result) -> dict[str, Any]:
     checked = result.get("tested_at") or analyzer._utc_now_iso()
     merged["health_checked_at"] = checked
     merged["media_checked_at"] = checked
+    merged["content_checked_at"] = checked
+    merged["health_source"] = "stream_sort_analyzer"
     merged["stream_id"] = item.get("id")
     merged["stream_name"] = item.get("name")
     merged["m3u_account_id"] = item.get("account_id")
@@ -276,8 +375,14 @@ def _migrate_legacy_throughput(items, cache, *, ttl_hours: float) -> int:
     return migrated
 
 
-def _analysis_reason(entry: Mapping[str, Any] | None, *, url_hash: str, health_ttl_hours: float, metadata_ttl_hours: float, now: datetime) -> str | None:
-    reason = health_check_reason(entry, url_hash=url_hash, ttl_hours=health_ttl_hours, now=now)
+def _analysis_reason(entry: Mapping[str, Any] | None, *, url_hash: str, health_ttl_hours: float, content_ttl_hours: float, metadata_ttl_hours: float, now: datetime) -> str | None:
+    reason = health_check_reason(
+        entry,
+        url_hash=url_hash,
+        ttl_hours=health_ttl_hours,
+        content_ttl_hours=content_ttl_hours,
+        now=now,
+    )
     if reason:
         return f"health_{reason}"
     reason = metadata_check_reason(entry, url_hash=url_hash, ttl_hours=metadata_ttl_hours, now=now)
@@ -297,6 +402,11 @@ def analyze_assigned_streams(settings: Mapping[str, Any], *, logger, cache_path:
     max_streams = max(0, analyzer._as_int(settings.get("analysis_max_streams"), 0))
     metadata_ttl_hours = max(0.0, analyzer._as_float(settings.get("stream_data_ttl_hours"), 12.0))
     health_ttl_hours = max(0.0, analyzer._as_float(settings.get("health_content_ttl_hours"), 24.0))
+    content_ttl_hours = max(0.0, analyzer._as_float(settings.get("content_validation_ttl_hours"), 168.0))
+    playback_health_reuse = analyzer._as_bool(settings.get("playback_health_reuse"), True)
+    playback_health_min_seconds = max(60.0, analyzer._as_float(settings.get("playback_health_min_seconds"), 300.0))
+    playback_health_clean_min_seconds = max(30.0, analyzer._as_float(settings.get("playback_health_clean_min_seconds"), 60.0))
+    playback_health_ttl_hours = max(0.0, analyzer._as_float(settings.get("playback_health_ttl_hours"), 6.0))
     throughput_ttl_hours = max(0.0, analyzer._as_float(settings.get("healthy_throughput_ttl_hours"), 6.0))
     throughput_duration = max(1.0, analyzer._as_float(settings.get("probe_duration_seconds"), 8.0))
     throughput_timeout = max(throughput_duration + 2.0, analyzer._as_float(settings.get("probe_timeout_seconds"), 10.0))
@@ -322,6 +432,24 @@ def analyze_assigned_streams(settings: Mapping[str, Any], *, logger, cache_path:
     total = len(items)
     cache = analyzer.load_analysis_cache(cache_path)
 
+    playback_health_refreshed = 0
+    if playback_health_reuse:
+        playback_health_refreshed = _sync_runtime_playback_health(
+            items,
+            cache,
+            load_reliability_cache(RELIABILITY_PATH),
+            min_playback_seconds=playback_health_min_seconds,
+            min_clean_playback_seconds=playback_health_clean_min_seconds,
+            ttl_hours=playback_health_ttl_hours,
+            now=datetime.now(timezone.utc),
+        )
+        if playback_health_refreshed:
+            analyzer.save_analysis_cache(cache, cache_path)
+            logger.info(
+                "[Analyze] Reused recent successful playback as reachability evidence for %d streams",
+                playback_health_refreshed,
+            )
+
     migrated = _migrate_legacy_throughput(items, cache, ttl_hours=throughput_ttl_hours)
     if migrated:
         analyzer.save_analysis_cache(cache, cache_path)
@@ -339,6 +467,7 @@ def analyze_assigned_streams(settings: Mapping[str, Any], *, logger, cache_path:
             cache.get(str(item["id"])),
             url_hash=analyzer._stream_url_hash(str(item.get("url") or "")),
             health_ttl_hours=health_ttl_hours,
+            content_ttl_hours=content_ttl_hours,
             metadata_ttl_hours=metadata_ttl_hours,
             now=now,
         )
@@ -366,9 +495,9 @@ def analyze_assigned_streams(settings: Mapping[str, Any], *, logger, cache_path:
             initial_fully_cached += 1
 
     logger.info(
-        "[Analyze] Starting: streams=%d media_due=%d throughput_due=%d fully_cached=%d dispatcharr_metadata_refreshed=%d metadata_ttl=%.1fh health_ttl=%.1fh healthy_throughput_ttl=%.1fh workers=%d",
-        total, len(media_due), initial_throughput_due, initial_fully_cached, dispatcharr_metadata_refreshed,
-        metadata_ttl_hours, health_ttl_hours, throughput_ttl_hours, workers,
+        "[Analyze] Starting: streams=%d media_due=%d throughput_due=%d fully_cached=%d playback_health_refreshed=%d dispatcharr_metadata_refreshed=%d metadata_ttl=%.1fh health_ttl=%.1fh content_ttl=%.1fh healthy_throughput_ttl=%.1fh workers=%d",
+        total, len(media_due), initial_throughput_due, initial_fully_cached, playback_health_refreshed, dispatcharr_metadata_refreshed,
+        metadata_ttl_hours, health_ttl_hours, content_ttl_hours, throughput_ttl_hours, workers,
     )
     if not items:
         return {
@@ -378,6 +507,7 @@ def analyze_assigned_streams(settings: Mapping[str, Any], *, logger, cache_path:
             "throughput_checked": 0,
             "fully_cached": 0,
             "dispatcharr_metadata_refreshed": 0,
+            "playback_health_refreshed": 0,
             "channels_selected": len({row.channel_id for row in rows}),
             "filters": filter_summary,
             "status_counts": {},
@@ -555,8 +685,8 @@ def analyze_assigned_streams(settings: Mapping[str, Any], *, logger, cache_path:
     health_counts = _status_counts(items, cache)
     throughput_counts = _throughput_counts(items, cache)
     logger.info(
-        "[Analyze] Complete: streams=%d media_checked=%d throughput_checked=%d fully_cached=%d dispatcharr_metadata_refreshed=%d | health %s | throughput %s",
-        total, len(media_checked_ids), len(throughput_checked_ids), fully_cached, dispatcharr_metadata_refreshed,
+        "[Analyze] Complete: streams=%d media_checked=%d throughput_checked=%d fully_cached=%d playback_health_refreshed=%d dispatcharr_metadata_refreshed=%d | health %s | throughput %s",
+        total, len(media_checked_ids), len(throughput_checked_ids), fully_cached, playback_health_refreshed, dispatcharr_metadata_refreshed,
         _overall_health_text(health_counts), _overall_throughput_text(throughput_counts),
     )
     return {
@@ -566,6 +696,7 @@ def analyze_assigned_streams(settings: Mapping[str, Any], *, logger, cache_path:
         "throughput_checked": len(throughput_checked_ids),
         "fully_cached": fully_cached,
         "dispatcharr_metadata_refreshed": dispatcharr_metadata_refreshed,
+        "playback_health_refreshed": playback_health_refreshed,
         "channels_selected": len({row.channel_id for row in rows}),
         "filters": filter_summary,
         "status_counts": {key: value for key, value in health_counts.items() if value > 0},

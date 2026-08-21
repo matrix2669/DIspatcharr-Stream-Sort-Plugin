@@ -12,7 +12,7 @@ def _resolver(stream_id, payload):
             "m3u_account_id": 1,
             "m3u_account_name": "Provider",
         }
-    if payload.get("stream_url") == "http://example.test/42":
+    if payload.get("stream_url") == "http://example.test/42" or payload.get("url") == "http://example.test/42":
         return {
             "stream_id": 42,
             "stream_name": "Resolved 42",
@@ -51,7 +51,7 @@ def test_switch_then_buffering_failover_is_attributed_to_previous_stream(tmp_pat
     assert data["streams"]["10"]["buffering_failover_seconds"] == 12.5
     assert data["streams"]["11"]["failovers"] == 0
     assert data["channels"]["name:NBC"]["active_stream_id"] == 11
-    assert data["scoring_enabled"] is False
+    assert data["scoring_enabled"] is True
 
 
 def test_failover_before_switch_is_attributed_to_current_stream(tmp_path):
@@ -114,7 +114,7 @@ def test_stream_can_be_resolved_from_runtime_url_when_id_is_missing(tmp_path):
     assert data["channels"]["name:ABC"]["active_stream_id"] == 42
 
 
-def test_channel_buffering_is_collection_only(tmp_path):
+def test_channel_buffering_updates_scoring_evidence(tmp_path):
     path = tmp_path / "reliability.json"
     started = datetime(2026, 8, 18, 1, 0, tzinfo=timezone.utc)
     record_runtime_event(
@@ -129,9 +129,42 @@ def test_channel_buffering_is_collection_only(tmp_path):
     )
 
     data = _load(path)
-    assert result["scoring_applied"] is False
+    assert result["scoring_applied"] is True
     assert data["streams"]["50"]["buffering_events"] == 1
-    assert data["scoring_enabled"] is False
+    assert data["scoring_enabled"] is True
+    assert data["streams"]["50"]["reliability_evidence"]["buffering_events"] == 1
+
+
+def test_channel_error_prefers_url_attribution_and_preserves_error_type(tmp_path):
+    path = tmp_path / "reliability.json"
+    started = datetime(2026, 8, 18, 1, 0, tzinfo=timezone.utc)
+    record_runtime_event(
+        "channel_start", {"channel_name": "ABC", "stream_id": 10},
+        path=str(path), resolver=_resolver, now=started,
+    )
+    result = record_runtime_event(
+        "channel_error",
+        {"channel_name": "ABC", "url": "http://example.test/42", "error_type": "connection_failed", "attempts": 3},
+        path=str(path), resolver=_resolver, now=started + timedelta(seconds=10),
+    )
+    data = _load(path)
+    assert result["stream_id"] == 42
+    assert result["classification"] == "startup_failure"
+    assert data["streams"]["42"]["last_failure_reason"] == "connection_failed"
+    assert data["streams"]["42"]["recent_events"][-1]["attempts"] == 3
+
+
+def test_clean_stop_records_reusable_playback_but_failed_session_does_not(tmp_path):
+    path = tmp_path / "reliability.json"
+    started = datetime(2026, 8, 18, 1, 0, tzinfo=timezone.utc)
+    record_runtime_event("channel_start", {"channel_name": "CLEAN", "stream_id": 60}, path=str(path), resolver=_resolver, now=started)
+    record_runtime_event("channel_stop", {"channel_name": "CLEAN"}, path=str(path), resolver=_resolver, now=started + timedelta(seconds=61))
+    record_runtime_event("channel_start", {"channel_name": "FAILED", "stream_id": 61}, path=str(path), resolver=_resolver, now=started)
+    record_runtime_event("channel_error", {"channel_name": "FAILED", "stream_id": 61}, path=str(path), resolver=_resolver, now=started + timedelta(seconds=30))
+    record_runtime_event("channel_stop", {"channel_name": "FAILED"}, path=str(path), resolver=_resolver, now=started + timedelta(seconds=70))
+    data = _load(path)
+    assert data["streams"]["60"]["last_clean_playback_seconds"] == 61
+    assert "last_clean_playback_at" not in data["streams"]["61"]
 
 
 def test_switch_internal_reconnect_is_retained_but_not_counted(tmp_path):

@@ -2,6 +2,7 @@ from datetime import datetime, timedelta, timezone
 
 from stream_sorter import analyzer, incremental
 from stream_sorter.incremental import (
+    _sync_runtime_playback_health,
     analyze_assigned_streams,
     health_check_reason,
     metadata_check_reason,
@@ -137,3 +138,60 @@ def test_matching_legacy_throughput_is_migrated(monkeypatch):
     assert incremental._migrate_legacy_throughput([item], cache, ttl_hours=6) == 1
     assert cache["42"]["throughput"]["status"] == "healthy"
     assert "expires_at" in cache["42"]["throughput"]
+
+
+def test_clean_runtime_playback_reuses_reachability_and_defers_content_check():
+    now = _now()
+    url = "http://example.test/live"
+    item = {
+        "id": 42,
+        "name": "Example",
+        "url": url,
+        "account_id": 3,
+        "account_name": "Provider",
+        "dispatcharr_stats": {"resolution": "1280x720", "source_fps": 59.94},
+        "dispatcharr_stats_updated_at": now.isoformat(),
+    }
+    reliability = {
+        "streams": {
+            "42": {
+                "last_clean_playback_at": now.isoformat(),
+                "last_clean_playback_seconds": 61,
+                "reliability_evidence": {"updated_at": now.isoformat(), "playback_seconds": 61},
+            }
+        }
+    }
+    cache = {}
+    refreshed = _sync_runtime_playback_health(
+        [item], cache, reliability,
+        min_playback_seconds=300,
+        min_clean_playback_seconds=60,
+        ttl_hours=6,
+        now=now,
+    )
+    assert refreshed == 1
+    assert cache["42"]["status"] == "alive"
+    assert cache["42"]["health_source"] == "runtime_playback"
+    assert health_check_reason(
+        cache["42"], url_hash=analyzer._stream_url_hash(url), ttl_hours=6,
+        content_ttl_hours=168, now=now + timedelta(hours=1),
+    ) is None
+    assert health_check_reason(
+        cache["42"], url_hash=analyzer._stream_url_hash(url), ttl_hours=999,
+        content_ttl_hours=168, now=now + timedelta(hours=169),
+    ) == "content_missing"
+
+
+def test_short_unfinished_playback_does_not_replace_reachability_probe():
+    now = _now()
+    item = {"id": 42, "name": "Example", "url": "http://example.test/live"}
+    reliability = {"streams": {"42": {"reliability_evidence": {"updated_at": now.isoformat(), "playback_seconds": 59}}}}
+    cache = {}
+    assert _sync_runtime_playback_health(
+        [item], cache, reliability,
+        min_playback_seconds=300,
+        min_clean_playback_seconds=60,
+        ttl_hours=6,
+        now=now,
+    ) == 0
+    assert cache == {}

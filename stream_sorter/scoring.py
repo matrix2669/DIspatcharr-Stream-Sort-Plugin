@@ -66,6 +66,9 @@ THROUGHPUT_SCORES = {
     "unknown": 0.0,
     "insufficient": -30.0,
 }
+RELIABILITY_MIN_PLAYBACK_SECONDS = 1800.0
+RELIABILITY_MIN_STARTS = 3.0
+RELIABILITY_SCORE_LIMIT = 20.0
 
 
 @dataclass(frozen=True)
@@ -97,6 +100,7 @@ class StreamCandidate:
     is_stale: bool = False
     url: str | None = None
     throughput: Mapping[str, Any] | None = None
+    reliability: Mapping[str, Any] | None = None
 
 
 @dataclass
@@ -114,6 +118,7 @@ class Evaluation:
     fps: float | None
     video_bitrate_kbps: float | None
     throughput_status: str
+    reliability_status: str = "insufficient_evidence"
     breakdown: dict[str, float] = field(default_factory=dict)
     matched_name_rules: list[str] = field(default_factory=list)
     source_rule: str | None = None
@@ -415,12 +420,49 @@ def _throughput_entry_status(
     return classify_throughput(measured, nominal_video_kbps), notes
 
 
+def reliability_score(entry: Mapping[str, Any] | None) -> tuple[float, str, list[str]]:
+    """Return a bounded soft score from schema-2, time-decayed evidence."""
+    evidence = (entry or {}).get("reliability_evidence")
+    if not isinstance(evidence, Mapping):
+        return 0.0, "insufficient_evidence", []
+
+    playback = max(0.0, _number(evidence.get("playback_seconds")) or 0.0)
+    starts = max(0.0, _number(evidence.get("starts")) or 0.0)
+    if playback < RELIABILITY_MIN_PLAYBACK_SECONDS and starts < RELIABILITY_MIN_STARTS:
+        return 0.0, "insufficient_evidence", [
+            f"reliability evidence pending ({playback / 60.0:.1f}m, {starts:.1f} starts)"
+        ]
+
+    hours = max(playback / 3600.0, 0.25)
+    confidence = min(1.0, max(playback / 36000.0, starts / 10.0))
+    clean_stops = max(0.0, _number(evidence.get("clean_stops")) or 0.0)
+    startup_failures = max(0.0, _number(evidence.get("startup_failures")) or 0.0)
+    playback_failures = max(0.0, _number(evidence.get("playback_failures")) or 0.0)
+    reconnects = max(0.0, _number(evidence.get("reconnects")) or 0.0)
+    buffering = max(0.0, _number(evidence.get("buffering_events")) or 0.0)
+    failovers = max(0.0, _number(evidence.get("failovers")) or 0.0)
+
+    clean_ratio = clean_stops / max(1.0, starts)
+    positive = 10.0 * clean_ratio
+    penalty = min(
+        30.0,
+        (startup_failures * 4.0 + playback_failures * 10.0 + failovers * 10.0
+         + reconnects * 2.0 + buffering) / hours,
+    )
+    score = max(-RELIABILITY_SCORE_LIMIT, min(RELIABILITY_SCORE_LIMIT, (positive - penalty) * confidence))
+    status = "healthy" if score >= 5 else "degraded" if score <= -5 else "neutral"
+    return round(score, 3), status, [
+        f"reliability uses {playback / 3600.0:.2f} decayed playback hours and {starts:.1f} starts"
+    ]
+
+
 def evaluate_candidate(
     candidate: StreamCandidate,
     *,
     source_rules: Iterable[SourceRule] = (),
     name_rules: Iterable[NameRule] = (),
     throughput_cache_ttl_minutes: float | None = 30.0,
+    reliability_scoring_enabled: bool = True,
     now: datetime | None = None,
 ) -> Evaluation:
     stats = candidate.stats or {}
@@ -479,6 +521,12 @@ def evaluate_candidate(
             n_score += rule.score
             matched_names.append(rule.label)
     t_score = THROUGHPUT_SCORES.get(throughput_status, 0.0)
+    r_score, reliability_status, reliability_notes = reliability_score(candidate.reliability)
+    if not reliability_scoring_enabled:
+        r_score = 0.0
+        reliability_status = "disabled"
+        reliability_notes = []
+    notes.extend(reliability_notes)
 
     breakdown = {
         "bitrate": round(b_score, 3),
@@ -486,6 +534,7 @@ def evaluate_candidate(
         "source": round(s_score, 3),
         "name_rules": round(n_score, 3),
         "throughput": round(t_score, 3),
+        "reliability": round(r_score, 3),
     }
     total = round(sum(breakdown.values()), 3)
 
@@ -503,6 +552,7 @@ def evaluate_candidate(
         fps=fps,
         video_bitrate_kbps=bitrate,
         throughput_status=throughput_status,
+        reliability_status=reliability_status,
         breakdown=breakdown,
         matched_name_rules=matched_names,
         source_rule=matched_source,
@@ -516,6 +566,7 @@ def rank_candidates(
     source_rules: Iterable[SourceRule] = (),
     name_rules: Iterable[NameRule] = (),
     throughput_cache_ttl_minutes: float | None = 30.0,
+    reliability_scoring_enabled: bool = True,
     now: datetime | None = None,
 ) -> list[Evaluation]:
     evaluations = [
@@ -524,6 +575,7 @@ def rank_candidates(
             source_rules=source_rules,
             name_rules=name_rules,
             throughput_cache_ttl_minutes=throughput_cache_ttl_minutes,
+            reliability_scoring_enabled=reliability_scoring_enabled,
             now=now,
         )
         for candidate in candidates

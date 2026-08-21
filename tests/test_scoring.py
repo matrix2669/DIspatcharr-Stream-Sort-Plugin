@@ -8,6 +8,7 @@ from stream_sorter.scoring import (
     estimate_nominal_throughput_kbps,
     parse_name_rules,
     parse_source_rules,
+    reliability_score,
     rank_candidates,
 )
 
@@ -220,3 +221,24 @@ def test_invalid_rules_fail_cleanly():
         parse_name_rules("10::[")
     with pytest.raises(ValueError):
         parse_source_rules("Provider")
+
+
+def test_reliability_requires_minimum_evidence():
+    score, status, _notes = reliability_score({"reliability_evidence": {"playback_seconds": 600, "starts": 1}})
+    assert score == 0
+    assert status == "insufficient_evidence"
+
+
+def test_clean_reliability_evidence_adds_bounded_soft_score():
+    score, status, _notes = reliability_score({"reliability_evidence": {
+        "playback_seconds": 36000,
+        "starts": 10,
+        "clean_stops": 10,
+        "startup_failures": 0,
+        "playback_failures": 0,
+        "reconnects": 0,
+        "buffering_events": 0,
+        "failovers": 0,
+    }})
+    assert score == 10
+    assert status == "healthy"
