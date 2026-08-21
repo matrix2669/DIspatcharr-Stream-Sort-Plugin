@@ -6,7 +6,7 @@ def test_plugin_manifest_is_valid_and_matches_version():
     root = Path(__file__).parents[1]
     manifest = json.loads((root / "stream_sorter" / "plugin.json").read_text())
     assert manifest["name"] == "Dispatcharr Stream Sort"
-    assert manifest["version"] == "0.3.2"
+    assert manifest["version"] == "0.3.3"
     assert {a["id"] for a in manifest["actions"]} == {
         "analyze_streams",
         "check_analysis_status",
@@ -32,6 +32,8 @@ def test_plugin_manifest_is_valid_and_matches_version():
     assert "playback_health_clean_min_seconds" in field_ids
     assert "content_validation_ttl_hours" in field_ids
     assert "healthy_throughput_ttl_hours" in field_ids
+    assert "probe_per_account_delay_seconds" in field_ids
+    assert "probe_rate_per_minute" not in field_ids
     assert "reliability_info" in field_ids
     assert "reliability_scoring_enabled" in field_ids
     assert "throughput_cache_ttl_minutes" not in field_ids

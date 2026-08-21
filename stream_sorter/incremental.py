@@ -454,7 +454,6 @@ def analyze_assigned_streams(settings: Mapping[str, Any], *, logger, cache_path:
     throughput_ttl_hours = max(0.0, analyzer._as_float(settings.get("healthy_throughput_ttl_hours"), 6.0))
     throughput_duration = max(1.0, analyzer._as_float(settings.get("probe_duration_seconds"), 8.0))
     throughput_timeout = max(throughput_duration + 2.0, analyzer._as_float(settings.get("probe_timeout_seconds"), 10.0))
-    throughput_rate_per_minute = max(1, analyzer._as_int(settings.get("probe_rate_per_minute"), 6))
     throughput_account_delay = max(0.0, analyzer._as_float(settings.get("probe_per_account_delay_seconds"), 1.0))
 
     queryset = ChannelStream.objects.select_related("stream", "stream__m3u_account").order_by("channel_id", "order", "id")
@@ -687,14 +686,11 @@ def analyze_assigned_streams(settings: Mapping[str, Any], *, logger, cache_path:
     throughput_checked_ids = set()
     if throughput_due:
         throughput_started = time.monotonic()
-        min_start_interval = 60.0 / float(throughput_rate_per_minute)
-        global_probe_limiter = analyzer._PerAccountStartLimiter(min_start_interval)
         account_probe_limiter = analyzer._PerAccountStartLimiter(throughput_account_delay)
         throughput_reason_by_id = {int(item["id"]): reason for item, reason in throughput_due}
 
         def run_throughput(item):
             account_probe_limiter.wait(item.get("account_id"))
-            global_probe_limiter.wait(None)
             entry = cache.get(str(item["id"])) or {}
             stats = entry.get("stats") or {}
             _width, height = parse_resolution(stats)

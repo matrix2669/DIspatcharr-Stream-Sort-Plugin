@@ -1,6 +1,6 @@
 [project]
 name = "dispatcharr-stream-sort-plugin"
-version = "0.3.2"
+version = "0.3.3"
 description = "Stream health analysis, scoring, ordering, and runtime reliability telemetry for Dispatcharr"
 requires-python = ">=3.11"
 

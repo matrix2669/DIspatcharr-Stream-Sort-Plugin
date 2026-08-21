@@ -52,6 +52,13 @@ def _utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def _configured_parallel_tests(settings: dict) -> int:
+    try:
+        return max(1, min(16, int(float(settings.get("analysis_workers", 2)))))
+    except (TypeError, ValueError):
+        return 2
+
+
 def _load_status() -> dict:
     try:
         with open(STATUS_PATH, "r", encoding="utf-8") as handle:
@@ -249,7 +256,12 @@ def _analysis_status() -> dict:
             f"({value.get('progress_completed', 0)}/{value['progress_total']})."
         )
     if job_status == "running":
-        message = f"Stream Sort analysis is running: {phase}.{progress}"
+        worker_text = (
+            f" Up to {value['parallel_tests']} tests run concurrently."
+            if value.get("parallel_tests")
+            else ""
+        )
+        message = f"Stream Sort analysis is running: {phase}.{progress}{worker_text}"
     elif job_status == "completed":
         result = value.get("result") or {}
         message = (
@@ -438,6 +450,7 @@ def _start_background_job(settings: dict, *, kind: str, sort_after: bool) -> dic
                 "status": "running",
                 "kind": kind,
                 "sort_after": sort_after,
+                "parallel_tests": _configured_parallel_tests(settings),
                 "phase": "starting",
                 "started_at": _utc_now_iso(),
                 "updated_at": _utc_now_iso(),

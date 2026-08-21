@@ -1,6 +1,6 @@
 {
   "name": "Dispatcharr Stream Sort",
-  "version": "0.3.2",
+  "version": "0.3.3",
   "description": "Analyzes stream health, quality, delivery performance, and runtime reliability telemetry, reuses fresh Dispatcharr playback metadata, then scores and reorders streams already assigned to channels.",
   "author": "matrix2669",
   "help_url": "https://github.com/matrix2669/DIspatcharr-Stream-Sort-Plugin",
@@ -41,8 +41,7 @@
     {"id":"throughput_info","label":"Integrated delivery throughput","type":"info","description":"Throughput is part of Analyze Streams. Healthy cached delivery results are reused; marginal, insufficient, unknown, expired, URL-changed, or metadata-changed results are probed again. Confirmed dead media streams are not throughput-probed."},
     {"id":"probe_duration_seconds","label":"Throughput sample duration (seconds)","type":"number","default":8},
     {"id":"probe_timeout_seconds","label":"Throughput probe timeout (seconds)","type":"number","default":10},
-    {"id":"probe_rate_per_minute","label":"Maximum throughput probes per minute","type":"number","default":6,"help_text":"Global start-rate cap used to limit provider load. Only streams whose throughput needs refreshing consume this allowance."},
-    {"id":"probe_per_account_delay_seconds","label":"Per-source throughput start delay (seconds)","type":"number","default":1},
+    {"id":"probe_per_account_delay_seconds","label":"Per-source throughput start delay (seconds)","type":"number","default":1,"help_text":"Minimum spacing between throughput starts against the same M3U source. Different sources may start at the same time, up to the Parallel tests limit."},
     {"id":"reliability_info","label":"Runtime reliability telemetry","type":"info","description":"Stream Sort collects runtime events and applies a bounded soft reliability score after at least 30 minutes of new playback or three new starts. Evidence decays with a 14-day half-life. Legacy v0.2.x counters are preserved but excluded because channel errors could be misattributed."},
     {"id":"reliability_scoring_enabled","label":"Use runtime reliability in sorting","type":"boolean","default":true,"help_text":"Reliability contributes at most +/-20 points inside the existing viability and resolution tiers. Streams without enough new evidence remain neutral."},
     {"id":"paths_info","label":"Files","type":"info","description":"Unified analysis/throughput cache: /data/dispatcharr_stream_sort_analysis.json | Analysis status: /data/dispatcharr_stream_sort_status.json | Runtime reliability telemetry: /data/dispatcharr_stream_sort_reliability.json | Dry-run/apply report: /data/dispatcharr_stream_sort_report.json. The old standalone throughput cache is read only as a migration fallback."}

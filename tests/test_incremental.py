@@ -1,6 +1,9 @@
 import collections
+import sys
 import threading
+import types
 from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
 
 from stream_sorter import analyzer, incremental
 from stream_sorter.incremental import (
@@ -74,6 +77,95 @@ def test_parallel_tests_reassign_capacity_when_an_m3u_source_runs_out():
     ]
     starts = _scheduled_accounts(items, workers=3)
     assert collections.Counter(starts[:3]) == {20: 2, 10: 1}
+
+
+def test_throughput_parallelism_is_limited_per_source_not_globally(tmp_path, monkeypatch):
+    class QuerySet(list):
+        def select_related(self, *_args):
+            return self
+
+        def order_by(self, *_args):
+            return self
+
+        def filter(self, **_kwargs):
+            return self
+
+    accounts = [
+        SimpleNamespace(id=10, name="Provider A", get_user_agent_string=lambda: "test"),
+        SimpleNamespace(id=20, name="Provider B", get_user_agent_string=lambda: "test"),
+    ]
+    streams = [
+        SimpleNamespace(
+            id=index,
+            name=f"Stream {index}",
+            url=f"http://example.test/{index}",
+            m3u_account=account,
+            m3u_account_id=account.id,
+            stream_stats={},
+            stream_stats_updated_at=None,
+        )
+        for index, account in enumerate(accounts, start=1)
+    ]
+    rows = QuerySet(
+        SimpleNamespace(channel_id=index, stream=stream)
+        for index, stream in enumerate(streams, start=1)
+    )
+    models_module = types.ModuleType("apps.channels.models")
+    models_module.ChannelStream = SimpleNamespace(objects=rows)
+    monkeypatch.setitem(sys.modules, "apps", types.ModuleType("apps"))
+    monkeypatch.setitem(sys.modules, "apps.channels", types.ModuleType("apps.channels"))
+    monkeypatch.setitem(sys.modules, "apps.channels.models", models_module)
+
+    now = datetime.now(timezone.utc).isoformat()
+    cache = {
+        str(stream.id): {
+            "status": "alive",
+            "url_hash": analyzer._stream_url_hash(stream.url),
+            "health_checked_at": now,
+            "content_checked_at": now,
+            "metadata_updated_at": now,
+            "stats": {"resolution": "1920x1080", "source_fps": 30},
+        }
+        for stream in streams
+    }
+    monkeypatch.setattr(incremental.analyzer, "load_analysis_cache", lambda _path: cache)
+    monkeypatch.setattr(incremental.analyzer, "save_analysis_cache", lambda *_args: None)
+    monkeypatch.setattr(incremental, "load_throughput_cache", lambda _path: {})
+    monkeypatch.setattr(incremental, "probe_stream", lambda *_args, **_kwargs: {
+        "status": "healthy",
+        "tested_at": now,
+        "measured_mbps": 10,
+    })
+    monkeypatch.setattr("stream_sorter.sorter.resolve_channel_scope", lambda _settings: (None, {}))
+
+    limiter_waits = []
+
+    class RecordingLimiter:
+        def __init__(self, delay_seconds):
+            self.delay_seconds = delay_seconds
+
+        def wait(self, account_id):
+            limiter_waits.append(account_id)
+
+    monkeypatch.setattr(incremental.analyzer, "_PerAccountStartLimiter", RecordingLimiter)
+    result = analyze_assigned_streams(
+        {
+            "analysis_workers": 2,
+            "playback_health_reuse": False,
+            "probe_rate_per_minute": 1,
+            "probe_per_account_delay_seconds": 1,
+        },
+        logger=SimpleNamespace(
+            info=lambda *_args, **_kwargs: None,
+            warning=lambda *_args, **_kwargs: None,
+        ),
+        cache_path=str(tmp_path / "analysis.json"),
+    )
+
+    assert result["media_checked"] == 0
+    assert result["throughput_checked"] == 2
+    assert collections.Counter(limiter_waits) == {10: 1, 20: 1}
+    assert None not in limiter_waits
 
 
 def test_incremental_analyzer_is_installed_for_plugin_compatibility():

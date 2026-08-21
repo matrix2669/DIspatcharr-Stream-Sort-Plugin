@@ -32,6 +32,7 @@ def test_analysis_status_reports_running_progress_without_overwriting_api_status
             "job_id": "job-1",
             "status": "running",
             "phase": "media_analysis",
+            "parallel_tests": 5,
             "progress_percent": 40,
             "progress_completed": 4,
             "progress_total": 10,
@@ -43,6 +44,7 @@ def test_analysis_status_reports_running_progress_without_overwriting_api_status
     assert result["job_status"] == "running"
     assert result["running"] is True
     assert "40% (4/10)" in result["message"]
+    assert "Up to 5 tests run concurrently" in result["message"]
 
 
 def test_analysis_status_marks_stale_running_job_interrupted(tmp_path, monkeypatch):
