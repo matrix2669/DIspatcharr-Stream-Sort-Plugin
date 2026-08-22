@@ -14,6 +14,15 @@ Historical versions below were published through the legacy `dev-test` workflow 
 
 ### Removed
 
+## 0.3.6-beta.2 - 2026-08-22
+
+### Changed
+
+- Clarify that Dispatcharr plugin test tags are published only to the dev-test registry without creating GitHub Releases.
+- Keep Stream Sort absent from the stable registry until a stable GitHub Release is explicitly approved.
+
+This beta changes project and distribution metadata only; Stream Sort runtime behavior is unchanged from `0.3.5`.
+
 ## 0.3.6-beta.1 - 2026-08-22
 
 ### Changed

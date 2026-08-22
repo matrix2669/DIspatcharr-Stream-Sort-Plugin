@@ -1,6 +1,6 @@
 {
   "name": "Dispatcharr Stream Sort",
-  "version": "0.3.6-beta.1",
+  "version": "0.3.6-beta.2",
   "description": "Analyzes stream health, quality, delivery performance, and runtime reliability telemetry with M3U connection-capacity reservations, reuses fresh Dispatcharr playback metadata, then scores and reorders streams already assigned to channels.",
   "author": "matrix2669",
   "help_url": "https://github.com/matrix2669/DIspatcharr-Stream-Sort-Plugin",
