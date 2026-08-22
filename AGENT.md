@@ -46,14 +46,14 @@ The repository uses the standalone workflow:
 - `main` — stable, production-ready releases;
 - `dev` — integration for the next release;
 - `feature/*` and `fix/*` — short-lived work based on and returning to `dev`;
-- `vMAJOR.MINOR.PATCH-beta.N` — immutable test releases from `dev`;
-- `vMAJOR.MINOR.PATCH` — immutable stable releases from `main`.
+- `vMAJOR.MINOR.PATCH-beta.N` — immutable test tags from `dev`, with no GitHub Release;
+- `vMAJOR.MINOR.PATCH` — version tags; only an explicitly approved GitHub Release may be advertised as stable from `main`.
 
-The `dispatcharr-plugins:dev-test` registry channel points to immutable beta tags from `dev`; it is not a source branch in this repository. Track every current branch in `BRANCHES.md`; remove an entry only when its remote branch is deleted and its durable result is already captured in `CHANGELOG.md` or `DECISIONS.md` as applicable.
+The `dispatcharr-plugins:dev-test` registry channel points to immutable test tags from `dev`; it is not a source branch in this repository. The stable registry must not contain Stream Sort until the user explicitly approves a GitHub Release. Track every current branch in `BRANCHES.md`; remove an entry only when its remote branch is deleted and its durable result is already captured in `CHANGELOG.md` or `DECISIONS.md` as applicable.
 
 ## Release Requirements
 
-Follow `RELEASE.md`. A release version must agree across `VERSION`, `pyproject.toml`, `stream_sorter/plugin.json`, Git tag, registry metadata, release notes, and artifact names; manifest tests enforce the repository-local values. Never move a published tag or replace a published artifact; issue a new version for corrections.
+Follow `RELEASE.md`. Every test tag must agree across `VERSION`, `pyproject.toml`, `stream_sorter/plugin.json`, and dev-test registry metadata; manifest tests enforce the repository-local values. Stable release notes and artifacts are added only when a GitHub Release is explicitly approved. Never move a published tag or replace a published artifact; issue a new version for corrections.
 
 ## Testing Requirements
 

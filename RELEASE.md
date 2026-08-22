@@ -1,6 +1,12 @@
 # Release Process
 
-Dispatcharr Stream Sort uses `main` for stable releases and `dev` for the next release. Published versions are immutable Git tags; registry channels never install from a moving source branch.
+Dispatcharr Stream Sort uses `dev` tags for testing and `main` only for explicitly approved stable releases. Registry channels never install from a moving source branch.
+
+For this plugin, a tag is not a GitHub Release:
+
+- a test tag from `dev` is published only to `matrix2669/dispatcharr-plugins:dev-test`;
+- no GitHub Release is created for a test tag;
+- only an explicitly approved stable GitHub Release is published to `matrix2669/dispatcharr-plugins:main`.
 
 ## Version sources
 
@@ -27,7 +33,7 @@ Testing builds use `MAJOR.MINOR.PATCH-beta.N`; stable builds use `MAJOR.MINOR.PA
 1. Integrate and validate the intended changes on `dev`.
 2. Set every version source to the next beta, such as `0.4.0-beta.1`, and finalize the matching changelog content.
 3. Commit the versioned state and tag that exact `dev` commit with the matching `v`-prefixed tag.
-4. Publish the GitHub Release as a prerelease and attach the beta ZIP plus checksum.
+4. Push the tag without creating a GitHub Release.
 5. Update the `dispatcharr-plugins:dev-test` manifest to the immutable tag archive and matching commit.
 6. Confirm Dispatcharr detects the version increment and installs that exact build.
 
@@ -43,4 +49,4 @@ Testing builds use `MAJOR.MINOR.PATCH-beta.N`; stable builds use `MAJOR.MINOR.PA
 
 ## Historical baseline
 
-Version `0.3.5` was originally validated and published through the legacy `dev-test` branch at commit `283da3aa636b443f39efe89a0216e4f7f837247d`. The `v0.3.5` tag anchors that exact historical source rather than assigning the same version to the later documentation commit.
+Version `0.3.5` was originally validated and published for testing through the legacy `dev-test` branch at commit `283da3aa636b443f39efe89a0216e4f7f837247d`. The `v0.3.5` tag anchors that exact historical test source; it does not declare a stable GitHub Release.
