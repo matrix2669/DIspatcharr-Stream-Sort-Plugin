@@ -14,6 +14,16 @@ Historical versions below were published through the legacy `dev-test` workflow 
 
 ### Removed
 
+## 0.3.6-beta.1 - 2026-08-22
+
+### Changed
+
+- Migrate the testing channel from the moving `dev-test` source branch to the immutable `v0.3.6-beta.1` prerelease tag.
+- Add repository-local project, branch, decision, release, and version documentation.
+- Add a test that keeps `VERSION`, `pyproject.toml`, and `stream_sorter/plugin.json` synchronized.
+
+This beta changes project and distribution metadata only; Stream Sort runtime behavior is unchanged from `0.3.5`.
+
 ## 0.3.5 - 2026-08-20
 
 ### Changed

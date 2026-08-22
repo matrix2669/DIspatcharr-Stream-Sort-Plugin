@@ -41,7 +41,7 @@ Keep changes focused and add regression coverage. Treat live profile IDs, instal
 
 ## Branch Workflow
 
-The repository is migrating from the legacy `main`/`dev-test` and checkpoint-branch layout to the standalone workflow:
+The repository uses the standalone workflow:
 
 - `main` — stable, production-ready releases;
 - `dev` — integration for the next release;
@@ -49,7 +49,7 @@ The repository is migrating from the legacy `main`/`dev-test` and checkpoint-bra
 - `vMAJOR.MINOR.PATCH-beta.N` — immutable test releases from `dev`;
 - `vMAJOR.MINOR.PATCH` — immutable stable releases from `main`.
 
-Until migration is explicitly performed, `dev-test` remains the active published source. Do not claim that `main`, `dev`, tags, or stable releases exist without checking GitHub. Track every current branch in `BRANCHES.md`; remove an entry only when its remote branch is deleted and its durable result is already captured in `CHANGELOG.md` or `DECISIONS.md` as applicable.
+The `dispatcharr-plugins:dev-test` registry channel points to immutable beta tags from `dev`; it is not a source branch in this repository. Track every current branch in `BRANCHES.md`; remove an entry only when its remote branch is deleted and its durable result is already captured in `CHANGELOG.md` or `DECISIONS.md` as applicable.
 
 ## Release Requirements
 

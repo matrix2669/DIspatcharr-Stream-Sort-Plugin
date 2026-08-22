@@ -98,7 +98,7 @@ Capacity behavior must be validated against fresh profile configuration. Deferre
 
 ## Status
 
-Accepted, migration pending
+Accepted
 
 ## Date
 
@@ -108,7 +108,7 @@ Accepted, migration pending
 
 Adopt the standalone release workflow defined by `matrix2669/workspace`: `main` contains stable releases, `dev` integrates the next release, beta tags `vMAJOR.MINOR.PATCH-beta.N` publish immutable test builds, and stable tags `vMAJOR.MINOR.PATCH` publish immutable normal releases.
 
-The current `dev-test` branch and registry entry remain authoritative until an explicit migration is validated. Existing checkpoint branches are not deleted automatically.
+The stable baseline tag `v0.3.5` anchors the exact historical commit previously published as version `0.3.5`. The first new test-channel release is `v0.3.6-beta.1` from `dev`. Registry channels point to immutable tags rather than source branches.
 
 ## Reason
 
@@ -116,7 +116,7 @@ The legacy workflow uses moving branches as version artifacts and has accumulate
 
 ## Consequences
 
-Migration must create and validate `dev`, promote stable code intentionally to `main`, update registry URLs from moving branches to tags, and package installable releases. `VERSION`, `pyproject.toml`, `stream_sorter/plugin.json`, tests, tags, and registry metadata must remain synchronized.
+`VERSION`, `pyproject.toml`, `stream_sorter/plugin.json`, tests, tags, and registry metadata must remain synchronized. Legacy branch cleanup occurs only after full-ref verification proves no unique work would be lost and the registry no longer depends on the old source branch.
 
 ## Provenance
 
