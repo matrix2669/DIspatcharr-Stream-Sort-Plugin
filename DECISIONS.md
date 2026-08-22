@@ -106,11 +106,11 @@ Accepted
 
 ## Decision
 
-Adopt the standalone release workflow defined by `matrix2669/workspace`: `main` contains stable releases, `dev` integrates the next release, beta tags `vMAJOR.MINOR.PATCH-beta.N` publish immutable test builds, and stable tags `vMAJOR.MINOR.PATCH` publish immutable normal releases.
+Adopt the standalone workflow defined by `matrix2669/workspace`: `main` contains released code, `dev` integrates the next version, beta tags `vMAJOR.MINOR.PATCH-beta.N` identify immutable test builds, and stable tags `vMAJOR.MINOR.PATCH` identify completed feature or fix work. A stable tag does not require a GitHub Release.
 
-The historical test tag `v0.3.5` anchors the exact commit previously published as version `0.3.5`. New test-channel versions use immutable tags from `dev` and are advertised only in `dispatcharr-plugins:dev-test`. Test tags do not create GitHub Releases.
+The historical test tag `v0.3.5` anchors the exact commit previously published as version `0.3.5`. Stream Sort's newest approved tag is advertised in `dispatcharr-plugins:dev`: beta while testing is active, otherwise the latest completed stable version. Tags do not create GitHub Releases.
 
-Only an explicitly approved stable GitHub Release may be added to `dispatcharr-plugins:main`. Stream Sort remains absent from the stable manifest until that approval and release exist.
+Only an explicitly approved GitHub Release may be added to `dispatcharr-plugins:main`. Stream Sort remains absent from the released manifest until that approval and Release exist.
 
 ## Reason
 

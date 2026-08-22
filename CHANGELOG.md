@@ -10,6 +10,9 @@ Historical versions below were published through the legacy `dev-test` workflow 
 
 ### Changed
 
+- Move the registry tagged-build channel from `dispatcharr-plugins:dev-test` to `dispatcharr-plugins:dev`.
+- Distinguish completed stable versions from explicitly approved GitHub Releases.
+
 ### Fixed
 
 ### Removed

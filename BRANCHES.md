@@ -31,7 +31,7 @@ Before deleting a branch, record user-visible results in `CHANGELOG.md` and dura
 - Base: the documented `main` migration baseline
 - Purpose: integrate upcoming changes and publish immutable test tags without creating GitHub Releases
 - Target: `main` after beta validation
-- Distribution target: `matrix2669/dispatcharr-plugins:dev-test`
+- Distribution target: `matrix2669/dispatcharr-plugins:dev`
 - Validation: every publishable beta requires the full automated suite, archive inspection, Dispatcharr update/install verification, and proportionate live integration testing
 
 ## Migration record
