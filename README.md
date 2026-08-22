@@ -138,5 +138,3 @@ The plugin owns the `plugins.stream_sorter` logger and prefixes its messages wit
 python -m pytest
 python -m compileall -q stream_sorter tests
 ```
-
-Changes are validated on `dev-test` before promotion to `dev`.
