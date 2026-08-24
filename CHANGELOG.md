@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.3.6-beta.7 - 2026-08-24
+
 ### Added
 
 - Add separate guarded **Reset Scan Statistics** and **Reset All Statistics** actions while preserving schedules, settings, provider configuration, and channel order.
