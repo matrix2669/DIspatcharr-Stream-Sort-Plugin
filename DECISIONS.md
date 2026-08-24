@@ -177,9 +177,10 @@ TTL tuning will be driven by a read/report action from collected health telemetr
 - Recommendations use report-derived fields from the latest health trend report:
   - history coverage (`history_rows`, `history_span_hours`),
   - dead ratio (`dead_check_ratio`),
-  - status transition ratio (`checks_per_status_change_ratio`),
-  - check-interval percentiles (`check_interval_hours`),
-  - status-change-interval percentiles (`status_change_interval_hours`),
+  - directional transition ratio (`status_changes_per_check_ratio`),
+  - completed alive episode durations (`alive_episode_duration_hours`),
+  - dead-to-alive recovery durations (`dead_recovery_duration_hours`),
+  - actual check concentration (`check_concentration`),
   - per-hour dead concentration (`hourly_dead_ratio`),
   - unstable stream pattern indicators.
 - Jitter is not applied to dead TTL, only to media analysis/throughput-like TTLs.
@@ -199,3 +200,29 @@ Users asked to keep control over settings, but still want data-driven recommenda
 ## Provenance
 
 - Stream Sort design discussion in this session (`TTL objective, stale handling, recommendation scope, and jitter policy`).
+
+# ADR-007: Provider-owned stale state and atomic scheduled analysis
+
+## Status
+
+Accepted; supersedes the `Stream.is_stale` persistence portion of ADR-005.
+
+## Date
+
+2026-08-24
+
+## Decision
+
+- Do not use Dispatcharr `Stream.is_stale` as analyzer health state. Dispatcharr defines and rewrites it during provider refresh, and playback selection does not exclude it.
+- Keep confirmed-dead state in Stream Sort evidence, reports, and sorting until Dispatcharr exposes a supported playback exclusion contract.
+- Require an atomic shared-cache claim for every scheduled cron minute because every uWSGI worker loads the plugin.
+- Version schedule configuration so a running worker cannot overwrite a newer Apply or Disable action.
+- Load current `PluginConfig.settings` for every scheduled run and close database connections on every scheduler cycle.
+- Measure directional health episodes. Dead TTL guidance uses dead-to-alive recovery duration; health TTL guidance uses completed alive episodes; jitter guidance uses observed check concentration.
+- Classify a stream as problematic only when it has at least four retained checks and more than 75 percent are dead.
+
+## Consequences
+
+- Stream Sort cannot guarantee that Dispatcharr playback skips a confirmed-dead stream without a compatible core feature.
+- Scheduled scans remain safe when multiple uWSGI workers are running and when settings change between scans.
+- Recommendation confidence remains low until enough history and directional transition samples exist.

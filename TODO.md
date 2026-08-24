@@ -1,10 +1,10 @@
 # Stream Sort TODO
 
-- [ ] Dead-stream monitoring and removal.
+- [ ] Add a Dispatcharr-supported playback exclusion mechanism if core exposes one; keep current dead-stream handling report-only and non-destructive.
 - [ ] Simplify the settings UI and scoring, possibly using select boxes with values from -5 to +5.
 - [ ] Add multi-line input boxes for prefix rules.
-- [ ] Add a scheduler, possibly with time constraints or automatic pauses while streams are active.
+- [ ] Consider an optional scheduler pause while streams are actively playing.
 - [ ] Add a button to stop the current scan.
-- [ ] Add a way to offset TTL schedules so streams become due for analysis at staggered times.
+- [ ] Evaluate provider-aware TTL spreading only if stream-level concentration reports show specific accounts are being hammered.
 - [ ] Remove the Runtime Reliability Collector from the Actions page in the UI.
 - [ ] Remove **Maximum streams per analysis run**; Group and Profile filters make it unnecessary.

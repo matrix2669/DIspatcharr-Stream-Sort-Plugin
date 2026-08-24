@@ -118,6 +118,14 @@ def test_throughput_parallelism_is_limited_per_source_not_globally(tmp_path, mon
     monkeypatch.setitem(sys.modules, "apps", types.ModuleType("apps"))
     monkeypatch.setitem(sys.modules, "apps.channels", types.ModuleType("apps.channels"))
     monkeypatch.setitem(sys.modules, "apps.channels.models", models_module)
+    django_module = types.ModuleType("django")
+    django_utils_module = types.ModuleType("django.utils")
+    django_timezone_module = types.ModuleType("django.utils.timezone")
+    django_timezone_module.now = lambda: _now()
+    django_utils_module.timezone = django_timezone_module
+    monkeypatch.setitem(sys.modules, "django", django_module)
+    monkeypatch.setitem(sys.modules, "django.utils", django_utils_module)
+    monkeypatch.setitem(sys.modules, "django.utils.timezone", django_timezone_module)
 
     now = datetime.now(timezone.utc).isoformat()
     cache = {
@@ -180,6 +188,10 @@ def test_throughput_parallelism_is_limited_per_source_not_globally(tmp_path, mon
 
     assert result["media_checked"] == 0
     assert result["throughput_checked"] == 2
+    assert result["analysis_health_report_path"] == str(
+        tmp_path / "dispatcharr_stream_sort_health_report.json"
+    )
+    assert (tmp_path / "dispatcharr_stream_sort_health_report.json").exists()
     assert collections.Counter(limiter_waits) == {10: 1, 20: 1}
     assert None not in limiter_waits
 
@@ -221,6 +233,24 @@ def test_dead_health_uses_dead_ttl_before_recheck():
     assert health_check_reason(expired, url_hash="abc", ttl_hours=24, dead_ttl_hours=1, now=now) == "status_dead"
 
 
+def test_dead_ttl_defers_the_complete_media_analysis_reason():
+    now = _now()
+    entry = {
+        "status": "dead",
+        "url_hash": "abc",
+        "health_checked_at": (now - timedelta(minutes=30)).isoformat(),
+    }
+    assert incremental._analysis_reason(
+        entry,
+        url_hash="abc",
+        health_ttl_hours=24,
+        content_ttl_hours=168,
+        metadata_ttl_hours=12,
+        dead_ttl_hours=1,
+        now=now,
+    ) is None
+
+
 def test_dead_ttl_does_not_use_jitter(monkeypatch):
     now = _now()
     entry = {
@@ -239,17 +269,13 @@ def test_dead_ttl_does_not_use_jitter(monkeypatch):
     ) == "status_dead_ttl"
 
 
-def test_ttl_jitter_can_stagger_next_health_check_for_alive_streams():
-    now = _now()
-    entry = {
-        "status": "alive",
-        "url_hash": "abc",
-        "health_checked_at": (now - timedelta(hours=1)).isoformat(),
-    }
-    unjittered = health_check_reason(entry, url_hash="abc", ttl_hours=1, now=now)
-    jittered = health_check_reason(entry, url_hash="abc", ttl_hours=1, ttl_jitter_percent=50, now=now)
-    assert unjittered == "ttl_expired"
-    assert jittered in {"ttl_expired", None}
+def test_ttl_jitter_assigns_stable_distinct_values_inside_the_configured_range():
+    first = incremental._ttl_with_jitter(10, url_hash="stream-a", jitter_percent=20)
+    second = incremental._ttl_with_jitter(10, url_hash="stream-b", jitter_percent=20)
+    assert 8 <= first <= 12
+    assert 8 <= second <= 12
+    assert first != second
+    assert first == incremental._ttl_with_jitter(10, url_hash="stream-a", jitter_percent=20)
 
 
 def test_health_report_includes_interval_guidance_from_history():
@@ -290,8 +316,77 @@ def test_health_report_includes_interval_guidance_from_history():
     assert report["observations"]["history_rows"] == 5
     assert report["observations"]["dead_checks"] == 3
     assert report["observations"]["status_changes"] == 2
+    assert report["observations"]["dead_recovery_duration_hours"]["samples"] == 1
+    assert report["observations"]["transition_counts"]["dead_to_alive"] == 1
     assert report["observations"]["check_interval_hours"]["p90"] is not None
     assert report["ttl_tuning_guidance"]["suggested_health_ttl_hours"] is not None
+
+
+def test_problematic_streams_require_more_than_75_percent_dead_across_full_scope():
+    now = _now()
+    items = [{"id": index, "name": f"Stream {index}"} for index in range(1, 26)]
+    cache = {}
+    for item in items:
+        statuses = ["dead", "dead", "dead", "alive"]
+        if item["id"] == 25:
+            statuses = ["dead", "dead", "dead", "dead", "alive"]
+        cache[str(item["id"])] = {
+            "status": statuses[-1],
+            "health_check_history": [
+                {
+                    "checked_at": (now - timedelta(hours=len(statuses) - index)).isoformat(),
+                    "previous_status": statuses[index - 1] if index else "unknown",
+                    "status": value,
+                    "reason": "ttl_expired",
+                }
+                for index, value in enumerate(statuses)
+            ],
+        }
+    report = _build_health_report(
+        items,
+        cache,
+        now=now,
+        media_reason_counts={},
+        throughput_reason_counts={},
+        channels_selected=25,
+    )
+    assert report["top_metrics"]["dead_dominant_streams"] == [25]
+    assert report["status_patterns"]["problematic_streams"][0]["stream_id"] == 25
+
+
+def test_persist_dispatcharr_result_does_not_write_provider_stale_state(monkeypatch):
+    saved = {}
+    stream = SimpleNamespace(
+        stream_stats={},
+        is_stale=True,
+        save=lambda update_fields: saved.update(update_fields=list(update_fields)),
+    )
+
+    class Query:
+        def first(self):
+            return stream
+
+    models_module = types.ModuleType("apps.channels.models")
+    models_module.Stream = SimpleNamespace(objects=SimpleNamespace(filter=lambda **_kwargs: Query()))
+    monkeypatch.setitem(sys.modules, "apps", types.ModuleType("apps"))
+    monkeypatch.setitem(sys.modules, "apps.channels", types.ModuleType("apps.channels"))
+    monkeypatch.setitem(sys.modules, "apps.channels.models", models_module)
+    django_module = types.ModuleType("django")
+    django_utils_module = types.ModuleType("django.utils")
+    django_timezone_module = types.ModuleType("django.utils.timezone")
+    django_timezone_module.now = lambda: _now()
+    django_utils_module.timezone = django_timezone_module
+    monkeypatch.setitem(sys.modules, "django", django_module)
+    monkeypatch.setitem(sys.modules, "django.utils", django_utils_module)
+    monkeypatch.setitem(sys.modules, "django.utils.timezone", django_timezone_module)
+    warnings = []
+    assert analyzer._persist_dispatcharr_result(
+        42,
+        {"status": "alive", "stats": {"resolution": "1920x1080"}},
+        SimpleNamespace(warning=lambda *args, **_kwargs: warnings.append(args)),
+    ), warnings
+    assert stream.is_stale is True
+    assert "is_stale" not in saved["update_fields"]
 
 
 def test_url_change_invalidates_health_and_metadata():
@@ -376,6 +471,8 @@ def test_older_dispatcharr_metadata_is_ignored():
 def test_media_stats_bitrate_change_is_treated_as_significant_only_above_tolerance():
     assert not _is_significant_bitrate_change(5000.0, 5600.0)
     assert _is_significant_bitrate_change(5000.0, 7000.0)
+    assert not _is_significant_bitrate_change(None, 5000.0)
+    assert not _is_significant_bitrate_change(5000.0, None)
 
 
 def test_media_stats_changed_for_throughput_uses_signature_and_bitrate_tolerance():
@@ -406,6 +503,39 @@ def test_media_change_thresholds_are_configurable():
         media_bitrate_relative_tolerance=0.05,
         media_bitrate_absolute_tolerance_kbps=100.0,
     )
+
+
+def test_dispatcharr_metadata_uses_configured_bitrate_change_thresholds():
+    now = _now()
+    url = "http://example.test/live"
+    item = {
+        "id": 42,
+        "url": url,
+        "dispatcharr_stats": {"resolution": "1920x1080", "source_fps": 60, "video_bitrate": 5600},
+        "dispatcharr_stats_updated_at": now.isoformat(),
+    }
+    cache = {"42": {
+        "url_hash": analyzer._stream_url_hash(url),
+        "metadata_updated_at": (now - timedelta(hours=1)).isoformat(),
+        "stats": {"resolution": "1920x1080", "source_fps": 60, "video_bitrate": 5000},
+    }}
+    refreshed, changed = incremental._sync_dispatcharr_metadata(
+        [item], cache,
+        media_bitrate_relative_tolerance=0.30,
+        media_bitrate_absolute_tolerance_kbps=500,
+    )
+    assert refreshed == 1
+    assert changed == set()
+
+    item["dispatcharr_stats"] = {"resolution": "1920x1080", "source_fps": 60, "video_bitrate": 7500}
+    item["dispatcharr_stats_updated_at"] = (now + timedelta(minutes=1)).isoformat()
+    refreshed, changed = incremental._sync_dispatcharr_metadata(
+        [item], cache,
+        media_bitrate_relative_tolerance=0.30,
+        media_bitrate_absolute_tolerance_kbps=500,
+    )
+    assert refreshed == 1
+    assert changed == {42}
 
 
 def test_skipped_media_result_preserves_previous_metadata():
@@ -485,3 +615,29 @@ def test_short_unfinished_playback_does_not_replace_reachability_probe():
         now=now,
     ) == 0
     assert cache == {}
+
+
+def test_runtime_playback_never_clears_confirmed_dead_health():
+    now = _now()
+    item = {"id": 42, "name": "Example", "url": "http://example.test/live"}
+    reliability = {"streams": {"42": {
+        "last_clean_playback_at": (now - timedelta(minutes=1)).isoformat(),
+        "last_clean_playback_seconds": 120,
+        "reliability_evidence": {
+            "updated_at": (now - timedelta(minutes=1)).isoformat(),
+            "playback_seconds": 120,
+        },
+    }}}
+    cache = {"42": {
+        "status": "dead",
+        "url_hash": analyzer._stream_url_hash(item["url"]),
+        "health_checked_at": now.isoformat(),
+    }}
+    assert _sync_runtime_playback_health(
+        [item], cache, reliability,
+        min_playback_seconds=300,
+        min_clean_playback_seconds=60,
+        ttl_hours=6,
+        now=now,
+    ) == 0
+    assert cache["42"]["status"] == "dead"

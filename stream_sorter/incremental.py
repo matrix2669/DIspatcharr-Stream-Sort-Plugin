@@ -23,7 +23,8 @@ from .throughput import (
 
 
 ANALYSIS_HEALTH_REPORT_PATH = "/data/dispatcharr_stream_sort_health_report.json"
-MEDIA_CHECK_HISTORY_LIMIT = 120
+MEDIA_CHECK_HISTORY_RETENTION_DAYS = 90
+MEDIA_CHECK_HISTORY_MAX_ROWS = 2000
 MEDIA_BITRATE_RELATIVE_TOLERANCE = 0.30
 MEDIA_BITRATE_ABSOLUTE_TOLERANCE_KBPS = 500.0
 
@@ -265,7 +266,7 @@ def _is_significant_bitrate_change(
     if new_bitrate is None and previous_bitrate is None:
         return False
     if previous_bitrate is None or new_bitrate is None:
-        return True
+        return False
     relative = MEDIA_BITRATE_RELATIVE_TOLERANCE if relative_tolerance is None else max(0.0, relative_tolerance)
     absolute = MEDIA_BITRATE_ABSOLUTE_TOLERANCE_KBPS if absolute_tolerance_kbps is None else max(0.0, absolute_tolerance_kbps)
     tolerance = max(absolute, previous_bitrate * relative)
@@ -341,8 +342,14 @@ def _append_health_history(
             "source": str(result.get("health_source") or entry.get("health_source") or "stream_sort_analyzer"),
         }
     )
-    if len(history) > MEDIA_CHECK_HISTORY_LIMIT:
-        history = history[-MEDIA_CHECK_HISTORY_LIMIT:]
+    observed_at = _parse_datetime(tested_at) or datetime.now(timezone.utc)
+    cutoff = observed_at - timedelta(days=MEDIA_CHECK_HISTORY_RETENTION_DAYS)
+    history = [
+        row for row in history
+        if (_parse_datetime(row.get("checked_at")) or observed_at) >= cutoff
+    ]
+    if len(history) > MEDIA_CHECK_HISTORY_MAX_ROWS:
+        history = history[-MEDIA_CHECK_HISTORY_MAX_ROWS:]
     entry["health_check_history"] = history
 
 
@@ -358,12 +365,16 @@ def _build_health_report(
     summary: collections.Counter[str] = collections.Counter()
     status_changes: dict[int, int] = {}
     dead_counts: dict[int, int] = {}
-    last_reasons: dict[int, str] = {}
     hourly_dead_checks: collections.Counter[int] = collections.Counter()
     hourly_total_checks: collections.Counter[int] = collections.Counter()
+    minute_check_counts: collections.Counter[str] = collections.Counter()
+    transition_counts: collections.Counter[str] = collections.Counter()
     all_checked_at: list[datetime] = []
     check_intervals_hours: list[float] = []
     status_change_intervals_hours: list[float] = []
+    dead_recovery_hours: list[float] = []
+    alive_episode_hours: list[float] = []
+    current_dead_episode_hours: list[float] = []
     total_changes = 0
     total_dead_checks = 0
     stream_reports = []
@@ -372,56 +383,87 @@ def _build_health_report(
         entry = cache.get(str(item["id"])) or {}
         status = str(entry.get("status") or "unknown").lower()
         summary[status] += 1
-
         history = entry.get("health_check_history") or []
-        changes = 0
+        timeline: list[tuple[datetime, str, str]] = []
         dead = 0
-        timeline: list[tuple[datetime, str]] = []
-        last_status = status
-        for index, row in enumerate(history):
+        for row in history:
             row_status = str(row.get("status") or "").lower()
-            if index and row_status and row_status != str(history[index - 1].get("status") or "").lower():
-                changes += 1
-                total_changes += 1
+            checked_at = _parse_datetime(row.get("checked_at"))
+            if not row_status or checked_at is None:
+                continue
+            recorded_previous = str(row.get("previous_status") or "").lower()
+            timeline.append((checked_at, row_status, recorded_previous))
+            all_checked_at.append(checked_at)
+            hourly_total_checks[checked_at.hour] += 1
+            minute_check_counts[checked_at.strftime("%Y%m%d%H%M")] += 1
             if row_status == "dead":
                 dead += 1
                 total_dead_checks += 1
-            if row_status:
-                try:
-                    parsed = _parse_datetime(row.get("checked_at"))
-                except Exception:
-                    parsed = None
-                if parsed is not None:
-                    timeline.append((parsed, row_status))
-                    hourly_total_checks[parsed.hour] += 1
-                    if row_status == "dead":
-                        hourly_dead_checks[parsed.hour] += 1
-                    all_checked_at.append(parsed)
-        if history:
-            last_record = history[-1]
-            last_status = str(last_record.get("status") or "unknown").lower()
-            last_reasons[int(item["id"])] = str(last_record.get("reason") or "none")
-        if len(timeline) >= 2:
-            timeline.sort(key=lambda row: row[0])
-            for index in range(1, len(timeline)):
-                check_intervals_hours.append((timeline[index][0] - timeline[index - 1][0]).total_seconds() / 3600.0)
-                if timeline[index][1] != timeline[index - 1][1]:
-                    status_change_intervals_hours.append((timeline[index][0] - timeline[index - 1][0]).total_seconds() / 3600.0)
+                hourly_dead_checks[checked_at.hour] += 1
 
-        status_changes[int(item["id"])] = changes
-        dead_counts[int(item["id"])] = dead
+        timeline.sort(key=lambda row: row[0])
+        changes = 0
+        dead_started_at: datetime | None = None
+        alive_started_at: datetime | None = None
+        prior_status = ""
+        for index, (checked_at, row_status, recorded_previous) in enumerate(timeline):
+            if index:
+                check_intervals_hours.append(
+                    (checked_at - timeline[index - 1][0]).total_seconds() / 3600.0
+                )
+            previous_status = recorded_previous or prior_status
+            if previous_status and previous_status != row_status:
+                changes += 1
+                total_changes += 1
+                transition_counts[f"{previous_status}_to_{row_status}"] += 1
+                if index:
+                    status_change_intervals_hours.append(
+                        (checked_at - timeline[index - 1][0]).total_seconds() / 3600.0
+                    )
+                if row_status == "dead":
+                    if alive_started_at is not None:
+                        alive_episode_hours.append(
+                            (checked_at - alive_started_at).total_seconds() / 3600.0
+                        )
+                    alive_started_at = None
+                    dead_started_at = checked_at
+                elif row_status == "alive":
+                    if dead_started_at is not None:
+                        dead_recovery_hours.append(
+                            (checked_at - dead_started_at).total_seconds() / 3600.0
+                        )
+                    dead_started_at = None
+                    alive_started_at = checked_at
+            elif not previous_status:
+                if row_status == "dead":
+                    dead_started_at = checked_at
+                elif row_status == "alive":
+                    alive_started_at = checked_at
+            prior_status = row_status
+
+        if prior_status == "dead" and dead_started_at is not None:
+            current_dead_episode_hours.append(
+                max(0.0, (now - dead_started_at).total_seconds() / 3600.0)
+            )
+
+        last_record = history[-1] if history else {}
+        history_len = len(history)
+        dead_ratio = dead / history_len if history_len else 0.0
+        stream_id = int(item["id"])
+        status_changes[stream_id] = changes
+        dead_counts[stream_id] = dead
         stream_reports.append(
             {
-                "stream_id": int(item["id"]),
+                "stream_id": stream_id,
                 "name": str(item.get("name") or ""),
-                "last_status": last_status,
-                "last_reason": last_reasons.get(int(item["id"]), "none"),
-                "history_len": len(history),
+                "last_status": str(last_record.get("status") or status).lower(),
+                "last_reason": str(last_record.get("reason") or "none"),
+                "history_len": history_len,
                 "status_changes": changes,
                 "dead_checks": dead,
-                "checks_checked_at": len(history) > 0 and _parse_datetime(history[-1].get("checked_at")) is not None,
-                "last_checked_at": history[-1].get("checked_at") if history else None,
-                "age_hours": _age_hours(history[-1].get("checked_at"), now) if history else None,
+                "dead_check_ratio": round(dead_ratio, 4),
+                "last_checked_at": last_record.get("checked_at"),
+                "age_hours": _age_hours(last_record.get("checked_at"), now),
             }
         )
 
@@ -435,6 +477,10 @@ def _build_health_report(
     check_interval_p90 = _percentile(check_intervals_hours, 0.9)
     status_change_interval_p50 = _percentile(status_change_intervals_hours, 0.5)
     status_change_interval_p90 = _percentile(status_change_intervals_hours, 0.9)
+    dead_recovery_p50 = _percentile(dead_recovery_hours, 0.5)
+    dead_recovery_p90 = _percentile(dead_recovery_hours, 0.9)
+    alive_episode_p25 = _percentile(alive_episode_hours, 0.25)
+    alive_episode_p50 = _percentile(alive_episode_hours, 0.5)
     total_history_rows = sum(len((cache.get(str(item["id"])) or {}).get("health_check_history") or []) for item in items)
 
     hourly = []
@@ -456,6 +502,16 @@ def _build_health_report(
         key=lambda row: (row["dead_checks"], row["status_changes"], row["history_len"]),
         reverse=True,
     )[:20]
+    problematic_streams = [
+        row for row in stream_reports
+        if row["history_len"] >= 4 and row["dead_check_ratio"] > 0.75
+    ]
+    problematic_streams.sort(
+        key=lambda row: (row["dead_check_ratio"], row["dead_checks"], row["history_len"]),
+        reverse=True,
+    )
+    busiest_minute = max(minute_check_counts.values(), default=0)
+    concentration_ratio = busiest_minute / total_history_rows if total_history_rows else 0.0
 
     return {
         "generated_at": now.isoformat(),
@@ -467,9 +523,11 @@ def _build_health_report(
             "history_span_hours": round(history_span_hours, 4),
             "status_changes": total_changes,
             "dead_checks": total_dead_checks,
-            "checks_per_status_change_ratio": round(
-                total_changes / max(1, total_history_rows),
-                4,
+            "checks_per_status_change_ratio": (
+                round(total_history_rows / total_changes, 4) if total_changes else None
+            ),
+            "status_changes_per_check_ratio": round(
+                total_changes / max(1, total_history_rows), 4
             ),
             "dead_check_ratio": round(total_dead_checks / max(1, total_history_rows), 4),
             "check_interval_hours": {
@@ -480,17 +538,35 @@ def _build_health_report(
                 "p50": _round_if_present(status_change_interval_p50, 4),
                 "p90": _round_if_present(status_change_interval_p90, 4),
             },
+            "dead_recovery_duration_hours": {
+                "samples": len(dead_recovery_hours),
+                "p50": _round_if_present(dead_recovery_p50, 4),
+                "p90": _round_if_present(dead_recovery_p90, 4),
+                "max": _round_if_present(max(dead_recovery_hours) if dead_recovery_hours else None, 4),
+            },
+            "alive_episode_duration_hours": {
+                "samples": len(alive_episode_hours),
+                "p25": _round_if_present(alive_episode_p25, 4),
+                "p50": _round_if_present(alive_episode_p50, 4),
+            },
+            "current_dead_episodes": len(current_dead_episode_hours),
+            "check_concentration": {
+                "busiest_minute_checks": busiest_minute,
+                "busiest_minute_ratio": round(concentration_ratio, 4),
+            },
+            "transition_counts": dict(transition_counts),
         },
         "reasons": {
             "media_due": dict(media_reason_counts),
             "throughput_due": dict(throughput_reason_counts),
         },
         "ttl_tuning_guidance": {
-            "suggested_health_ttl_hours": _round_if_present(check_interval_p90, 2),
-            "suggested_dead_ttl_hours": _round_if_present(status_change_interval_p50, 2),
+            "suggested_health_ttl_hours": _round_if_present(alive_episode_p25, 2),
+            "suggested_dead_ttl_hours": _round_if_present(dead_recovery_p50, 2),
         },
         "status_patterns": {
             "unstable_streams": unstable_top,
+            "problematic_streams": problematic_streams,
             "hourly_dead_ratio": hourly,
         },
         "stream_stats": {
@@ -500,9 +576,7 @@ def _build_health_report(
         "top_metrics": {
             "max_status_changes": max(status_changes.values()) if status_changes else 0,
             "max_dead_checks": max(dead_counts.values()) if dead_counts else 0,
-            "dead_dominant_streams": [
-                row["stream_id"] for row in unstable_top if row["dead_checks"] and row["dead_checks"] >= row["history_len"] / 2
-            ],
+            "dead_dominant_streams": [row["stream_id"] for row in problematic_streams],
         },
     }
 
@@ -629,7 +703,13 @@ def _item_from_stream(stream) -> dict[str, Any]:
     }
 
 
-def _merge_dispatcharr_metadata(item: Mapping[str, Any], previous: Mapping[str, Any]) -> tuple[dict[str, Any], bool, bool]:
+def _merge_dispatcharr_metadata(
+    item: Mapping[str, Any],
+    previous: Mapping[str, Any],
+    *,
+    media_bitrate_relative_tolerance: float = MEDIA_BITRATE_RELATIVE_TOLERANCE,
+    media_bitrate_absolute_tolerance_kbps: float = MEDIA_BITRATE_ABSOLUTE_TOLERANCE_KBPS,
+) -> tuple[dict[str, Any], bool, bool]:
     merged = dict(previous)
     current_hash = analyzer._stream_url_hash(str(item.get("url") or ""))
     if str(merged.get("url_hash") or "") != current_hash:
@@ -643,7 +723,7 @@ def _merge_dispatcharr_metadata(item: Mapping[str, Any], previous: Mapping[str, 
     current_metadata_at = _parse_datetime(merged.get("metadata_updated_at") or merged.get("media_checked_at") or merged.get("tested_at"))
     if current_metadata_at is not None and dispatcharr_updated_at <= current_metadata_at:
         return merged, False, False
-    old_signature = _stats_signature(merged.get("stats"))
+    previous_stats = dict(merged.get("stats") or {})
     stats = dict(merged.get("stats") or {})
     stats.update(dict(dispatcharr_stats))
     merged["stats"] = stats
@@ -655,10 +735,22 @@ def _merge_dispatcharr_metadata(item: Mapping[str, Any], previous: Mapping[str, 
     merged["m3u_account_id"] = item.get("account_id")
     merged["m3u_account_name"] = item.get("account_name")
     merged["url_hash"] = current_hash
-    return merged, True, _stats_signature(stats) != old_signature
+    changed = _media_stats_changed_for_throughput(
+        previous_stats,
+        stats,
+        media_bitrate_relative_tolerance=media_bitrate_relative_tolerance,
+        media_bitrate_absolute_tolerance_kbps=media_bitrate_absolute_tolerance_kbps,
+    )
+    return merged, True, changed
 
 
-def _sync_dispatcharr_metadata(items, cache) -> tuple[int, set[int]]:
+def _sync_dispatcharr_metadata(
+    items,
+    cache,
+    *,
+    media_bitrate_relative_tolerance: float = MEDIA_BITRATE_RELATIVE_TOLERANCE,
+    media_bitrate_absolute_tolerance_kbps: float = MEDIA_BITRATE_ABSOLUTE_TOLERANCE_KBPS,
+) -> tuple[int, set[int]]:
     refreshed = 0
     changed_ids: set[int] = set()
     for item in items:
@@ -666,7 +758,12 @@ def _sync_dispatcharr_metadata(items, cache) -> tuple[int, set[int]]:
         previous = cache.get(key)
         if not isinstance(previous, Mapping):
             continue
-        merged, did_refresh, signature_changed = _merge_dispatcharr_metadata(item, previous)
+        merged, did_refresh, signature_changed = _merge_dispatcharr_metadata(
+            item,
+            previous,
+            media_bitrate_relative_tolerance=media_bitrate_relative_tolerance,
+            media_bitrate_absolute_tolerance_kbps=media_bitrate_absolute_tolerance_kbps,
+        )
         if not did_refresh:
             continue
         cache[key] = merged
@@ -721,6 +818,22 @@ def _sync_runtime_playback_health(
         previous_observation = _parse_datetime(entry.get("playback_health_checked_at"))
         if previous_observation is not None and previous_observation >= observed_at:
             continue
+        latest_health_observation = max(
+            (
+                parsed for parsed in (
+                    _parse_datetime(entry.get("health_checked_at")),
+                    _parse_datetime(entry.get("media_checked_at")),
+                    _parse_datetime(entry.get("tested_at")),
+                )
+                if parsed is not None
+            ),
+            default=None,
+        )
+        if str(entry.get("status") or "").lower() == "dead":
+            continue
+        if latest_health_observation is not None and latest_health_observation >= observed_at:
+            continue
+        previous_status = str(entry.get("status") or "unknown").lower()
         entry.update({
             "status": "alive",
             "error": "",
@@ -742,6 +855,14 @@ def _sync_runtime_playback_health(
             entry["metadata_updated_at"] = dispatcharr_updated_at.isoformat()
             entry["metadata_source"] = "dispatcharr_stream_stats"
             entry["dispatcharr_stats_updated_at"] = dispatcharr_updated_at.isoformat()
+        _append_health_history(
+            entry,
+            reason="runtime_playback",
+            previous_status=previous_status,
+            new_status="alive",
+            tested_at=observed_at.isoformat(),
+            result={"health_source": "runtime_playback"},
+        )
         cache[key] = entry
         refreshed += 1
     return refreshed
@@ -850,6 +971,8 @@ def _analysis_reason(
         ttl_jitter_percent=ttl_jitter_percent,
         now=now,
     )
+    if reason == "status_dead_ttl":
+        return None
     if reason:
         return f"health_{reason}"
     reason = metadata_check_reason(
@@ -864,9 +987,25 @@ def _analysis_reason(
     return None
 
 
-def analyze_assigned_streams(settings: Mapping[str, Any], *, logger, cache_path: str = analyzer.ANALYSIS_CACHE_PATH) -> dict[str, Any]:
+def analyze_assigned_streams(
+    settings: Mapping[str, Any],
+    *,
+    logger,
+    cache_path: str = analyzer.ANALYSIS_CACHE_PATH,
+    health_report_path: str | None = None,
+) -> dict[str, Any]:
     from apps.channels.models import ChannelStream
     from .sorter import resolve_channel_scope
+
+    if health_report_path is None:
+        health_report_path = (
+            ANALYSIS_HEALTH_REPORT_PATH
+            if cache_path == analyzer.ANALYSIS_CACHE_PATH
+            else os.path.join(
+                os.path.dirname(cache_path) or ".",
+                "dispatcharr_stream_sort_health_report.json",
+            )
+        )
 
     channel_ids, filter_summary = resolve_channel_scope(settings)
     workers = max(1, min(16, analyzer._as_int(settings.get("analysis_workers"), 2)))
@@ -940,7 +1079,12 @@ def analyze_assigned_streams(settings: Mapping[str, Any], *, logger, cache_path:
         analyzer.save_analysis_cache(cache, cache_path)
         logger.info("[Analyze] Migrated %d matching legacy throughput measurements into the unified cache", migrated)
 
-    dispatcharr_metadata_refreshed, dispatcharr_metadata_changed_ids = _sync_dispatcharr_metadata(items, cache)
+    dispatcharr_metadata_refreshed, dispatcharr_metadata_changed_ids = _sync_dispatcharr_metadata(
+        items,
+        cache,
+        media_bitrate_relative_tolerance=media_bitrate_relative_tolerance,
+        media_bitrate_absolute_tolerance_kbps=media_bitrate_absolute_tolerance_kbps,
+    )
     if dispatcharr_metadata_refreshed:
         analyzer.save_analysis_cache(cache, cache_path)
         logger.info("[Analyze] Refreshed basic metadata for %d streams from newer Dispatcharr stream_stats", dispatcharr_metadata_refreshed)
@@ -990,6 +1134,17 @@ def analyze_assigned_streams(settings: Mapping[str, Any], *, logger, cache_path:
         metadata_ttl_hours, health_ttl_hours, dead_ttl_hours, content_ttl_hours, throughput_ttl_hours, analysis_ttl_jitter_percent, workers,
     )
     if not items:
+        _save_json(
+            health_report_path,
+            _build_health_report(
+                [],
+                cache,
+                now=datetime.now(timezone.utc),
+                media_reason_counts=media_reason_counts,
+                throughput_reason_counts={},
+                channels_selected=len({row.channel_id for row in rows}),
+            ),
+        )
         return {
             "streams_analyzed": 0,
             "streams_selected": 0,
@@ -1004,7 +1159,7 @@ def analyze_assigned_streams(settings: Mapping[str, Any], *, logger, cache_path:
             "status_counts": {},
             "throughput_status_counts": {},
             "cache_path": cache_path,
-            "analysis_health_report_path": ANALYSIS_HEALTH_REPORT_PATH,
+            "analysis_health_report_path": health_report_path,
         }
 
     capacity_manager = build_capacity_manager(items, logger=logger)
@@ -1236,7 +1391,6 @@ def analyze_assigned_streams(settings: Mapping[str, Any], *, logger, cache_path:
                 nominal = None
             entry = cache.get(str(item["id"])) or {}
             cache[str(item["id"])] = _merge_throughput_result(item, entry, result, ttl_hours=throughput_ttl_hours)
-            analyzer.save_analysis_cache(cache, cache_path)
             throughput_checked_ids.add(int(item["id"]))
             elapsed = max(time.monotonic() - throughput_started, 0.001)
             eta = elapsed / completed * (len(throughput_due) - completed) if completed < len(throughput_due) else 0.0
@@ -1252,6 +1406,9 @@ def analyze_assigned_streams(settings: Mapping[str, Any], *, logger, cache_path:
                 _overall_throughput_text(counts), max(0, alive_count - len(throughput_due)),
                 len(throughput_due) - completed, analyzer._format_eta(eta),
             )
+
+    if throughput_checked_ids:
+        analyzer.save_analysis_cache(cache, cache_path)
 
     media_checked_ids = set(media_results)
     capacity_deferred_ids = media_capacity_deferred_ids | throughput_capacity_deferred_ids
@@ -1276,7 +1433,8 @@ def analyze_assigned_streams(settings: Mapping[str, Any], *, logger, cache_path:
         throughput_reason_counts=throughput_reason_counts,
         channels_selected=len({row.channel_id for row in rows}),
     )
-    _save_json(ANALYSIS_HEALTH_REPORT_PATH, report)
+    report["filters"] = filter_summary
+    _save_json(health_report_path, report)
     return {
         "streams_analyzed": total,
         "streams_selected": total,
@@ -1291,7 +1449,7 @@ def analyze_assigned_streams(settings: Mapping[str, Any], *, logger, cache_path:
         "status_counts": {key: value for key, value in health_counts.items() if value > 0},
         "throughput_status_counts": {key: value for key, value in throughput_counts.items() if value > 0},
         "cache_path": cache_path,
-        "analysis_health_report_path": ANALYSIS_HEALTH_REPORT_PATH,
+        "analysis_health_report_path": health_report_path,
     }
 
 

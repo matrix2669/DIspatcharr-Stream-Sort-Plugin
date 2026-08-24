@@ -7,7 +7,7 @@ import re
 import tempfile
 import threading
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Mapping
 
 try:
@@ -16,7 +16,7 @@ except ImportError:  # pragma: no cover - Dispatcharr runs on Linux
     fcntl = None
 
 from .analyzer import ANALYSIS_CACHE_PATH, probe_assigned_streams
-from .incremental import ANALYSIS_HEALTH_REPORT_PATH, analyze_assigned_streams
+from .incremental import ANALYSIS_HEALTH_REPORT_PATH, _parse_datetime, analyze_assigned_streams
 from .reliability import RELIABILITY_PATH, record_runtime_event
 from .sorter import REPORT_PATH, resolve_channel_scope, sort_channels
 from .throughput import DEFAULT_CACHE_PATH
@@ -26,10 +26,13 @@ PROBE_LOCK_PATH = "/data/dispatcharr_stream_sort_probe.lock"
 STATUS_PATH = "/data/dispatcharr_stream_sort_status.json"
 TTL_RECOMMENDATION_PATH = "/data/dispatcharr_stream_sort_ttl_recommendations.json"
 SCHEDULE_STATE_PATH = "/data/dispatcharr_stream_sort_schedule_state.json"
+SCHEDULE_STATE_LOCK_PATH = "/data/dispatcharr_stream_sort_schedule_state.lock"
+SCHEDULE_CLAIM_PREFIX = "dispatcharr-stream-sort-schedule"
 _FALLBACK_JOB_LOCK = threading.Lock()
+_FALLBACK_SCHEDULE_STATE_LOCK = threading.Lock()
 M3U_SOURCE_SCORE_PREFIX = "m3u_source_score_"
 LOG_PREFIX = "[Stream Sort]"
-SCHEDULER_POLL_SECONDS = 60
+SCHEDULER_POLL_SECONDS = 10
 SCHEDULER_THREAD_NAME = "dispatcharr-stream-sort-scheduler"
 
 _SCHEDULER_THREAD = None
@@ -160,7 +163,7 @@ def _parse_cron_expression(expression: str) -> tuple[set[int], set[int], set[int
     hours = _parse_cron_field(hour_part, minimum=0, maximum=23)
     days_of_month = _parse_cron_field(dom_part, minimum=1, maximum=31)
     months = _parse_cron_field(month_part, minimum=1, maximum=12)
-    days_of_week = _parse_cron_field(dow_part, minimum=0, maximum=6)
+    days_of_week = _parse_cron_field(dow_part, minimum=0, maximum=7)
     normalized_dow = set()
     for value in days_of_week:
         normalized_dow.add(0 if value == 7 else value)
@@ -171,14 +174,23 @@ def _cron_matches(expression: str, when: datetime) -> bool:
     if when.tzinfo is None:
         when = when.replace(tzinfo=timezone.utc)
     when = when.astimezone(timezone.utc)
+    parts = str(expression or "").strip().split()
     minutes, hours, days_of_month, months, days_of_week = _parse_cron_expression(expression)
     day_of_week = when.isoweekday() % 7
+    dom_match = when.day in days_of_month
+    dow_match = day_of_week in days_of_week
+    dom_wildcard = parts[2] in {"*", "?"}
+    dow_wildcard = parts[4] in {"*", "?"}
+    day_matches = (
+        dom_match and dow_match
+        if dom_wildcard or dow_wildcard
+        else dom_match or dow_match
+    )
     return (
         when.minute in minutes
         and when.hour in hours
-        and when.day in days_of_month
         and when.month in months
-        and day_of_week in days_of_week
+        and day_matches
     )
 
 
@@ -195,12 +207,12 @@ def _load_schedule_state() -> dict:
     raw = _load_json(
         SCHEDULE_STATE_PATH,
         {
-            "version": 1,
+            "version": 2,
             "enabled": False,
             "cron": "",
             "apply_sort_after_analysis": True,
             "allow_parallel_checks": False,
-            "settings": {},
+            "generation": 0,
             "last_scheduled_minute": None,
             "last_run_at": None,
             "last_run_status": "idle",
@@ -209,12 +221,12 @@ def _load_schedule_state() -> dict:
         },
     )
     return {
-        "version": 1,
+        "version": 2,
         "enabled": _safe_bool(raw.get("enabled"), False),
         "cron": str(raw.get("cron") or "").strip(),
         "apply_sort_after_analysis": _safe_bool(raw.get("apply_sort_after_analysis"), True),
         "allow_parallel_checks": _safe_bool(raw.get("allow_parallel_checks"), False),
-        "settings": raw.get("settings") if isinstance(raw.get("settings"), dict) else {},
+        "generation": int(raw.get("generation") or 0),
         "last_scheduled_minute": str(raw.get("last_scheduled_minute") or "").strip() or None,
         "last_run_at": str(raw.get("last_run_at") or "").strip() or None,
         "last_run_status": str(raw.get("last_run_status") or "idle"),
@@ -225,12 +237,12 @@ def _load_schedule_state() -> dict:
 
 def _save_schedule_state(value: dict) -> None:
     payload = {
-        "version": 1,
+        "version": 2,
         "enabled": _safe_bool(value.get("enabled"), False),
         "cron": str(value.get("cron") or "").strip(),
         "apply_sort_after_analysis": _safe_bool(value.get("apply_sort_after_analysis"), True),
         "allow_parallel_checks": _safe_bool(value.get("allow_parallel_checks"), False),
-        "settings": value.get("settings") if isinstance(value.get("settings"), dict) else {},
+        "generation": int(value.get("generation") or 0),
         "last_scheduled_minute": value.get("last_scheduled_minute"),
         "last_run_at": value.get("last_run_at"),
         "last_run_status": str(value.get("last_run_status") or "idle"),
@@ -239,6 +251,56 @@ def _save_schedule_state(value: dict) -> None:
         "updated_at": _utc_now_iso(),
     }
     _save_json(SCHEDULE_STATE_PATH, payload)
+
+
+def _mutate_schedule_state(mutator):
+    os.makedirs(os.path.dirname(SCHEDULE_STATE_LOCK_PATH) or ".", exist_ok=True)
+    if fcntl is None:
+        with _FALLBACK_SCHEDULE_STATE_LOCK:
+            state = _load_schedule_state()
+            mutator(state)
+            _save_schedule_state(state)
+            return state
+    with open(SCHEDULE_STATE_LOCK_PATH, "a+", encoding="utf-8") as handle:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        try:
+            state = _load_schedule_state()
+            mutator(state)
+            _save_schedule_state(state)
+            return state
+        finally:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
+def _claim_schedule_minute(generation: int, current_minute: str) -> bool:
+    try:
+        from django.core.cache import cache
+
+        return bool(
+            cache.add(
+                f"{SCHEDULE_CLAIM_PREFIX}:{generation}:{current_minute}",
+                uuid.uuid4().hex,
+                timeout=180,
+            )
+        )
+    except Exception:
+        claim_path = f"{SCHEDULE_STATE_LOCK_PATH}.{generation}.{current_minute}"
+        try:
+            descriptor = os.open(claim_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        except FileExistsError:
+            return False
+        os.close(descriptor)
+        return True
+
+
+def _load_live_plugin_settings() -> tuple[bool, dict]:
+    from apps.plugins.models import PluginConfig
+
+    config = PluginConfig.objects.filter(key="stream_sorter").values("enabled", "settings").first()
+    if not config:
+        return False, {}
+    settings = config.get("settings") if isinstance(config.get("settings"), dict) else {}
+    return bool(config.get("enabled")), _settings_with_dynamic_source_scores(settings)
 
 
 def _configured_parallel_tests(settings: dict) -> int:
@@ -542,8 +604,9 @@ def _recommend_ttls(settings: dict, *, report: dict) -> dict:
     observations = report.get("observations") if isinstance(report, Mapping) else None
     if not isinstance(observations, Mapping):
         observations = {}
-    check_intervals = observations.get("check_interval_hours") if isinstance(observations.get("check_interval_hours"), Mapping) else {}
-    status_intervals = observations.get("status_change_interval_hours") if isinstance(observations.get("status_change_interval_hours"), Mapping) else {}
+    alive_episodes = observations.get("alive_episode_duration_hours") if isinstance(observations.get("alive_episode_duration_hours"), Mapping) else {}
+    dead_recoveries = observations.get("dead_recovery_duration_hours") if isinstance(observations.get("dead_recovery_duration_hours"), Mapping) else {}
+    concentration = observations.get("check_concentration") if isinstance(observations.get("check_concentration"), Mapping) else {}
     status_patterns = report.get("status_patterns") if isinstance(report.get("status_patterns"), Mapping) else {}
     hourly = status_patterns.get("hourly_dead_ratio") if isinstance(status_patterns.get("hourly_dead_ratio"), list) else []
     reasons = report.get("reasons") if isinstance(report.get("reasons"), Mapping) else {}
@@ -555,7 +618,11 @@ def _recommend_ttls(settings: dict, *, report: dict) -> dict:
     selected_streams = int(report.get("selected_streams") or 0)
     history_rows = int(observations.get("history_rows") or 0)
     dead_ratio = float(observations.get("dead_check_ratio") or 0.0)
-    status_change_ratio = float(observations.get("checks_per_status_change_ratio") or 0.0)
+    status_change_ratio = float(observations.get("status_changes_per_check_ratio") or 0.0)
+    history_span_hours = float(observations.get("history_span_hours") or 0.0)
+    recovery_samples = int(dead_recoveries.get("samples") or 0)
+    alive_episode_samples = int(alive_episodes.get("samples") or 0)
+    minute_concentration = float(concentration.get("busiest_minute_ratio") or 0.0)
 
     max_dead_ratio_by_hour = max((
         float(row.get("dead_ratio")) for row in hourly
@@ -563,26 +630,24 @@ def _recommend_ttls(settings: dict, *, report: dict) -> dict:
         and isinstance(row.get("dead_ratio"), (int, float))
     ), default=0.0)
 
-    health_base = check_intervals.get("p90")
+    health_base = alive_episodes.get("p25")
     if health_base is None:
-        health_base = check_intervals.get("p50")
+        health_base = alive_episodes.get("p50")
     suggested_health = _clamp_float(_safe_float(health_base, None), 0.5, 240.0)
-    if suggested_health is not None:
-        suggested_health *= 1.25
-        suggested_health = _clamp_float(suggested_health, 0.5, 240.0)
 
-    dead_base = status_intervals.get("p50")
+    dead_base = dead_recoveries.get("p50")
     if dead_base is None:
-        dead_base = status_intervals.get("p90")
+        dead_base = dead_recoveries.get("p90")
     suggested_dead = _clamp_float(_safe_float(dead_base, None), 0.25, 24.0)
-    if suggested_dead is not None:
-        suggested_dead *= 1.2
-        suggested_dead = _clamp_float(suggested_dead, 0.25, 24.0)
 
     if dead_ratio >= 0.30 and suggested_dead is not None:
         suggested_dead = _clamp_float(min(suggested_dead, dead_current * 0.6), 0.25, 24.0)
 
-    if selected_streams >= 75 or status_change_ratio >= 0.20:
+    if minute_concentration >= 0.20:
+        suggested_jitter = 25.0
+    elif minute_concentration >= 0.10:
+        suggested_jitter = 20.0
+    elif selected_streams >= 75 or status_change_ratio >= 0.20:
         suggested_jitter = 15.0
     elif max_dead_ratio_by_hour >= 0.40:
         suggested_jitter = 20.0
@@ -591,9 +656,6 @@ def _recommend_ttls(settings: dict, *, report: dict) -> dict:
 
     if max_dead_ratio_by_hour >= 0.25:
         suggested_jitter = max(suggested_jitter, 15.0)
-    if status_change_ratio < 0.10 and history_rows >= 50:
-        suggested_jitter = min(25.0, max(suggested_jitter, 18.0))
-
     notes = []
     if history_rows < 20:
         notes.append("History is sparse; treat recommendations as provisional until at least 20 health rows are collected.")
@@ -603,11 +665,17 @@ def _recommend_ttls(settings: dict, *, report: dict) -> dict:
         notes.append("Higher dead-check ratio suggests keeping dead TTL shorter for faster recovery on unstable URLs.")
     if status_change_ratio >= 0.20:
         notes.append("Frequent status transitions suggest moderate jitter to avoid synchronized rechecks.")
+    if recovery_samples < 5:
+        notes.append("Fewer than five dead-to-alive recoveries were observed; the dead TTL recommendation is provisional.")
+    if alive_episode_samples < 5:
+        notes.append("Fewer than five completed alive episodes were observed; the reachability TTL recommendation is provisional.")
+    if history_span_hours < 72:
+        notes.append("Collect at least 72 hours of history before treating TTL recommendations as stable.")
 
     confidence = "low"
-    if history_rows >= 120 and selected_streams >= 50:
+    if history_span_hours >= 336 and recovery_samples >= 20 and alive_episode_samples >= 20:
         confidence = "high"
-    elif history_rows >= 40:
+    elif history_span_hours >= 72 and recovery_samples >= 5 and alive_episode_samples >= 5:
         confidence = "medium"
 
     recommendations = {
@@ -629,13 +697,14 @@ def _recommend_ttls(settings: dict, *, report: dict) -> dict:
         },
         "recommended_ttls": recommendations,
         "observation_summary": {
-            "history_span_hours": observations.get("history_span_hours"),
+            "history_span_hours": history_span_hours,
             "status_changes": observations.get("status_changes"),
             "dead_checks": observations.get("dead_checks"),
-            "checks_per_status_change_ratio": status_change_ratio,
+            "status_changes_per_check_ratio": status_change_ratio,
             "dead_check_ratio": dead_ratio,
-            "status_change_interval_hours": status_intervals,
-            "check_interval_hours": check_intervals,
+            "dead_recovery_duration_hours": dead_recoveries,
+            "alive_episode_duration_hours": alive_episodes,
+            "check_concentration": concentration,
             "media_reasons": reasons.get("media_due") or {},
             "max_dead_ratio_by_hour": round(max_dead_ratio_by_hour, 4),
         },
@@ -653,6 +722,24 @@ def _run_ttl_recommendation_action(settings: dict) -> dict:
                 "No analysis health report found. Run Analyze Streams first so"
                 f" it writes {ANALYSIS_HEALTH_REPORT_PATH}."
             ),
+        }
+
+    generated_at = _parse_datetime(report.get("generated_at"))
+    if generated_at is None:
+        return {
+            "status": "error",
+            "message": "The health report has no valid generation timestamp. Run Analyze Streams again.",
+        }
+    age_hours = (datetime.now(timezone.utc) - generated_at).total_seconds() / 3600.0
+    if age_hours > 168:
+        return {
+            "status": "error",
+            "message": "The health report is older than seven days. Run Analyze Streams again before recommending TTLs.",
+        }
+    if int(report.get("selected_streams") or 0) <= 0:
+        return {
+            "status": "error",
+            "message": "The latest health report contains no selected streams. Run Analyze Streams for the intended scope.",
         }
 
     result = _recommend_ttls(settings, report=report)
@@ -675,6 +762,35 @@ def _run_ttl_recommendation_action(settings: dict) -> dict:
     }
 
 
+def _run_health_report_action() -> dict:
+    report = _load_json(ANALYSIS_HEALTH_REPORT_PATH, {})
+    if not report:
+        return {
+            "status": "error",
+            "message": "No health report found. Run Analyze Streams first.",
+        }
+    generated_at = _parse_datetime(report.get("generated_at"))
+    age_text = "unknown"
+    if generated_at is not None:
+        age_text = f"{max(0.0, (datetime.now(timezone.utc) - generated_at).total_seconds() / 3600.0):.1f}h"
+    observations = report.get("observations") if isinstance(report.get("observations"), Mapping) else {}
+    patterns = report.get("status_patterns") if isinstance(report.get("status_patterns"), Mapping) else {}
+    problematic = patterns.get("problematic_streams") if isinstance(patterns.get("problematic_streams"), list) else []
+    transitions = observations.get("transition_counts") if isinstance(observations.get("transition_counts"), Mapping) else {}
+    message = (
+        f"Health report age={age_text}; streams={int(report.get('selected_streams') or 0)}; "
+        f"problematic (>75% dead, minimum 4 checks)={len(problematic)}; "
+        f"alive-to-dead={int(transitions.get('alive_to_dead') or 0)}; "
+        f"dead-to-alive={int(transitions.get('dead_to_alive') or 0)}."
+    )
+    return {
+        "status": "ok",
+        "message": message,
+        "report_path": ANALYSIS_HEALTH_REPORT_PATH,
+        "result": report,
+    }
+
+
 def _scheduled_settings(settings: dict, *, allow_parallel_checks: bool) -> dict:
     scheduled = dict(settings or {})
     scheduled.pop("stream_sort_schedule_cron", None)
@@ -685,55 +801,84 @@ def _scheduled_settings(settings: dict, *, allow_parallel_checks: bool) -> dict:
     return scheduled
 
 
-def _apply_schedule_action(settings: dict) -> dict:
-    state = _load_schedule_state()
-    cron_expr = str(settings.get("stream_sort_schedule_cron") or "").strip()
-    state["cron"] = cron_expr
-    state["apply_sort_after_analysis"] = _safe_bool(
-        settings.get("stream_sort_apply_sort_after_scheduled_scan"), True
-    )
-    state["allow_parallel_checks"] = _safe_bool(
-        settings.get("stream_sort_allow_parallel_checks_on_scheduled_scan"), False
-    )
-    state["settings"] = dict(settings or {})
-    state["settings"].pop("stream_sort_schedule_cron", None)
-    state["settings"].pop("stream_sort_apply_sort_after_scheduled_scan", None)
-    state["settings"].pop("stream_sort_allow_parallel_checks_on_scheduled_scan", None)
-    state["last_scheduled_minute"] = None
+def _set_schedule_job_running(generation: int, job_id: str) -> bool:
+    accepted = {"value": False}
 
+    def mutate(state):
+        if not state.get("enabled") or int(state.get("generation") or 0) != generation:
+            return
+        state["last_scheduled_minute"] = datetime.now(timezone.utc).strftime("%Y%m%d%H%M")
+        state["last_run_at"] = _utc_now_iso()
+        state["last_run_status"] = "running"
+        state["last_run_message"] = "Scheduled analysis is running."
+        state["last_job_id"] = job_id
+        accepted["value"] = True
+
+    _mutate_schedule_state(mutate)
+    return accepted["value"]
+
+
+def _finish_schedule_job(generation: int | None, job_id: str, *, status: str, message: str) -> None:
+    if generation is None:
+        return
+
+    def mutate(state):
+        if int(state.get("generation") or 0) != generation:
+            return
+        if str(state.get("last_job_id") or "") != job_id:
+            return
+        state["last_run_status"] = status
+        state["last_run_message"] = message
+
+    _mutate_schedule_state(mutate)
+
+
+def _apply_schedule_action(settings: dict) -> dict:
+    cron_expr = str(settings.get("stream_sort_schedule_cron") or "").strip()
     if cron_expr:
         _parse_cron_expression(cron_expr)
-        state["enabled"] = True
-        status = "ok"
-        state["last_run_status"] = "enabled"
-        state["last_run_message"] = f"Stream Sort schedule enabled with cron '{cron_expr}'."
         message = (
-            f"Saved stream schedule: cron='{cron_expr}', apply_sort="
-            f"{state['apply_sort_after_analysis']}, parallel_checks="
-            f"{state['allow_parallel_checks']}. First run will occur on the next matching minute."
+            f"Saved stream schedule: cron='{cron_expr}'. "
+            "Scheduled runs always load the current UI settings."
         )
     else:
-        state["enabled"] = False
-        status = "ok"
-        state["last_run_status"] = "disabled"
-        state["last_run_message"] = "Stream Sort schedule disabled (empty cron)."
         message = "Stream Sort schedule cleared; automatic scheduled analysis is disabled."
 
-    _save_schedule_state(state)
+    def mutate(state):
+        state["generation"] = int(state.get("generation") or 0) + 1
+        state["cron"] = cron_expr
+        state["apply_sort_after_analysis"] = _safe_bool(
+            settings.get("stream_sort_apply_sort_after_scheduled_scan"), True
+        )
+        state["allow_parallel_checks"] = _safe_bool(
+            settings.get("stream_sort_allow_parallel_checks_on_scheduled_scan"), False
+        )
+        state["enabled"] = bool(cron_expr)
+        state["last_scheduled_minute"] = None
+        state["last_run_status"] = "enabled" if cron_expr else "disabled"
+        state["last_run_message"] = (
+            f"Stream Sort schedule enabled with cron '{cron_expr}'."
+            if cron_expr
+            else "Stream Sort schedule disabled (empty cron)."
+        )
+
+    state = _mutate_schedule_state(mutate)
     return {
-        "status": status,
+        "status": "ok",
         "message": message,
         "schedule_state": state,
     }
 
 
 def _disable_schedule_action() -> dict:
-    state = _load_schedule_state()
-    state["enabled"] = False
-    state["last_run_status"] = "disabled"
-    state["last_run_message"] = "Stream Sort schedule disabled by user."
-    state["last_scheduled_minute"] = None
-    _save_schedule_state(state)
+    def mutate(state):
+        state["generation"] = int(state.get("generation") or 0) + 1
+        state["enabled"] = False
+        state["last_run_status"] = "disabled"
+        state["last_run_message"] = "Stream Sort schedule disabled by user."
+        state["last_scheduled_minute"] = None
+
+    state = _mutate_schedule_state(mutate)
     return {
         "status": "ok",
         "message": "Stream Sort scheduled analysis disabled.",
@@ -757,20 +902,20 @@ def _schedule_status_action() -> dict:
     }
 
 
-def _run_scheduled_scan(state: dict, now: datetime) -> dict:
-    state_settings = state.get("settings") if isinstance(state.get("settings"), dict) else {}
+def _run_scheduled_scan(state: dict, now: datetime, settings: dict) -> dict:
     scheduled_settings = _scheduled_settings(
-        state_settings,
+        settings,
         allow_parallel_checks=_safe_bool(state.get("allow_parallel_checks"), False),
     )
     return _start_background_job(
         scheduled_settings,
         kind="analyze",
         sort_after=bool(state.get("apply_sort_after_analysis", True)),
+        schedule_generation=int(state.get("generation") or 0),
     )
 
 
-def _check_schedule_tick(now: datetime | None = None) -> dict:
+def _check_schedule_tick(now: datetime | None = None, *, settings: dict | None = None) -> dict:
     if now is None:
         now = datetime.now(timezone.utc)
     now = now.replace(second=0, microsecond=0, tzinfo=timezone.utc) if now.tzinfo is None else now.replace(
@@ -815,22 +960,36 @@ def _check_schedule_tick(now: datetime | None = None) -> dict:
             "message": "not due yet",
             "state": state,
         }
-    if current_minute == str(state.get("last_scheduled_minute") or "").strip():
+    generation = int(state.get("generation") or 0)
+    if not _claim_schedule_minute(generation, current_minute):
         return {
             "status": "skipped",
-            "message": "already checked this minute",
+            "message": "another worker already claimed this minute",
             "state": state,
         }
+    latest = _load_schedule_state()
+    if (
+        not latest.get("enabled")
+        or int(latest.get("generation") or 0) != generation
+        or str(latest.get("cron") or "") != cron_expr
+    ):
+        return {
+            "status": "skipped",
+            "message": "schedule changed after this minute was claimed",
+            "state": latest,
+        }
+    result = _run_scheduled_scan(latest, now=now, settings=dict(settings or {}))
+    if not result.get("job_id"):
+        def record_skip(current):
+            if int(current.get("generation") or 0) != generation:
+                return
+            current["last_run_at"] = _utc_now_iso()
+            current["last_run_status"] = "skipped_busy" if "already running" in str(result.get("message") or "") else "error"
+            current["last_run_message"] = result.get("message") or "scheduled run skipped"
 
-    state["last_scheduled_minute"] = current_minute
-    state["last_run_at"] = _utc_now_iso()
-    result = _run_scheduled_scan(state, now=now)
-    job_id = result.get("job_id")
-    if job_id:
-        state["last_job_id"] = job_id
-    state["last_run_status"] = result.get("status") or "error"
-    state["last_run_message"] = result.get("message") or ""
-    _save_schedule_state(state)
+        state = _mutate_schedule_state(record_skip)
+    else:
+        state = _load_schedule_state()
     return {
         "status": result.get("status") or "error",
         "message": result.get("message") or "scheduled run skipped",
@@ -863,19 +1022,28 @@ class _StreamSortScheduler:
             thread.join(timeout=1)
 
     def _loop(self):
+        from django.db import close_old_connections
+
         while not self.stop_event.is_set():
+            close_old_connections()
             try:
-                _check_schedule_tick()
+                enabled, settings = _load_live_plugin_settings()
+                if enabled:
+                    _check_schedule_tick(settings=settings)
             except Exception as exc:
                 LOGGER.exception("Stream Sort scheduler failed: %s", exc)
                 try:
-                    state = _load_schedule_state()
-                    state["last_run_status"] = "error"
-                    state["last_run_message"] = f"{type(exc).__name__}: {exc}"
-                    _save_schedule_state(state)
+                    def record_error(state):
+                        state["last_run_status"] = "error"
+                        state["last_run_message"] = f"{type(exc).__name__}: {exc}"
+
+                    _mutate_schedule_state(record_error)
                 except Exception:
                     pass
+            finally:
+                close_old_connections()
             self.stop_event.wait(SCHEDULER_POLL_SECONDS)
+        close_old_connections()
 
 
 def _start_scheduler() -> None:
@@ -891,7 +1059,14 @@ def _stop_scheduler() -> None:
     _SCHEDULER_THREAD.stop()
 
 
-def _background_analyze_job(settings: dict, lock_handle, *, sort_after: bool, job_id: str) -> None:
+def _background_analyze_job(
+    settings: dict,
+    lock_handle,
+    *,
+    sort_after: bool,
+    job_id: str,
+    schedule_generation: int | None = None,
+) -> None:
     from django.db import close_old_connections
 
     close_old_connections()
@@ -938,6 +1113,12 @@ def _background_analyze_job(settings: dict, lock_handle, *, sort_after: bool, jo
             finished_at=_utc_now_iso(),
             result=result,
         )
+        _finish_schedule_job(
+            schedule_generation,
+            job_id,
+            status="completed",
+            message=f"Scheduled analysis completed for {result['streams_analyzed']} streams.",
+        )
     except Exception as exc:
         LOGGER.exception("[Analyze] background job failed")
         _update_status(
@@ -948,12 +1129,25 @@ def _background_analyze_job(settings: dict, lock_handle, *, sort_after: bool, jo
             error=f"{type(exc).__name__}: {exc}",
         )
         _notify("❌ Stream Sort: stream analysis failed. Check Dispatcharr logs.")
+        _finish_schedule_job(
+            schedule_generation,
+            job_id,
+            status="failed",
+            message=f"{type(exc).__name__}: {exc}",
+        )
     finally:
         close_old_connections()
         _release_job_lock(lock_handle)
 
 
-def _background_probe_job(settings: dict, lock_handle, *, sort_after: bool, job_id: str) -> None:
+def _background_probe_job(
+    settings: dict,
+    lock_handle,
+    *,
+    sort_after: bool,
+    job_id: str,
+    schedule_generation: int | None = None,
+) -> None:
     from django.db import close_old_connections
 
     close_old_connections()
@@ -1007,7 +1201,13 @@ def _background_probe_job(settings: dict, lock_handle, *, sort_after: bool, job_
         _release_job_lock(lock_handle)
 
 
-def _start_background_job(settings: dict, *, kind: str, sort_after: bool) -> dict:
+def _start_background_job(
+    settings: dict,
+    *,
+    kind: str,
+    sort_after: bool,
+    schedule_generation: int | None = None,
+) -> dict:
     _channel_ids, scope = resolve_channel_scope(settings)
     lock_handle = _acquire_job_lock()
     if lock_handle is None:
@@ -1032,7 +1232,11 @@ def _start_background_job(settings: dict, *, kind: str, sort_after: bool) -> dic
     worker = threading.Thread(
         target=target,
         args=(dict(settings), lock_handle),
-        kwargs={"sort_after": sort_after, "job_id": job_id},
+        kwargs={
+            "sort_after": sort_after,
+            "job_id": job_id,
+            "schedule_generation": schedule_generation,
+        },
         name=thread_name,
         daemon=True,
     )
@@ -1050,6 +1254,19 @@ def _start_background_job(settings: dict, *, kind: str, sort_after: bool) -> dic
                 "filters": scope,
             }
         )
+        if schedule_generation is not None and not _set_schedule_job_running(schedule_generation, job_id):
+            _update_status(
+                job_id,
+                status="cancelled",
+                phase="cancelled",
+                finished_at=_utc_now_iso(),
+                error="Schedule was disabled or replaced before launch.",
+            )
+            _release_job_lock(lock_handle)
+            return {
+                "status": "skipped",
+                "message": "Schedule was disabled or replaced before launch.",
+            }
         worker.start()
     except Exception as exc:
         try:
@@ -1169,6 +1386,9 @@ class Plugin:
 
             if action == "recommend_ttls":
                 return _run_ttl_recommendation_action(settings)
+
+            if action == "health_report":
+                return _run_health_report_action()
 
             if action == "dry_run":
                 result = sort_channels(settings, apply=False, logger=logger)

@@ -17,6 +17,37 @@ Historical versions below were published through the legacy `dev-test` workflow 
 
 ### Removed
 
+## 0.3.6-beta.4 - 2026-08-24
+
+### Added
+
+- Add a Health Report action with problematic-stream, directional-transition, recovery-duration, and check-concentration results.
+- Add atomic cross-worker schedule claims, final scheduled-job status, and schedule generation guards.
+- Add 90-day time-based health history with bounded safety retention.
+
+### Changed
+
+- Load current saved UI settings for every scheduled run instead of retaining a stale snapshot.
+- Use standard cron Sunday and day-of-month/day-of-week semantics.
+- Base provisional TTL guidance on completed alive episodes and dead-to-alive recoveries rather than current check cadence.
+- Treat Dispatcharr `is_stale` as provider-owned lifecycle state and keep analyzer health report-only until Dispatcharr provides a supported playback exclusion contract.
+
+### Fixed
+
+- Actually defer confirmed-dead streams until Dead stream TTL expiry without applying jitter.
+- Prevent runtime playback evidence from clearing a newer confirmed-dead result.
+- Apply configured bitrate change thresholds to newer Dispatcharr metadata.
+- Treat missing bitrate as unknown instead of a measurable change.
+- Prevent duplicate scheduled launches and stale schedule-state overwrites across uWSGI workers.
+- Close database connections used by long-lived scheduler threads.
+- Write empty and custom-path health reports safely, and batch throughput cache persistence.
+- Correct status-change ratios, the greater-than-75-percent problematic-stream threshold, and report coverage beyond the unstable top 20.
+- Restore a green isolated test path by making health-report destinations injectable.
+
+### Removed
+
+- Remove writes to Dispatcharr's provider-refresh `Stream.is_stale` field.
+
 ## 0.3.6-beta.3 - 2026-08-24
 
 ### Added

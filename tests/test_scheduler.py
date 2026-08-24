@@ -16,8 +16,16 @@ def test_cron_match_evaluates_expression_with_utc_minute_boundary():
     assert not plugin._cron_matches("*/20 * * * *", now)
 
 
+def test_cron_accepts_sunday_seven_and_uses_standard_dom_dow_or_semantics():
+    sunday = datetime(2026, 8, 23, 12, 0, tzinfo=timezone.utc)
+    monday_matching_dom = datetime(2026, 8, 24, 12, 0, tzinfo=timezone.utc)
+    assert plugin._cron_matches("0 12 * * 7", sunday)
+    assert plugin._cron_matches("0 12 24 * 0", monday_matching_dom)
+
+
 def test_apply_schedule_action_stores_only_relevant_settings(tmp_path, monkeypatch):
     monkeypatch.setattr(plugin, "SCHEDULE_STATE_PATH", str(tmp_path / "schedule.json"))
+    monkeypatch.setattr(plugin, "SCHEDULE_STATE_LOCK_PATH", str(tmp_path / "schedule.lock"))
 
     result = plugin._apply_schedule_action(
         {
@@ -34,18 +42,19 @@ def test_apply_schedule_action_stores_only_relevant_settings(tmp_path, monkeypat
     assert state["apply_sort_after_analysis"] is False
     assert state["allow_parallel_checks"] is True
     assert state["cron"] == "*/30 * * * *"
-    assert state["settings"]["channel_group_filter"] == "Live"
-    assert "stream_sort_schedule_cron" not in state["settings"]
+    assert "settings" not in state
+    assert state["generation"] == 1
 
 
 def test_scheduled_scan_forces_single_worker_when_parallel_disabled(tmp_path, monkeypatch):
     captured = {}
     monkeypatch.setattr(plugin, "SCHEDULE_STATE_PATH", str(tmp_path / "schedule.json"))
 
-    def fake_start_background_job(settings, kind, sort_after):
+    def fake_start_background_job(settings, kind, sort_after, schedule_generation=None):
         captured["settings"] = settings
         captured["kind"] = kind
         captured["sort_after"] = sort_after
+        captured["schedule_generation"] = schedule_generation
         return {
             "status": "ok",
             "message": "ok",
@@ -59,25 +68,38 @@ def test_scheduled_scan_forces_single_worker_when_parallel_disabled(tmp_path, mo
         "cron": "* * * * *",
         "apply_sort_after_analysis": True,
         "allow_parallel_checks": False,
-        "settings": {"analysis_workers": 8},
+        "generation": 7,
     }
 
-    result = plugin._run_scheduled_scan(state, now=datetime(2026, 8, 24, tzinfo=timezone.utc))
+    result = plugin._run_scheduled_scan(
+        state,
+        now=datetime(2026, 8, 24, tzinfo=timezone.utc),
+        settings={"analysis_workers": 8, "channel_group_filter": "Current"},
+    )
     assert result["status"] == "ok"
     assert captured["kind"] == "analyze"
     assert captured["sort_after"] is True
     assert captured["settings"]["analysis_workers"] == 1
+    assert captured["settings"]["channel_group_filter"] == "Current"
+    assert captured["schedule_generation"] == 7
 
 
 def test_check_schedule_tick_only_runs_once_per_minute_when_due(tmp_path, monkeypatch):
     monkeypatch.setattr(plugin, "SCHEDULE_STATE_PATH", str(tmp_path / "schedule.json"))
+    monkeypatch.setattr(plugin, "SCHEDULE_STATE_LOCK_PATH", str(tmp_path / "schedule.lock"))
     ran = {"count": 0}
+    claims = {"count": 0}
 
-    def fake_run_scheduled_scan(state, now):
+    def fake_run_scheduled_scan(state, now, settings):
         ran["count"] += 1
         return {"status": "ok", "message": "triggered", "job_id": f"job-{ran['count']}"}
 
+    def fake_claim(_generation, _minute):
+        claims["count"] += 1
+        return claims["count"] == 1
+
     monkeypatch.setattr(plugin, "_run_scheduled_scan", fake_run_scheduled_scan)
+    monkeypatch.setattr(plugin, "_claim_schedule_minute", fake_claim)
 
     state = plugin._load_schedule_state()
     state.update({
@@ -85,15 +107,29 @@ def test_check_schedule_tick_only_runs_once_per_minute_when_due(tmp_path, monkey
         "cron": "* * * * *",
         "apply_sort_after_analysis": True,
         "allow_parallel_checks": True,
-        "settings": {},
+        "generation": 1,
         "last_scheduled_minute": None,
     })
     plugin._save_schedule_state(state)
 
     tick_time = datetime(2026, 8, 24, 12, 0, 15, tzinfo=timezone.utc)
-    first = plugin._check_schedule_tick(tick_time)
-    second = plugin._check_schedule_tick(tick_time)
+    first = plugin._check_schedule_tick(tick_time, settings={"analysis_workers": 3})
+    second = plugin._check_schedule_tick(tick_time, settings={"analysis_workers": 3})
 
     assert first["status"] == "ok"
     assert second["status"] == "skipped"
     assert ran["count"] == 1
+
+
+def test_schedule_completion_updates_only_matching_generation_and_job(tmp_path, monkeypatch):
+    monkeypatch.setattr(plugin, "SCHEDULE_STATE_PATH", str(tmp_path / "schedule.json"))
+    monkeypatch.setattr(plugin, "SCHEDULE_STATE_LOCK_PATH", str(tmp_path / "schedule.lock"))
+    state = plugin._load_schedule_state()
+    state.update({"enabled": True, "generation": 4, "last_job_id": "job-4"})
+    plugin._save_schedule_state(state)
+
+    plugin._finish_schedule_job(4, "job-4", status="completed", message="complete")
+    assert plugin._load_schedule_state()["last_run_status"] == "completed"
+
+    plugin._finish_schedule_job(3, "job-4", status="failed", message="stale")
+    assert plugin._load_schedule_state()["last_run_status"] == "completed"

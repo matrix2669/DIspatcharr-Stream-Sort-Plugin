@@ -72,6 +72,15 @@ Behavior affecting provider connections also requires controlled Dispatcharr int
 - If an obsolete analysis owns the probe lock, identify and stop only that worker, then verify any stale profile counters are released.
 - Treat cached branch, registry, deployment, and provider-capacity observations as stale until refreshed.
 
+## Scheduler and Health-State Contracts
+
+- Scheduled analysis state is `/data/dispatcharr_stream_sort_schedule_state.json`; configuration is versioned, every due minute is atomically claimed through Django cache, and every run loads current `PluginConfig.settings`.
+- Every long-lived scheduler cycle that can use the ORM must call `close_old_connections()` before and after work.
+- Health history and report output are `/data/dispatcharr_stream_sort_analysis.json` and `/data/dispatcharr_stream_sort_health_report.json`. History uses a 90-day window with a high safety cap.
+- TTL recommendations are read-only at `/data/dispatcharr_stream_sort_ttl_recommendations.json` and must reject missing, empty, or older-than-seven-day reports.
+- Do not write `Stream.is_stale` for analyzer health. Dispatcharr owns it as M3U refresh lifecycle state and does not use it to exclude playback candidates.
+- Only a completed analyzer scan may clear confirmed-dead state; runtime playback evidence cannot promote a confirmed-dead cache entry.
+
 ## Future Agent Checklist
 
 - [ ] Read this file, `DECISIONS.md`, and `BRANCHES.md`

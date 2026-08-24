@@ -452,11 +452,10 @@ def _persist_dispatcharr_result(stream_id: int, result: Mapping[str, Any], logge
             logger.warning('[Analyze] stream=%s disappeared before metadata update', stream_id)
             return False
         stream.stream_stats = dict(result.get('stats') or {}) if status == 'alive' else {}
-        if hasattr(stream, 'is_stale'):
-            stream.is_stale = status == 'dead'
-            fields = ['stream_stats', 'is_stale']
-        else:
-            fields = ['stream_stats']
+        # Dispatcharr owns is_stale as provider-refresh lifecycle state. It is
+        # not a playback exclusion flag, so analyzer health remains in the
+        # plugin cache/report until Dispatcharr exposes a supported health API.
+        fields = ['stream_stats']
         if hasattr(stream, 'stream_stats_updated_at'):
             stream.stream_stats_updated_at = django_timezone.now()
             fields.append('stream_stats_updated_at')

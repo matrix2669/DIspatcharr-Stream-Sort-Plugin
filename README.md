@@ -23,7 +23,7 @@ The analyzer tracks five independent freshness components:
 - **Content validation interval:** 7 days by default. Reused playback does not claim that black/frozen/silent checks ran; it only defers an initially missing content validation until this interval expires.
 - **Healthy throughput TTL:** 6 hours by default. Marginal, insufficient, and unknown throughput are rechecked on every Analyze run.
 
-Dead, skipped, or unknown health states are still revalidated unless overridden by settings.
+Confirmed-dead streams are deferred by the exact Dead stream TTL between Analyze runs. Skipped and unknown health states remain eligible for revalidation.
 
 Each analyze run writes a compact health trend report for all selected streams to:
 
@@ -33,14 +33,16 @@ and the **Recommend TTLs** action writes a companion recommendation file to:
 
 `/data/dispatcharr_stream_sort_ttl_recommendations.json`
 
-Use that file to find:
+Use the **Health Report** action, or inspect that file directly, to find:
 - streams that are repeatedly dead,
 - streams with frequent health transitions,
 - and whether dead checks are concentrated at specific hours.
 
 If you want to reduce scan waves when many streams are discovered at the same time, set **TTL jitter percent** (0-100) to spread expiry windows per stream.
 
-When newer Dispatcharr stream data is imported, the cache records `metadata_source: "dispatcharr_stream_stats"`. Qualifying runtime playback records `health_source: "runtime_playback"`; sessions containing a channel error or failover do not qualify as clean. If the imported resolution/FPS changes, or if bitrate changes beyond configured thresholds, throughput is rechecked so its delivery classification uses the new media characteristics.
+When newer Dispatcharr stream data is imported, the cache records `metadata_source: "dispatcharr_stream_stats"`. Qualifying runtime playback records `health_source: "runtime_playback"`; sessions containing a channel error or failover do not qualify as clean. Runtime evidence never clears a confirmed-dead result; only a completed analyzer scan can do that. If imported resolution/FPS changes, or bitrate changes beyond configured thresholds, throughput is rechecked so its delivery classification uses the new media characteristics.
+
+Dispatcharr's `Stream.is_stale` field belongs to provider refresh and is not a playback exclusion flag. Stream Sort therefore does not write it. Confirmed-dead state is reported and used for sorting, but current Dispatcharr releases require a core-supported exclusion mechanism before a plugin can guarantee that playback skips a dead stream.
 
 Significant bitrate change currently uses:
 - media bitrate relative tolerance (default `30%`), and
@@ -100,14 +102,17 @@ Inside the same viability/resolution tier, the additive score uses bitrate adequ
 - Use **Dead stream TTL** to defer repeated dead-stream rechecks between scans.
 - Set **TTL jitter percent** (for example `20`) so streams don’t all expire at once.
 - Use **Maximum streams per analysis run** to cap per-run load and spread full rechecks over multiple windows.
-- Run `Analyze Streams` and `Analyze + Sort` on separate schedules if you want sorting only after multiple analysis cycles.
+- Use the single scheduled Analyze job and choose whether **Apply sort after scheduled analysis** is enabled.
 - Click **Recommend TTLs** after analyzing to get data-driven reachability/dead-TTL and jitter recommendations before changing settings.
 
-The health trend report (`/data/dispatcharr_stream_sort_health_report.json`) includes:
+The 90-day health trend report (`/data/dispatcharr_stream_sort_health_report.json`) includes:
 
 - hourly dead-check concentration,
 - streams with unstable status histories,
-- status-change gap percentiles (`p50`, `p90`) you can use to tune Reachability and Dead TTLs.
+- explicit alive-to-dead and dead-to-alive transition counts,
+- completed dead-recovery and alive-episode durations,
+- censored currently-dead episodes, and
+- actual check concentration used to tune jitter.
 
 Suggested process:
 
@@ -166,10 +171,11 @@ All matching name rules are additive.
 ## Actions
 
 - **Analyze Streams** — incrementally refresh only health/content, metadata, or throughput components that require checking.
-- **Apply Schedule** — save a cron-based automatic analyze schedule for scoped channels.
-- **Check Schedule** — show current scheduled state, next/last run status, and whether auto-sort and parallel-check options are enabled.
+- **Apply Schedule** — save a standard five-field UTC cron schedule. Each run loads current saved UI settings and is atomically claimed once across workers.
+- **Check Schedule** — show current schedule configuration and final status of the latest scheduled job.
 - **Disable Schedule** — stop automatic scheduled analysis and clear any in-memory due-minute state.
-- **Recommend TTLs** — compute health/dead TTL and jitter recommendations from the latest health trend report.
+- **Health Report** — show problematic streams, directional health transitions, dead recovery, and time concentration in the UI.
+- **Recommend TTLs** — compute read-only health/dead TTL and jitter recommendations from recent directional evidence, with confidence and sparse-data warnings.
 - **Dry Run** — write `/data/dispatcharr_stream_sort_report.json` without changing order.
 - **Sort Streams** — apply the calculated `ChannelStream.order` only.
 - **Analyze + Sort** — incrementally analyze, then apply the refreshed ordering.
