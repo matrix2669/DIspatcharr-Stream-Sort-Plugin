@@ -9,9 +9,16 @@ import tempfile
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from datetime import datetime, timedelta, timezone
 from typing import Any, Mapping
+from zoneinfo import ZoneInfo
 
 from . import analyzer
 from .capacity import build_capacity_manager
+from .execution_control import (
+    AnalysisCancelled,
+    analysis_cancel_requested,
+    close_analysis_cancel_window,
+    exclusive_analysis_execution,
+)
 from .scoring import estimate_nominal_throughput_kbps, parse_fps, parse_resolution
 from .reliability import RELIABILITY_PATH, load_reliability_cache
 from .throughput import (
@@ -24,7 +31,9 @@ from .throughput import (
 
 ANALYSIS_HEALTH_REPORT_PATH = "/data/dispatcharr_stream_sort_health_report.json"
 MEDIA_CHECK_HISTORY_RETENTION_DAYS = 90
-MEDIA_CHECK_HISTORY_MAX_ROWS = 2000
+MEDIA_CHECK_HISTORY_MAX_ROWS = 10000
+MEDIA_CHECK_ROLLUP_RETENTION_DAYS = 365
+HEALTH_REPORT_TIMEZONE = ZoneInfo("America/New_York")
 MEDIA_BITRATE_RELATIVE_TOLERANCE = 0.30
 MEDIA_BITRATE_ABSOLUTE_TOLERANCE_KBPS = 500.0
 
@@ -121,6 +130,8 @@ def health_check_reason(
     status = str(entry.get("status") or "unknown").strip().lower()
     if status != "alive":
         if status == "dead" and dead_ttl_hours is not None:
+            if entry.get("retry_pending"):
+                return "status_dead_retry_pending"
             checked_at = (
                 entry.get("health_checked_at")
                 or entry.get("playback_health_checked_at")
@@ -331,17 +342,21 @@ def _append_health_history(
     result: Mapping[str, Any],
 ) -> None:
     history = list(entry.get("health_check_history") or [])
-    history.append(
-        {
-            "checked_at": tested_at,
-            "previous_status": previous_status,
-            "status": new_status,
-            "reason": reason or "unknown",
-            "error_type": str(result.get("error_type") or ""),
-            "error": str(result.get("error") or ""),
-            "source": str(result.get("health_source") or entry.get("health_source") or "stream_sort_analyzer"),
-        }
-    )
+    retry = result.get("retry_telemetry")
+    retry = dict(retry) if isinstance(retry, Mapping) else {}
+    terminal = not bool(retry.get("retry_pending"))
+    row = {
+        "checked_at": tested_at,
+        "previous_status": previous_status,
+        "status": new_status,
+        "reason": reason or "unknown",
+        "error_type": str(result.get("error_type") or ""),
+        "error": str(result.get("error") or ""),
+        "source": str(result.get("health_source") or entry.get("health_source") or "stream_sort_analyzer"),
+        "retry": retry,
+        "terminal": terminal,
+    }
+    history.append(row)
     observed_at = _parse_datetime(tested_at) or datetime.now(timezone.utc)
     cutoff = observed_at - timedelta(days=MEDIA_CHECK_HISTORY_RETENTION_DAYS)
     history = [
@@ -351,6 +366,31 @@ def _append_health_history(
     if len(history) > MEDIA_CHECK_HISTORY_MAX_ROWS:
         history = history[-MEDIA_CHECK_HISTORY_MAX_ROWS:]
     entry["health_check_history"] = history
+
+    rollups = entry.get("health_daily_rollups")
+    rollups = dict(rollups) if isinstance(rollups, Mapping) else {}
+    day = observed_at.date().isoformat()
+    bucket = dict(rollups.get(day) or {})
+    terminal_key = "completed_checks" if terminal else "provisional_checks"
+    bucket[terminal_key] = int(bucket.get(terminal_key) or 0) + 1
+    if terminal and new_status in {"alive", "dead"}:
+        key = f"{new_status}_checks"
+        bucket[key] = int(bucket.get(key) or 0) + 1
+    if terminal and previous_status in {"alive", "dead"} and previous_status != new_status:
+        key = f"{previous_status}_to_{new_status}"
+        bucket[key] = int(bucket.get(key) or 0) + 1
+    bucket["retry_attempts"] = int(bucket.get("retry_attempts") or 0) + int(retry.get("retry_attempts") or 0)
+    bucket["retry_assisted_recoveries"] = int(bucket.get("retry_assisted_recoveries") or 0) + int(
+        bool(retry.get("recovered_after_retries"))
+    )
+    bucket["retry_exhaustions"] = int(bucket.get("retry_exhaustions") or 0) + int(
+        bool(retry.get("retries_exhausted"))
+    )
+    rollups[day] = bucket
+    rollup_cutoff = (observed_at - timedelta(days=MEDIA_CHECK_ROLLUP_RETENTION_DAYS)).date().isoformat()
+    entry["health_daily_rollups"] = {
+        key: value for key, value in sorted(rollups.items()) if key >= rollup_cutoff
+    }
 
 
 def _build_health_report(
@@ -375,6 +415,11 @@ def _build_health_report(
     dead_recovery_hours: list[float] = []
     alive_episode_hours: list[float] = []
     current_dead_episode_hours: list[float] = []
+    retry_attempts = 0
+    retry_assisted_recoveries = 0
+    retry_exhaustions = 0
+    retry_deferred = 0
+    daily_rollup_dates = set()
     total_changes = 0
     total_dead_checks = 0
     stream_reports = []
@@ -385,21 +430,40 @@ def _build_health_report(
         summary[status] += 1
         history = entry.get("health_check_history") or []
         timeline: list[tuple[datetime, str, str]] = []
+        valid_history = []
         dead = 0
+        stream_retry_attempts = 0
+        stream_retry_recoveries = 0
+        stream_retry_exhaustions = 0
+        stream_retry_deferred = 0
+        daily_rollup_dates.update((entry.get("health_daily_rollups") or {}).keys())
         for row in history:
             row_status = str(row.get("status") or "").lower()
             checked_at = _parse_datetime(row.get("checked_at"))
-            if not row_status or checked_at is None:
+            retry = row.get("retry") if isinstance(row.get("retry"), Mapping) else {}
+            attempts = int(retry.get("retry_attempts") or 0)
+            deferred = int(retry.get("retry_deferred") or 0)
+            stream_retry_attempts += attempts
+            stream_retry_deferred += deferred
+            stream_retry_recoveries += int(bool(retry.get("recovered_after_retries")))
+            stream_retry_exhaustions += int(bool(retry.get("retries_exhausted")))
+            if (
+                row_status not in {"alive", "dead"}
+                or checked_at is None
+                or not bool(row.get("terminal", True))
+            ):
                 continue
+            valid_history.append(row)
             recorded_previous = str(row.get("previous_status") or "").lower()
             timeline.append((checked_at, row_status, recorded_previous))
             all_checked_at.append(checked_at)
-            hourly_total_checks[checked_at.hour] += 1
-            minute_check_counts[checked_at.strftime("%Y%m%d%H%M")] += 1
+            local_checked_at = checked_at.astimezone(HEALTH_REPORT_TIMEZONE)
+            hourly_total_checks[local_checked_at.hour] += 1
+            minute_check_counts[local_checked_at.strftime("%Y%m%d%H%M")] += 1
             if row_status == "dead":
                 dead += 1
                 total_dead_checks += 1
-                hourly_dead_checks[checked_at.hour] += 1
+                hourly_dead_checks[local_checked_at.hour] += 1
 
         timeline.sort(key=lambda row: row[0])
         changes = 0
@@ -446,8 +510,13 @@ def _build_health_report(
                 max(0.0, (now - dead_started_at).total_seconds() / 3600.0)
             )
 
-        last_record = history[-1] if history else {}
-        history_len = len(history)
+        last_record = valid_history[-1] if valid_history else {}
+        history_len = len(timeline)
+        stream_history_span_hours = (
+            (timeline[-1][0] - timeline[0][0]).total_seconds() / 3600.0
+            if len(timeline) >= 2
+            else 0.0
+        )
         dead_ratio = dead / history_len if history_len else 0.0
         stream_id = int(item["id"])
         status_changes[stream_id] = changes
@@ -462,10 +531,19 @@ def _build_health_report(
                 "status_changes": changes,
                 "dead_checks": dead,
                 "dead_check_ratio": round(dead_ratio, 4),
+                "history_span_hours": round(stream_history_span_hours, 2),
+                "retry_attempts": stream_retry_attempts,
+                "retry_assisted_recoveries": stream_retry_recoveries,
+                "retry_exhaustions": stream_retry_exhaustions,
+                "retry_deferred": stream_retry_deferred,
                 "last_checked_at": last_record.get("checked_at"),
                 "age_hours": _age_hours(last_record.get("checked_at"), now),
             }
         )
+        retry_attempts += stream_retry_attempts
+        retry_assisted_recoveries += stream_retry_recoveries
+        retry_exhaustions += stream_retry_exhaustions
+        retry_deferred += stream_retry_deferred
 
     if all_checked_at:
         all_checked_at.sort()
@@ -504,7 +582,9 @@ def _build_health_report(
     )[:20]
     problematic_streams = [
         row for row in stream_reports
-        if row["history_len"] >= 4 and row["dead_check_ratio"] > 0.75
+        if row["history_len"] >= 20
+        and row["history_span_hours"] >= 168.0
+        and row["dead_check_ratio"] > 0.75
     ]
     problematic_streams.sort(
         key=lambda row: (row["dead_check_ratio"], row["dead_checks"], row["history_len"]),
@@ -515,6 +595,7 @@ def _build_health_report(
 
     return {
         "generated_at": now.isoformat(),
+        "reporting_timezone": str(HEALTH_REPORT_TIMEZONE),
         "selected_streams": len(items),
         "channels_selected": channels_selected,
         "status_counts": {status: count for status, count in summary.items()},
@@ -569,6 +650,16 @@ def _build_health_report(
             "problematic_streams": problematic_streams,
             "hourly_dead_ratio": hourly,
         },
+        "retry_reliability": {
+            "retry_attempts": retry_attempts,
+            "retry_assisted_recoveries": retry_assisted_recoveries,
+            "retry_exhaustions": retry_exhaustions,
+            "retry_capacity_deferrals": retry_deferred,
+        },
+        "daily_rollups": {
+            "retention_days": MEDIA_CHECK_ROLLUP_RETENTION_DAYS,
+            "days_present": len(daily_rollup_dates),
+        },
         "stream_stats": {
             "dead_change_counts": dead_counts,
             "status_change_counts": status_changes,
@@ -614,6 +705,8 @@ def _fair_account_futures(
         futures = {}
         while futures or any(queues[key] for key in account_order):
             while len(futures) < worker_count:
+                if analysis_cancel_requested():
+                    break
                 pending = [
                     key
                     for key in account_order
@@ -664,6 +757,8 @@ def _fair_account_futures(
                     break
 
             if not futures:
+                if analysis_cancel_requested():
+                    break
                 # Every remaining limited source is currently occupied by
                 # viewers or other reserved connections. Leave its cached
                 # result unchanged and retry it on the next analysis run.
@@ -987,6 +1082,7 @@ def _analysis_reason(
     return None
 
 
+@exclusive_analysis_execution
 def analyze_assigned_streams(
     settings: Mapping[str, Any],
     *,
@@ -1032,7 +1128,7 @@ def analyze_assigned_streams(
     playback_health_clean_min_seconds = max(30.0, analyzer._as_float(settings.get("playback_health_clean_min_seconds"), 60.0))
     playback_health_ttl_hours = max(0.0, analyzer._as_float(settings.get("playback_health_ttl_hours"), 6.0))
     throughput_ttl_hours = max(0.0, analyzer._as_float(settings.get("healthy_throughput_ttl_hours"), 6.0))
-    analysis_ttl_jitter_percent = max(0.0, min(100.0, analyzer._as_float(settings.get("analysis_ttl_jitter_percent"), 0.0)))
+    analysis_ttl_jitter_percent = max(0.0, min(100.0, analyzer._as_float(settings.get("analysis_ttl_jitter_percent"), 30.0)))
     throughput_duration = max(1.0, analyzer._as_float(settings.get("probe_duration_seconds"), 8.0))
     throughput_timeout = max(throughput_duration + 2.0, analyzer._as_float(settings.get("probe_timeout_seconds"), 10.0))
     throughput_account_delay = max(0.0, analyzer._as_float(settings.get("probe_per_account_delay_seconds"), 1.0))
@@ -1164,7 +1260,9 @@ def analyze_assigned_streams(
 
     capacity_manager = build_capacity_manager(items, logger=logger)
 
+    canceled = False
     media_results = {}
+    media_retry_telemetry = {}
     media_capacity_deferred_ids = set()
     previous_media_stats = {
         int(item["id"]): (cache.get(str(item["id"])) or {}).get("stats")
@@ -1227,7 +1325,17 @@ def analyze_assigned_streams(
                     "stats": {},
                     "details": {},
                 }
-            media_results[int(item["id"])] = dict(result)
+            sid = int(item["id"])
+            media_results[sid] = dict(result)
+            initial_error_type = str(result.get("error_type") or "")
+            media_retry_telemetry[sid] = {
+                "initial_failed": str(result.get("status") or "unknown").lower() != "alive",
+                "initial_status": str(result.get("status") or "unknown").lower(),
+                "initial_error_type": initial_error_type,
+                "retry_attempts": 0,
+                "retry_deferred": 0,
+                "failure_types": [initial_error_type] if initial_error_type else [],
+            }
             elapsed = max(time.monotonic() - media_started, 0.001)
             eta = elapsed / completed * (len(media_due) - completed) if completed < len(media_due) else 0.0
             counts = _status_counts(items, cache)
@@ -1245,8 +1353,12 @@ def analyze_assigned_streams(
                 _overall_health_text(counts), total - len(media_due), len(media_due) - completed, analyzer._format_eta(eta),
             )
 
+        canceled = analysis_cancel_requested()
+
         by_id = {int(item["id"]): item for item, _ in media_due}
         for retry_pass in range(1, retries + 1):
+            if canceled:
+                break
             retry_ids = [
                 sid for sid, result in media_results.items()
                 if str(result.get("error_type") or "") in analyzer.RETRYABLE_ERROR_TYPES
@@ -1255,7 +1367,14 @@ def analyze_assigned_streams(
                 break
             backoff = max(1.0, account_delay * 3.0)
             logger.info("[Analyze Retry %d/%d] waiting %.1fs before retrying %d media checks", retry_pass, retries, backoff, len(retry_ids))
-            time.sleep(backoff)
+            deadline = time.monotonic() + backoff
+            while time.monotonic() < deadline:
+                if analysis_cancel_requested():
+                    canceled = True
+                    break
+                time.sleep(min(0.25, max(0.0, deadline - time.monotonic())))
+            if canceled:
+                break
             retry_items = [by_id[sid] for sid in retry_ids]
             for item, future in _fair_account_futures(
                 retry_items,
@@ -1266,6 +1385,7 @@ def analyze_assigned_streams(
                 max_per_account=1,
             ):
                 if future is None:
+                    media_retry_telemetry[int(item["id"])]["retry_deferred"] += 1
                     logger.info(
                         "[Analyze Retry %d/%d] stream=%s deferred because its M3U connection limit is occupied",
                         retry_pass,
@@ -1274,9 +1394,9 @@ def analyze_assigned_streams(
                     )
                     continue
                 try:
-                    media_results[int(item["id"])] = dict(future.result())
+                    retry_result = dict(future.result())
                 except Exception as exc:
-                    media_results[int(item["id"])] = {
+                    retry_result = {
                         "tested_at": analyzer._utc_now_iso(),
                         "status": "dead",
                         "error_type": "other",
@@ -1284,20 +1404,49 @@ def analyze_assigned_streams(
                         "stats": {},
                         "details": {},
                     }
+                sid = int(item["id"])
+                media_results[sid] = retry_result
+                telemetry = media_retry_telemetry[sid]
+                telemetry["retry_attempts"] += 1
+                error_type = str(retry_result.get("error_type") or "")
+                if error_type and error_type not in telemetry["failure_types"]:
+                    telemetry["failure_types"].append(error_type)
+            canceled = analysis_cancel_requested()
+
+        canceled = canceled or analysis_cancel_requested()
 
         for item, _ in media_due:
             sid = int(item["id"])
             if sid not in media_results:
                 continue
             result = media_results[sid]
+            telemetry = media_retry_telemetry[sid]
+            terminal_status = str(result.get("status") or "unknown").lower()
+            telemetry["terminal_status"] = terminal_status
+            telemetry["recovered_after_retries"] = bool(
+                telemetry["initial_failed"]
+                and telemetry["retry_attempts"]
+                and terminal_status == "alive"
+            )
+            telemetry["retries_exhausted"] = bool(
+                retries > 0
+                and telemetry["retry_attempts"] >= retries
+                and str(result.get("error_type") or "") in analyzer.RETRYABLE_ERROR_TYPES
+            )
+            telemetry["retry_pending"] = bool(
+                terminal_status == "dead"
+                and retries > 0
+                and telemetry["retry_attempts"] < retries
+                and str(result.get("error_type") or "") in analyzer.RETRYABLE_ERROR_TYPES
+            )
+            result["retry_pending"] = telemetry["retry_pending"]
+            result["retry_telemetry"] = telemetry
             cache[str(sid)] = _merge_media_result(
                 item,
                 cache.get(str(sid)),
                 result,
                 analysis_reason=reason_by_id.get(sid),
             )
-            analyzer._persist_dispatcharr_result(sid, result, logger)
-        analyzer.save_analysis_cache(cache, cache_path)
 
     media_changed_ids = {
         sid for sid, result in media_results.items()
@@ -1332,7 +1481,8 @@ def analyze_assigned_streams(
 
     throughput_checked_ids = set()
     throughput_capacity_deferred_ids = set()
-    if throughput_due:
+    canceled = canceled or analysis_cancel_requested()
+    if throughput_due and not canceled:
         throughput_started = time.monotonic()
         account_probe_limiter = analyzer._PerAccountStartLimiter(throughput_account_delay)
         throughput_reason_by_id = {int(item["id"]): reason for item, reason in throughput_due}
@@ -1406,9 +1556,7 @@ def analyze_assigned_streams(
                 _overall_throughput_text(counts), max(0, alive_count - len(throughput_due)),
                 len(throughput_due) - completed, analyzer._format_eta(eta),
             )
-
-    if throughput_checked_ids:
-        analyzer.save_analysis_cache(cache, cache_path)
+        canceled = analysis_cancel_requested()
 
     media_checked_ids = set(media_results)
     capacity_deferred_ids = media_capacity_deferred_ids | throughput_capacity_deferred_ids
@@ -1418,6 +1566,10 @@ def analyze_assigned_streams(
         and int(item["id"]) not in throughput_checked_ids
         and int(item["id"]) not in capacity_deferred_ids
     )
+    canceled = bool(close_analysis_cancel_window() or canceled)
+    for sid, result in media_results.items():
+        analyzer._persist_dispatcharr_result(sid, result, logger)
+    analyzer.save_analysis_cache(cache, cache_path)
     health_counts = _status_counts(items, cache)
     throughput_counts = _throughput_counts(items, cache)
     logger.info(
@@ -1435,7 +1587,7 @@ def analyze_assigned_streams(
     )
     report["filters"] = filter_summary
     _save_json(health_report_path, report)
-    return {
+    result = {
         "streams_analyzed": total,
         "streams_selected": total,
         "media_checked": len(media_checked_ids),
@@ -1451,6 +1603,12 @@ def analyze_assigned_streams(
         "cache_path": cache_path,
         "analysis_health_report_path": health_report_path,
     }
+    if canceled:
+        raise AnalysisCancelled(
+            "Stream analysis was canceled after saving completed probe results",
+            result=result,
+        )
+    return result
 
 
 def install() -> None:

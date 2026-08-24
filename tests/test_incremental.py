@@ -233,6 +233,23 @@ def test_dead_health_uses_dead_ttl_before_recheck():
     assert health_check_reason(expired, url_hash="abc", ttl_hours=24, dead_ttl_hours=1, now=now) == "status_dead"
 
 
+def test_dead_result_with_incomplete_retries_bypasses_dead_ttl():
+    now = _now()
+    entry = {
+        "status": "dead",
+        "url_hash": "abc",
+        "health_checked_at": (now - timedelta(minutes=1)).isoformat(),
+        "retry_pending": True,
+    }
+    assert health_check_reason(
+        entry,
+        url_hash="abc",
+        ttl_hours=24,
+        dead_ttl_hours=1,
+        now=now,
+    ) == "status_dead_retry_pending"
+
+
 def test_dead_ttl_defers_the_complete_media_analysis_reason():
     now = _now()
     entry = {
@@ -327,14 +344,14 @@ def test_problematic_streams_require_more_than_75_percent_dead_across_full_scope
     items = [{"id": index, "name": f"Stream {index}"} for index in range(1, 26)]
     cache = {}
     for item in items:
-        statuses = ["dead", "dead", "dead", "alive"]
+        statuses = (["dead"] * 15) + (["alive"] * 5)
         if item["id"] == 25:
-            statuses = ["dead", "dead", "dead", "dead", "alive"]
+            statuses = (["dead"] * 16) + (["alive"] * 4)
         cache[str(item["id"])] = {
             "status": statuses[-1],
             "health_check_history": [
                 {
-                    "checked_at": (now - timedelta(hours=len(statuses) - index)).isoformat(),
+                    "checked_at": (now - timedelta(days=8) + timedelta(hours=index * 10)).isoformat(),
                     "previous_status": statuses[index - 1] if index else "unknown",
                     "status": value,
                     "reason": "ttl_expired",

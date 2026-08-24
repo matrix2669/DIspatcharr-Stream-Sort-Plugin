@@ -1,6 +1,6 @@
 {
   "name": "Dispatcharr Stream Sort",
-  "version": "0.3.6-beta.5",
+  "version": "0.3.6-beta.6",
   "description": "Analyzes stream health, quality, delivery performance, and runtime reliability telemetry with M3U connection-capacity reservations, reuses fresh Dispatcharr playback metadata, then scores and reorders streams already assigned to channels.",
   "author": "matrix2669",
   "help_url": "https://github.com/matrix2669/DIspatcharr-Stream-Sort-Plugin",
@@ -26,7 +26,7 @@
     {"id":"playback_health_min_seconds","label":"Minimum established playback fallback (seconds)","type":"number","default":300,"help_text":"Long playback can qualify even before a clean stop is observed."},
     {"id":"playback_health_ttl_hours","label":"Playback reachability TTL (hours)","type":"number","default":6,"help_text":"How recently qualifying playback must have occurred to replace a direct reachability probe."},
     {"id":"content_validation_ttl_hours","label":"Content validation interval (hours)","type":"number","default":168,"help_text":"Black, frozen, and silent checks still run periodically. Recent playback defers an initially missing content check until this interval expires."},
-    {"id":"analysis_ttl_jitter_percent","label":"TTL jitter percent","type":"number","default":0,"help_text":"Apply per-stream analysis TTL jitter to stagger expiry and reduce synchronized rechecks. Set e.g. 20 for ±20% variation around each configured TTL."},
+    {"id":"analysis_ttl_jitter_percent","label":"TTL jitter percent","type":"number","default":30,"help_text":"Apply stable per-stream analysis TTL jitter from -30% to +30% around each configured media and throughput TTL. Dead-stream TTL is never jittered."},
     {"id":"healthy_throughput_ttl_hours","label":"Healthy throughput TTL (hours)","type":"number","default":6,"help_text":"HEALTHY throughput is reused until this TTL expires. Marginal, insufficient, and unknown throughput are rechecked every Analyze run. 0 forces throughput recheck on every Analyze run."},
     {"id":"analysis_workers","label":"Parallel tests","type":"number","default":2,"help_text":"Total concurrent media and throughput tests (maximum 16). Active slots are balanced across M3U sources and all active profiles, capped by each profile's remaining Dispatcharr connection-pool capacity after active viewers."},
     {"id":"analysis_connection_timeout_seconds","label":"Analysis connection timeout (seconds)","type":"number","default":10},
@@ -57,6 +57,7 @@
   "actions": [
     {"id":"analyze_streams","label":"Analyze Streams","description":"Incrementally refresh only health/content, metadata, or throughput data that needs checking in the selected channel scope.","button_label":"Analyze Streams","button_variant":"outline","button_color":"orange","confirm":{"required":true,"title":"Analyze assigned streams?","message":"Fresh cached data and newer Dispatcharr playback metadata are reused. Provider connections are opened only for components that need refreshing. It does not rename, move, create, or delete channels."}},
     {"id":"check_analysis_status","label":"Check Analysis Status","description":"Show the current phase and progress of the active analysis, or the outcome of the last analysis.","button_label":"Check Status","button_variant":"outline","button_color":"gray"},
+    {"id":"stop_analysis","label":"Stop Current Scan","description":"Stop new probes, safely drain active probes, and release their exact provider reservations.","button_label":"Stop Current Scan","button_variant":"outline","button_color":"red","confirm":{"required":true,"title":"Stop the current scan?","message":"No new probes will start. Already-running probes will finish or time out so Stream Sort can release only the provider reservations it owns."}},
     {"id":"health_report","label":"Health Report","description":"Show problematic streams, directional health transitions, dead-to-alive recovery evidence, time concentration, report age, and the complete latest report without changing streams or settings.","button_label":"Health Report","button_variant":"outline","button_color":"blue"},
     {"id":"recommend_ttls","label":"Recommend TTLs","description":"Read a recent non-empty health report and produce read-only TTL and jitter recommendations. Confidence remains low until enough directional transitions and history have been collected.","button_label":"Recommend TTLs","button_variant":"outline","button_color":"blue"},
     {"id":"dry_run","label":"Dry Run","description":"Calculate the proposed order for the selected channel scope without changing ChannelStream.order.","button_label":"Dry Run","button_variant":"outline","button_color":"blue"},

@@ -100,7 +100,7 @@ Inside the same viability/resolution tier, the additive score uses bitrate adequ
 ## Operational tuning for scan load and TTL staggering
 
 - Use **Dead stream TTL** to defer repeated dead-stream rechecks between scans.
-- Set **TTL jitter percent** (for example `20`) so streams don’t all expire at once.
+- The default **TTL jitter percent** is `30`, assigning each stream a stable media/throughput TTL between 70% and 130% of the configured value so streams do not expire together. Dead TTL is exact and receives no jitter.
 - Use **Maximum streams per analysis run** to cap per-run load and spread full rechecks over multiple windows.
 - Use the single scheduled Analyze job and choose whether **Apply sort after scheduled analysis** is enabled.
 - Click **Recommend TTLs** after analyzing to get data-driven reachability/dead-TTL and jitter recommendations before changing settings.
@@ -171,6 +171,7 @@ All matching name rules are additive.
 ## Actions
 
 - **Analyze Streams** — incrementally refresh only health/content, metadata, or throughput components that require checking.
+- **Stop Current Scan** — stop launching new probes and safely drain already-running probes so Stream Sort releases only its own provider reservations. It does not clear Dispatcharr provider counters or reclaim viewer capacity.
 - **Apply Schedule** — save a standard five-field UTC cron schedule. Each run loads current saved UI settings and is atomically claimed once across workers.
 - **Check Schedule** — show current schedule configuration and final status of the latest scheduled job.
 - **Disable Schedule** — stop automatic scheduled analysis and clear any in-memory due-minute state.
@@ -182,6 +183,8 @@ All matching name rules are additive.
 - **Runtime Reliability Collector** — automatic event-triggered collector for Dispatcharr runtime telemetry; manual invocation does not synthesize reliability events.
 
 Separate `Probe Throughput` actions are no longer shown because throughput is part of Analyze Streams.
+
+Stopping a scan checkpoints every media and throughput probe that has already completed, then skips remaining probes and post-analysis sorting. A dead media result that has not completed its configured retry sequence is saved as retry-pending with an effective dead TTL of zero, so the next scan immediately resumes confirmation instead of treating it as confirmed dead. Retry-pending observations remain visible as provisional evidence but are excluded from terminal dead percentages. Stopping a scan does not disable its recurring schedule.
 
 ## Logging
 

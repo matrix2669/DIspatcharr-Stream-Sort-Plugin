@@ -4,16 +4,23 @@ All notable user-visible changes to Dispatcharr Stream Sort are documented here.
 
 Historical versions below were published through the legacy `dev-test` workflow and were not Git tags or GitHub Releases.
 
-## Unreleased
+## 0.3.6-beta.6 - 2026-08-24
 
 ### Added
+
+- Add a **Stop Current Scan** action that checkpoints completed probes, stops new probe launches, and drains already-active probes so their exact provider reservations are released normally.
 
 ### Changed
 
 - Move the registry tagged-build channel from `dispatcharr-plugins:dev-test` to `dispatcharr-plugins:dev`.
 - Distinguish completed stable versions from explicitly approved GitHub Releases.
+- Make the accepted 30% per-stream TTL jitter the UI and runtime default, retain detailed health rows with a cap that accommodates hourly checks for 90 days, and retain scheduled outcomes for 365 days.
 
 ### Fixed
+
+- Enforce a shared execution lease inside the analyzer so direct management-shell calls cannot overlap UI or scheduled scans by bypassing the plugin job lock.
+- Preserve the established viewer-aware provider capacity and manual parallel-scan behavior; cancellation never clears aggregate Dispatcharr provider counters.
+- Preserve completed media and throughput results when a scan is stopped, skip post-analysis sorting, and give unconfirmed dead results an effective zero dead TTL until their retry sequence completes.
 
 ### Removed
 

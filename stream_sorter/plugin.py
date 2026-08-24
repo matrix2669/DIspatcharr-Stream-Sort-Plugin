@@ -16,6 +16,7 @@ except ImportError:  # pragma: no cover - Dispatcharr runs on Linux
     fcntl = None
 
 from .analyzer import ANALYSIS_CACHE_PATH, probe_assigned_streams
+from .execution_control import AnalysisAlreadyRunning, AnalysisCancelled, request_analysis_cancel
 from .incremental import ANALYSIS_HEALTH_REPORT_PATH, _parse_datetime, analyze_assigned_streams
 from .reliability import RELIABILITY_PATH, record_runtime_event
 from .sorter import REPORT_PATH, resolve_channel_scope, sort_channels
@@ -34,6 +35,8 @@ M3U_SOURCE_SCORE_PREFIX = "m3u_source_score_"
 LOG_PREFIX = "[Stream Sort]"
 SCHEDULER_POLL_SECONDS = 10
 SCHEDULER_THREAD_NAME = "dispatcharr-stream-sort-scheduler"
+SCHEDULE_HISTORY_RETENTION_DAYS = 365
+SCHEDULE_HISTORY_MAX_ROWS = 20000
 
 _SCHEDULER_THREAD = None
 
@@ -218,6 +221,7 @@ def _load_schedule_state() -> dict:
             "last_run_status": "idle",
             "last_run_message": "",
             "last_job_id": None,
+            "history": [],
         },
     )
     return {
@@ -232,6 +236,7 @@ def _load_schedule_state() -> dict:
         "last_run_status": str(raw.get("last_run_status") or "idle"),
         "last_run_message": str(raw.get("last_run_message") or ""),
         "last_job_id": raw.get("last_job_id"),
+        "history": [dict(row) for row in (raw.get("history") or []) if isinstance(row, Mapping)],
     }
 
 
@@ -248,9 +253,30 @@ def _save_schedule_state(value: dict) -> None:
         "last_run_status": str(value.get("last_run_status") or "idle"),
         "last_run_message": str(value.get("last_run_message") or ""),
         "last_job_id": value.get("last_job_id"),
+        "history": [dict(row) for row in (value.get("history") or []) if isinstance(row, Mapping)],
         "updated_at": _utc_now_iso(),
     }
     _save_json(SCHEDULE_STATE_PATH, payload)
+
+
+def _append_schedule_history(state: dict, *, status: str, message: str, job_id=None) -> None:
+    observed_at = datetime.now(timezone.utc)
+    cutoff = observed_at - timedelta(days=SCHEDULE_HISTORY_RETENTION_DAYS)
+    history = [
+        dict(row)
+        for row in (state.get("history") or [])
+        if isinstance(row, Mapping)
+        and (_parse_datetime(row.get("observed_at")) or observed_at) >= cutoff
+    ]
+    history.append(
+        {
+            "observed_at": observed_at.isoformat(),
+            "status": str(status),
+            "message": str(message),
+            "job_id": job_id,
+        }
+    )
+    state["history"] = history[-SCHEDULE_HISTORY_MAX_ROWS:]
 
 
 def _mutate_schedule_state(mutator):
@@ -613,7 +639,7 @@ def _recommend_ttls(settings: dict, *, report: dict) -> dict:
 
     health_current = _safe_float(settings.get("health_content_ttl_hours"), 24.0)
     dead_current = _safe_float(settings.get("dead_content_ttl_hours"), 1.0)
-    jitter_current = _safe_float(settings.get("analysis_ttl_jitter_percent"), 0.0)
+    jitter_current = _safe_float(settings.get("analysis_ttl_jitter_percent"), 30.0)
 
     selected_streams = int(report.get("selected_streams") or 0)
     history_rows = int(observations.get("history_rows") or 0)
@@ -779,7 +805,7 @@ def _run_health_report_action() -> dict:
     transitions = observations.get("transition_counts") if isinstance(observations.get("transition_counts"), Mapping) else {}
     message = (
         f"Health report age={age_text}; streams={int(report.get('selected_streams') or 0)}; "
-        f"problematic (>75% dead, minimum 4 checks)={len(problematic)}; "
+        f"problematic (>75% dead, minimum 20 checks over 7 days)={len(problematic)}; "
         f"alive-to-dead={int(transitions.get('alive_to_dead') or 0)}; "
         f"dead-to-alive={int(transitions.get('dead_to_alive') or 0)}."
     )
@@ -829,6 +855,7 @@ def _finish_schedule_job(generation: int | None, job_id: str, *, status: str, me
             return
         state["last_run_status"] = status
         state["last_run_message"] = message
+        _append_schedule_history(state, status=status, message=message, job_id=job_id)
 
     _mutate_schedule_state(mutate)
 
@@ -946,6 +973,11 @@ def _check_schedule_tick(now: datetime | None = None, *, settings: dict | None =
     except ValueError as exc:
         state["last_run_status"] = "error"
         state["last_run_message"] = f"Invalid cron: {exc}"
+        _append_schedule_history(
+            state,
+            status="error",
+            message=state["last_run_message"],
+        )
         _save_schedule_state(state)
         return {
             "status": "error",
@@ -986,6 +1018,11 @@ def _check_schedule_tick(now: datetime | None = None, *, settings: dict | None =
             current["last_run_at"] = _utc_now_iso()
             current["last_run_status"] = "skipped_busy" if "already running" in str(result.get("message") or "") else "error"
             current["last_run_message"] = result.get("message") or "scheduled run skipped"
+            _append_schedule_history(
+                current,
+                status=current["last_run_status"],
+                message=current["last_run_message"],
+            )
 
         state = _mutate_schedule_state(record_skip)
     else:
@@ -1036,6 +1073,11 @@ class _StreamSortScheduler:
                     def record_error(state):
                         state["last_run_status"] = "error"
                         state["last_run_message"] = f"{type(exc).__name__}: {exc}"
+                        _append_schedule_history(
+                            state,
+                            status="error",
+                            message=state["last_run_message"],
+                        )
 
                     _mutate_schedule_state(record_error)
                 except Exception:
@@ -1118,6 +1160,43 @@ def _background_analyze_job(
             job_id,
             status="completed",
             message=f"Scheduled analysis completed for {result['streams_analyzed']} streams.",
+        )
+    except AnalysisCancelled as exc:
+        LOGGER.info("[Analyze] background job canceled")
+        partial_result = exc.result if isinstance(exc.result, Mapping) else {}
+        _update_status(
+            job_id,
+            status="canceled",
+            phase="canceled",
+            finished_at=_utc_now_iso(),
+            error=str(exc),
+            result=partial_result,
+        )
+        _notify(
+            "Stream Sort: analysis canceled after saving "
+            f"{partial_result.get('media_checked', 0)} completed media checks and "
+            f"{partial_result.get('throughput_checked', 0)} completed throughput checks."
+        )
+        _finish_schedule_job(
+            schedule_generation,
+            job_id,
+            status="canceled",
+            message=str(exc),
+        )
+    except AnalysisAlreadyRunning as exc:
+        LOGGER.warning("[Analyze] background job skipped: %s", exc)
+        _update_status(
+            job_id,
+            status="skipped_busy",
+            phase="skipped",
+            finished_at=_utc_now_iso(),
+            error=str(exc),
+        )
+        _finish_schedule_job(
+            schedule_generation,
+            job_id,
+            status="skipped_busy",
+            message=str(exc),
         )
     except Exception as exc:
         LOGGER.exception("[Analyze] background job failed")
@@ -1383,6 +1462,9 @@ class Plugin:
 
             if action == "check_analysis_status":
                 return _analysis_status()
+
+            if action == "stop_analysis":
+                return request_analysis_cancel()
 
             if action == "recommend_ttls":
                 return _run_ttl_recommendation_action(settings)

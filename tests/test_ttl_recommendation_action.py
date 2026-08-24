@@ -74,7 +74,7 @@ def test_health_report_action_returns_problem_stream_summary(tmp_path, monkeypat
 
     result = plugin._run_health_report_action()
     assert result["status"] == "ok"
-    assert "problematic (>75% dead, minimum 4 checks)=1" in result["message"]
+    assert "problematic (>75% dead, minimum 20 checks over 7 days)=1" in result["message"]
     assert result["result"]["observations"]["transition_counts"]["dead_to_alive"] == 2
 
 

@@ -129,7 +129,12 @@ def test_schedule_completion_updates_only_matching_generation_and_job(tmp_path, 
     plugin._save_schedule_state(state)
 
     plugin._finish_schedule_job(4, "job-4", status="completed", message="complete")
-    assert plugin._load_schedule_state()["last_run_status"] == "completed"
+    completed_state = plugin._load_schedule_state()
+    assert completed_state["last_run_status"] == "completed"
+    assert completed_state["history"][-1]["status"] == "completed"
+    assert completed_state["history"][-1]["job_id"] == "job-4"
 
     plugin._finish_schedule_job(3, "job-4", status="failed", message="stale")
-    assert plugin._load_schedule_state()["last_run_status"] == "completed"
+    stale_state = plugin._load_schedule_state()
+    assert stale_state["last_run_status"] == "completed"
+    assert len(stale_state["history"]) == 1

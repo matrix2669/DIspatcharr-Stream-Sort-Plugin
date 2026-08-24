@@ -152,12 +152,13 @@ This preserves recovery from transient transport/auth/login misses while prevent
 ## Consequences
 
 - `dead_content_ttl_hours` is the primary control for how long known-dead streams are deferred between full scans.
+- The initial operating value for `dead_content_ttl_hours` is one hour. Dead TTL remains user-configurable and is not jittered.
 - Operational tuning focuses on keeping provider checks lower while still allowing quick revalidation when needed.
-- `media_bitrate_relative_tolerance_percent` and `media_bitrate_absolute_tolerance_kbps` control when metadata changes trigger `media_changed` throughput rechecks (default 30% and 500 kbps). This makes `media_changed` behavior tunable without code changes while still ignoring normal ffprobe bitrate jitter.
+- `media_bitrate_relative_tolerance_percent` and `media_bitrate_absolute_tolerance_kbps` control when metadata changes trigger `media_changed` throughput rechecks (default 30% and 500 kbps). A bitrate-only change must meet or exceed both thresholds; a 500 kbps difference alone does not trigger a recheck when it is less than 30 percent. This makes `media_changed` behavior tunable without code changes while still ignoring normal ffprobe bitrate jitter.
 
 ## Provenance
 
-- Stream Sort discussion thread: user-guided TTL tuning and stale-state clarification (`this session`).
+- Operator requirements review on 2026-08-24: TTL tuning, retry behavior, and stale-state clarification.
 
 # ADR-006: Read-only TTL recommendation action and stream-level TTL jitter strategy
 
@@ -184,7 +185,7 @@ TTL tuning will be driven by a read/report action from collected health telemetr
   - per-hour dead concentration (`hourly_dead_ratio`),
   - unstable stream pattern indicators.
 - Jitter is not applied to dead TTL, only to media analysis/throughput-like TTLs.
-- Start with stream-level jitter only (per-stream randomization around TTL) to smooth expiry without account/provider-aware scheduling complexity.
+- Start with stable stream-level jitter only: each stream receives a deterministic multiplier from 0.70 through 1.30 around configured media-analysis and throughput TTLs. The multiplier is not redrawn on every scan. Dead TTL is exact and receives no jitter.
 - Add provider-aware spread only if empirical metrics show sustained concentration on specific accounts.
 
 ## Reason
@@ -199,7 +200,7 @@ Users asked to keep control over settings, but still want data-driven recommenda
 
 ## Provenance
 
-- Stream Sort design discussion in this session (`TTL objective, stale handling, recommendation scope, and jitter policy`).
+- Operator requirements review on 2026-08-24: TTL objective, health-state ownership, recommendation scope, and jitter policy.
 
 # ADR-007: Provider-owned stale state and atomic scheduled analysis
 
@@ -226,3 +227,123 @@ Accepted; supersedes the `Stream.is_stale` persistence portion of ADR-005.
 - Stream Sort cannot guarantee that Dispatcharr playback skips a confirmed-dead stream without a compatible core feature.
 - Scheduled scans remain safe when multiple uWSGI workers are running and when settings change between scans.
 - Recommendation confidence remains low until enough history and directional transition samples exist.
+
+# ADR-008: Define durable health telemetry and scheduled-scan operating policy
+
+## Status
+
+Accepted. Retention, minimum evidence, and recommendation thresholds are provisional starting values that must be reviewed against collected data.
+
+## Date
+
+2026-08-24
+
+## Decision
+
+### Observation model
+
+- A completed health observation is one stream's terminal `alive` or `dead` result from a completed analysis scan after the initial attempt and up to three immediate retry passes.
+- The initial attempt and retries are not separate health observations. They must not inflate alive/dead counts, transition counts, or dead percentages.
+- `unknown`, skipped, capacity-deferred, and incomplete individual probe results are excluded from alive/dead percentages and stream-removal eligibility. Completed probes from a stopped scan are retained. A dead result whose configured retry sequence was interrupted is stored as provisional retry-pending evidence and remains excluded until confirmation completes.
+- Retry behavior is retained as separate reliability telemetry. Record whether the initial attempt failed, the number of retries needed to recover, the failure categories encountered, the terminal result, and whether all retries were exhausted.
+- Reports must expose how often a stream needs retries before becoming alive. Repeated retry-assisted recovery is a reliability warning even when terminal health is alive, but it does not automatically change sorting or removal eligibility until collected data supports a scoring rule.
+
+### Retention and aggregation
+
+- Retain detailed observations and retry telemetry for 90 days.
+- Retain daily aggregate health, transition, retry, concentration, and scheduling summaries for 365 days.
+- Review storage volume and analytical value after operational use; either retention period may be reduced or extended when evidence supports it.
+
+### Problematic-stream classification
+
+- A stream may be recommended for removal only after at least 20 completed health observations spanning at least seven days, with more than 75 percent of those completed observations terminally dead.
+- The seven-day span is intentionally conservative and provisional. Early reports may identify watch-list candidates, but they must not present them as removal-ready.
+- The threshold supersedes ADR-007's initial minimum of four retained checks.
+- Retry dependence is reported alongside terminal dead percentage so future analysis can determine whether chronically retry-dependent streams need a separate reliability threshold.
+
+### Time and reporting
+
+- Store timestamps in UTC.
+- Display and analyze operator-facing time-of-day patterns in `America/New_York` unless the UI later provides an explicit reporting-timezone setting.
+- Identify report entries using stable stream ID, channel name, and source name. URLs, credentials, tokens, and sensitive query parameters must be omitted or redacted.
+
+### Scheduled operation
+
+- The initial schedule is hourly at minute zero.
+- Scheduled scans use one check at a time; the manual parallel-analysis setting does not increase scheduled concurrency unless the user explicitly enables scheduled parallel checks.
+- Sorting runs after each completed scheduled analysis by default.
+- Every scheduled run loads the current UI settings and channel filters at run start rather than retaining a stale settings snapshot from when the schedule was applied.
+- If an earlier analysis or sort job is still running, skip the newly due run. Do not queue overlapping runs.
+- Record and report every skipped schedule occurrence. A skipped hourly run is a tuning signal that TTLs, jitter, provider capacity, or selected scope may need adjustment.
+- Media-analysis and throughput TTLs begin with stable per-stream jitter of up to 30 percent in either direction. Dead TTL remains exact and begins at one hour.
+
+### TTL objective
+
+- Prefer the longest evidence-supported TTLs that reduce provider checks without hiding meaningful health transitions.
+- TTL recommendations remain read-only. Operators review and apply settings through the UI.
+- Initial spreading is stream-level. Provider-aware spreading remains deferred until telemetry shows sustained account-specific pressure.
+
+## Reason
+
+Terminal scan outcomes are the appropriate unit for health analysis because immediate retries are intended to absorb transient network, authentication, and probe failures. Counting retries as separate dead observations would exaggerate failure rates, while discarding retry behavior entirely would hide streams that are technically alive but repeatedly unreliable.
+
+Finite detailed retention controls storage growth, and longer daily rollups preserve enough history to study recurring health patterns and tune TTLs. Skipping overlapping schedules prevents a backlog from increasing provider pressure; the skip itself supplies evidence that scan duration and TTL concentration need adjustment.
+
+## Rejected alternatives
+
+- Count each retry as an independent health result: rejected because retries are recovery attempts within one scan.
+- Ignore retry-assisted recovery: rejected because persistent retry dependence may reveal unreliable streams.
+- Queue overlapping scheduled scans: rejected because queued work defeats the goal of fewer provider checks.
+- Retain detailed history indefinitely: rejected because the analytical benefit is unproven and storage would grow without a bound.
+- Apply TTL recommendations automatically: rejected because settings remain operator-controlled.
+- Add provider-aware jitter immediately: deferred until stream-level evidence demonstrates that account concentration remains a problem.
+
+## Consequences
+
+- Health reports need separate terminal-health and retry-reliability sections.
+- Daily rollups must preserve enough information to analyze dead ratios, transitions, retry dependence, time-of-day concentration, scheduled skips, and TTL expiry concentration after detailed rows expire.
+- The initial 12-hour review is exploratory and cannot satisfy the seven-day removal threshold.
+- Future threshold changes must cite collected evidence and supersede this ADR rather than relying on conversation history.
+
+## Provenance
+
+- Operator monitoring observations and approved policy review completed on 2026-08-24.
+- Builds on ADR-005, ADR-006, and ADR-007; supersedes only ADR-007's four-check problematic-stream minimum.
+
+---
+
+# ADR-009: Serialize every analysis entry point and cancel cooperatively
+
+## Status
+
+Accepted
+
+## Date
+
+2026-08-24
+
+## Decision
+
+Preserve the existing viewer-aware provider reservation logic and established manual parallel-analysis behavior. Every analysis entry point, including direct management-shell calls, must acquire one shared analyzer-level execution lease in addition to the UI and scheduler job lock.
+
+The UI stop action is cooperative and checkpoints completed work. It stops launching new probes, lets already-running probes finish or time out, releases their exact reservations through the normal capacity-manager path, saves every completed media and throughput result, and prevents post-analysis sorting from starting. It cancels only the active job and does not disable the recurring schedule.
+
+A completed dead result receives the configured dead TTL only after its configured immediate retry sequence completes. If stopping interrupts that sequence, the dead result is saved as retry-pending with an effective dead TTL of zero and is immediately due on the next scan. Retry-pending dead evidence is provisional and excluded from terminal health percentages until confirmation completes.
+
+Stream Sort must never clear Dispatcharr aggregate provider counters or reclaim capacity that may belong to a Dispatcharr viewer. It may release only reservations attributable to the active Stream Sort execution.
+
+## Reason
+
+The zero-capacity and deferred scan was caused by two Stream Sort analyses overlapping after a direct management-shell scan bypassed the UI and scheduler lock. The first scan legitimately held provider reservations, so the second scan saw those profiles as unavailable. This was not a regression in the provider-capacity calculation.
+
+## Consequences
+
+- Direct, manual, and scheduled analysis calls share one execution boundary.
+- A competing call is rejected rather than probing or altering provider capacity.
+- Cancellation may take up to the active probe timeout because in-flight probes are drained safely rather than killed.
+- Once completed results begin committing, a late stop request reports that the scan is completing instead of claiming cancellation.
+
+## Provenance
+
+- Live scan and provider-counter investigation completed on 2026-08-24.
+- Builds on ADR-003 and ADR-008 without changing their capacity, retry, scheduling, or telemetry decisions.

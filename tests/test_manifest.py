@@ -13,6 +13,7 @@ def test_plugin_manifest_is_valid_and_matches_version():
     assert {a["id"] for a in manifest["actions"]} == {
         "analyze_streams",
         "check_analysis_status",
+        "stop_analysis",
         "apply_schedule",
         "schedule_status",
             "remove_schedule",
@@ -40,6 +41,8 @@ def test_plugin_manifest_is_valid_and_matches_version():
     assert "media_bitrate_relative_tolerance_percent" in field_ids
     assert "media_bitrate_absolute_tolerance_kbps" in field_ids
     assert "analysis_ttl_jitter_percent" in field_ids
+    jitter_field = next(field for field in manifest["fields"] if field["id"] == "analysis_ttl_jitter_percent")
+    assert jitter_field["default"] == 30
     assert "playback_health_reuse" in field_ids
     assert "playback_health_clean_min_seconds" in field_ids
     assert "content_validation_ttl_hours" in field_ids

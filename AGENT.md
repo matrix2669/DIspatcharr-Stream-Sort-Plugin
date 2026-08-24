@@ -1,5 +1,16 @@
 # AGENT.md
 
+## Workspace Standards Reconciliation Gate
+
+Before any substantive work, locate the maintained local `matrix2669/workspace` checkout and run `<workspace>/scripts/reconcile-standards --check .` from this repository root. The workspace `AI-INSTRUCTIONS.md`, `AGENT-STANDARD.md`, and Git history must be available.
+
+If `WORKSPACE-STANDARDS.yaml` is missing, pending, or stale, stop project work and run `<workspace>/scripts/reconcile-standards --diff .`. Review the standards change against this complete `AGENT.md`, `DECISIONS.md`, code/configuration contracts, dependencies, `BRANCHES.md`, `RELEASE.md`, upstream requirements when applicable, and related projects.
+
+A contradiction blocks work. Ask focused follow-up questions to establish whether the changed standard, proposed work, new answer, or older accepted decision is authoritative; never choose silently. Record project-decision supersessions in `DECISIONS.md` and realign every affected artifact. Only after no contradiction remains, run `<workspace>/scripts/reconcile-standards --apply --confirm-reviewed-no-conflicts .`.
+
+Missing workspace standards or Git history is a hard block. Standards exceptions require explicit user authorization and must be stated in a dedicated section of this file with exact scope, rationale, authority, approval date, and review/removal trigger; `DECISIONS.md` cannot waive workspace standards.
+
+
 ## Purpose
 
 This repository owns the Dispatcharr Stream Sort plugin. The plugin analyzes streams already assigned to Dispatcharr channels, records runtime reliability, scores viable alternatives, and changes only `ChannelStream.order` when sorting is explicitly requested.
@@ -10,6 +21,7 @@ This repository owns the Dispatcharr Stream Sort plugin. The plugin analyzes str
 - `stream_sorter/incremental.py` decides which health, content, metadata, and throughput components require refresh and schedules work fairly across M3U accounts.
 - `stream_sorter/analyzer.py` performs reachability, FFprobe metadata, and FFmpeg content checks.
 - `stream_sorter/capacity.py` reserves Dispatcharr connection-pool slots across active M3U profiles and resolves the selected profile's rewritten live URL.
+- `stream_sorter/execution_control.py` serializes every analysis entry point and coordinates cooperative cancellation across plugin workers and direct management-shell calls.
 - `stream_sorter/reliability.py` stores URL-attributed playback evidence and produces conservative, decayed reliability scores.
 - `stream_sorter/scoring.py` and `stream_sorter/sorter.py` calculate ordering and apply only the selected channel scope.
 - `stream_sorter/throughput.py` measures delivery capacity and maintains compatibility with the legacy throughput cache.
@@ -22,6 +34,7 @@ Runtime state belongs under `/data`:
 - `dispatcharr_stream_sort_status.json` — background analysis status;
 - `dispatcharr_stream_sort_report.json` — dry-run/apply report;
 - `dispatcharr_stream_sort_probe.lock` — cross-worker analysis lock.
+- `dispatcharr_stream_sort_analysis_execution.lock` and companion control files — analyzer-level execution lease and cooperative cancellation state.
 
 ## Non-Negotiable Rules
 
