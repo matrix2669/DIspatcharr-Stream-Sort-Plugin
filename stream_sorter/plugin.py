@@ -8,6 +8,7 @@ import tempfile
 import threading
 import uuid
 from datetime import datetime, timezone
+from typing import Mapping
 
 try:
     import fcntl
@@ -15,7 +16,7 @@ except ImportError:  # pragma: no cover - Dispatcharr runs on Linux
     fcntl = None
 
 from .analyzer import ANALYSIS_CACHE_PATH, probe_assigned_streams
-from .incremental import analyze_assigned_streams
+from .incremental import ANALYSIS_HEALTH_REPORT_PATH, analyze_assigned_streams
 from .reliability import RELIABILITY_PATH, record_runtime_event
 from .sorter import REPORT_PATH, resolve_channel_scope, sort_channels
 from .throughput import DEFAULT_CACHE_PATH
@@ -23,9 +24,15 @@ from .throughput import DEFAULT_CACHE_PATH
 
 PROBE_LOCK_PATH = "/data/dispatcharr_stream_sort_probe.lock"
 STATUS_PATH = "/data/dispatcharr_stream_sort_status.json"
+TTL_RECOMMENDATION_PATH = "/data/dispatcharr_stream_sort_ttl_recommendations.json"
+SCHEDULE_STATE_PATH = "/data/dispatcharr_stream_sort_schedule_state.json"
 _FALLBACK_JOB_LOCK = threading.Lock()
 M3U_SOURCE_SCORE_PREFIX = "m3u_source_score_"
 LOG_PREFIX = "[Stream Sort]"
+SCHEDULER_POLL_SECONDS = 60
+SCHEDULER_THREAD_NAME = "dispatcharr-stream-sort-scheduler"
+
+_SCHEDULER_THREAD = None
 
 
 def _load_manifest() -> dict:
@@ -50,6 +57,188 @@ LOGGER = _StreamSortLogger(logging.getLogger("plugins.stream_sorter"), {})
 
 def _utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def _safe_bool(value, default: bool = False) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"1", "true", "yes", "on"}:
+            return True
+        if normalized in {"0", "false", "no", "off"}:
+            return False
+    if isinstance(value, (int, float)):
+        return bool(value)
+    return bool(value)
+
+
+def _parse_cron_field(expression: str, *, minimum: int, maximum: int) -> set[int]:
+    source = str(expression).strip()
+    if source == "" or source == "*":
+        return set(range(minimum, maximum + 1))
+    if source == "?":
+        return set(range(minimum, maximum + 1))
+
+    results = set()
+    for part in source.split(","):
+        token = part.strip()
+        if not token:
+            continue
+        if token == "*":
+            results.update(range(minimum, maximum + 1))
+            continue
+
+        if token.startswith("*/"):
+            try:
+                step = int(token[2:])
+            except ValueError as exc:
+                raise ValueError(f"Invalid step value: {token}") from exc
+            if step <= 0:
+                raise ValueError(f"Cron step must be positive: {token}")
+            results.update(range(minimum, maximum + 1, step))
+            continue
+
+        if "/" in token:
+            base, step_text = token.split("/", 1)
+            try:
+                step = int(step_text)
+            except ValueError as exc:
+                raise ValueError(f"Invalid step value: {token}") from exc
+            if step <= 0:
+                raise ValueError(f"Cron step must be positive: {token}")
+            range_start = minimum
+            range_end = maximum
+            if base != "*":
+                if "-" not in base:
+                    raise ValueError(f"Invalid stepped field: {token}")
+                start_text, end_text = base.split("-", 1)
+                try:
+                    range_start = int(start_text.strip())
+                    range_end = int(end_text.strip())
+                except ValueError as exc:
+                    raise ValueError(f"Invalid stepped range: {token}") from exc
+            results.update(range(range_start, range_end + 1, step))
+            continue
+
+        if "-" in token:
+            start_text, end_text = token.split("-", 1)
+            try:
+                start = int(start_text.strip())
+                end = int(end_text.strip())
+            except ValueError as exc:
+                raise ValueError(f"Invalid range field: {token}") from exc
+            if start > end:
+                raise ValueError(f"Invalid range order: {token}")
+            results.update(range(start, end + 1))
+            continue
+
+        try:
+            value = int(token)
+        except ValueError as exc:
+            raise ValueError(f"Invalid cron field: {token}") from exc
+        results.add(value)
+
+    normalized = set()
+    for value in results:
+        if value < minimum or value > maximum:
+            raise ValueError(f"Cron field value out of range: {value}")
+        normalized.add(value)
+    if not normalized:
+        raise ValueError("Cron field is empty")
+    return normalized
+
+
+def _parse_cron_expression(expression: str) -> tuple[set[int], set[int], set[int], set[int], set[int]]:
+    parts = str(expression or "").strip().split()
+    if len(parts) != 5:
+        raise ValueError("Cron expression must have 5 fields")
+    minute_part, hour_part, dom_part, month_part, dow_part = parts
+    minutes = _parse_cron_field(minute_part, minimum=0, maximum=59)
+    hours = _parse_cron_field(hour_part, minimum=0, maximum=23)
+    days_of_month = _parse_cron_field(dom_part, minimum=1, maximum=31)
+    months = _parse_cron_field(month_part, minimum=1, maximum=12)
+    days_of_week = _parse_cron_field(dow_part, minimum=0, maximum=6)
+    normalized_dow = set()
+    for value in days_of_week:
+        normalized_dow.add(0 if value == 7 else value)
+    return minutes, hours, days_of_month, months, normalized_dow
+
+
+def _cron_matches(expression: str, when: datetime) -> bool:
+    if when.tzinfo is None:
+        when = when.replace(tzinfo=timezone.utc)
+    when = when.astimezone(timezone.utc)
+    minutes, hours, days_of_month, months, days_of_week = _parse_cron_expression(expression)
+    day_of_week = when.isoweekday() % 7
+    return (
+        when.minute in minutes
+        and when.hour in hours
+        and when.day in days_of_month
+        and when.month in months
+        and day_of_week in days_of_week
+    )
+
+
+def _is_scheduler_process() -> bool:
+    try:
+        from dispatcharr.db.process_label import get_process_role
+
+        return str(get_process_role()) == "uwsgi"
+    except Exception:
+        return True
+
+
+def _load_schedule_state() -> dict:
+    raw = _load_json(
+        SCHEDULE_STATE_PATH,
+        {
+            "version": 1,
+            "enabled": False,
+            "cron": "",
+            "apply_sort_after_analysis": True,
+            "allow_parallel_checks": False,
+            "settings": {},
+            "last_scheduled_minute": None,
+            "last_run_at": None,
+            "last_run_status": "idle",
+            "last_run_message": "",
+            "last_job_id": None,
+        },
+    )
+    return {
+        "version": 1,
+        "enabled": _safe_bool(raw.get("enabled"), False),
+        "cron": str(raw.get("cron") or "").strip(),
+        "apply_sort_after_analysis": _safe_bool(raw.get("apply_sort_after_analysis"), True),
+        "allow_parallel_checks": _safe_bool(raw.get("allow_parallel_checks"), False),
+        "settings": raw.get("settings") if isinstance(raw.get("settings"), dict) else {},
+        "last_scheduled_minute": str(raw.get("last_scheduled_minute") or "").strip() or None,
+        "last_run_at": str(raw.get("last_run_at") or "").strip() or None,
+        "last_run_status": str(raw.get("last_run_status") or "idle"),
+        "last_run_message": str(raw.get("last_run_message") or ""),
+        "last_job_id": raw.get("last_job_id"),
+    }
+
+
+def _save_schedule_state(value: dict) -> None:
+    payload = {
+        "version": 1,
+        "enabled": _safe_bool(value.get("enabled"), False),
+        "cron": str(value.get("cron") or "").strip(),
+        "apply_sort_after_analysis": _safe_bool(value.get("apply_sort_after_analysis"), True),
+        "allow_parallel_checks": _safe_bool(value.get("allow_parallel_checks"), False),
+        "settings": value.get("settings") if isinstance(value.get("settings"), dict) else {},
+        "last_scheduled_minute": value.get("last_scheduled_minute"),
+        "last_run_at": value.get("last_run_at"),
+        "last_run_status": str(value.get("last_run_status") or "idle"),
+        "last_run_message": str(value.get("last_run_message") or ""),
+        "last_job_id": value.get("last_job_id"),
+        "updated_at": _utc_now_iso(),
+    }
+    _save_json(SCHEDULE_STATE_PATH, payload)
 
 
 def _configured_parallel_tests(settings: dict) -> int:
@@ -264,6 +453,7 @@ def _analysis_status() -> dict:
         message = f"Stream Sort analysis is running: {phase}.{progress}{worker_text}"
     elif job_status == "completed":
         result = value.get("result") or {}
+        health_report_path = result.get("analysis_health_report_path")
         message = (
             f"Last Stream Sort analysis completed: {result.get('streams_analyzed', 0)} streams; "
             f"{result.get('media_checked', 0)} media checks; "
@@ -271,6 +461,8 @@ def _analysis_status() -> dict:
             f"{result.get('capacity_deferred', 0)} capacity-deferred checks; "
             f"{result.get('playback_health_refreshed', 0)} playback reachability reuses."
         )
+        if health_report_path:
+            message += f" Report: {health_report_path}."
     elif job_status == "failed":
         message = f"Last Stream Sort analysis failed: {value.get('error') or 'unknown error'}."
     else:
@@ -297,6 +489,406 @@ def _notify(message: str) -> None:
         )
     except Exception:
         pass
+
+
+def _safe_float(value, default: float) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _load_json(path: str, default: dict) -> dict:
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            value = json.load(handle)
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return default
+    return value if isinstance(value, dict) else default
+
+
+def _save_json(path: str, value: dict) -> None:
+    directory = os.path.dirname(path) or "."
+    os.makedirs(directory, exist_ok=True)
+    fd, temporary_path = tempfile.mkstemp(
+        prefix=".dispatcharr-stream-sort-recommendation-",
+        suffix=".json",
+        dir=directory,
+    )
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(value, handle, indent=2, sort_keys=True)
+            handle.write("\n")
+        os.replace(temporary_path, path)
+    except Exception:
+        try:
+            os.unlink(temporary_path)
+        except OSError:
+            pass
+        raise
+
+
+def _clamp_float(value: float | None, minimum: float, maximum: float) -> float | None:
+    if value is None:
+        return None
+    return max(minimum, min(maximum, value))
+
+
+def _format_hours(value: float | None) -> str:
+    return "n/a" if value is None else str(value)
+
+
+def _recommend_ttls(settings: dict, *, report: dict) -> dict:
+    observations = report.get("observations") if isinstance(report, Mapping) else None
+    if not isinstance(observations, Mapping):
+        observations = {}
+    check_intervals = observations.get("check_interval_hours") if isinstance(observations.get("check_interval_hours"), Mapping) else {}
+    status_intervals = observations.get("status_change_interval_hours") if isinstance(observations.get("status_change_interval_hours"), Mapping) else {}
+    status_patterns = report.get("status_patterns") if isinstance(report.get("status_patterns"), Mapping) else {}
+    hourly = status_patterns.get("hourly_dead_ratio") if isinstance(status_patterns.get("hourly_dead_ratio"), list) else []
+    reasons = report.get("reasons") if isinstance(report.get("reasons"), Mapping) else {}
+
+    health_current = _safe_float(settings.get("health_content_ttl_hours"), 24.0)
+    dead_current = _safe_float(settings.get("dead_content_ttl_hours"), 1.0)
+    jitter_current = _safe_float(settings.get("analysis_ttl_jitter_percent"), 0.0)
+
+    selected_streams = int(report.get("selected_streams") or 0)
+    history_rows = int(observations.get("history_rows") or 0)
+    dead_ratio = float(observations.get("dead_check_ratio") or 0.0)
+    status_change_ratio = float(observations.get("checks_per_status_change_ratio") or 0.0)
+
+    max_dead_ratio_by_hour = max((
+        float(row.get("dead_ratio")) for row in hourly
+        if isinstance(row, Mapping)
+        and isinstance(row.get("dead_ratio"), (int, float))
+    ), default=0.0)
+
+    health_base = check_intervals.get("p90")
+    if health_base is None:
+        health_base = check_intervals.get("p50")
+    suggested_health = _clamp_float(_safe_float(health_base, None), 0.5, 240.0)
+    if suggested_health is not None:
+        suggested_health *= 1.25
+        suggested_health = _clamp_float(suggested_health, 0.5, 240.0)
+
+    dead_base = status_intervals.get("p50")
+    if dead_base is None:
+        dead_base = status_intervals.get("p90")
+    suggested_dead = _clamp_float(_safe_float(dead_base, None), 0.25, 24.0)
+    if suggested_dead is not None:
+        suggested_dead *= 1.2
+        suggested_dead = _clamp_float(suggested_dead, 0.25, 24.0)
+
+    if dead_ratio >= 0.30 and suggested_dead is not None:
+        suggested_dead = _clamp_float(min(suggested_dead, dead_current * 0.6), 0.25, 24.0)
+
+    if selected_streams >= 75 or status_change_ratio >= 0.20:
+        suggested_jitter = 15.0
+    elif max_dead_ratio_by_hour >= 0.40:
+        suggested_jitter = 20.0
+    else:
+        suggested_jitter = 0.0
+
+    if max_dead_ratio_by_hour >= 0.25:
+        suggested_jitter = max(suggested_jitter, 15.0)
+    if status_change_ratio < 0.10 and history_rows >= 50:
+        suggested_jitter = min(25.0, max(suggested_jitter, 18.0))
+
+    notes = []
+    if history_rows < 20:
+        notes.append("History is sparse; treat recommendations as provisional until at least 20 health rows are collected.")
+    if selected_streams == 0:
+        notes.append("No streams were included in the current report; recommendations are placeholders.")
+    if dead_ratio >= 0.25:
+        notes.append("Higher dead-check ratio suggests keeping dead TTL shorter for faster recovery on unstable URLs.")
+    if status_change_ratio >= 0.20:
+        notes.append("Frequent status transitions suggest moderate jitter to avoid synchronized rechecks.")
+
+    confidence = "low"
+    if history_rows >= 120 and selected_streams >= 50:
+        confidence = "high"
+    elif history_rows >= 40:
+        confidence = "medium"
+
+    recommendations = {
+        "health_content_ttl_hours": suggested_health,
+        "dead_content_ttl_hours": suggested_dead,
+        "analysis_ttl_jitter_percent": suggested_jitter,
+    }
+
+    return {
+        "generated_at": _utc_now_iso(),
+        "health_report_path": ANALYSIS_HEALTH_REPORT_PATH,
+        "selected_streams": selected_streams,
+        "history_rows": history_rows,
+        "confidence": confidence,
+        "current_ttls": {
+            "health_content_ttl_hours": health_current,
+            "dead_content_ttl_hours": dead_current,
+            "analysis_ttl_jitter_percent": jitter_current,
+        },
+        "recommended_ttls": recommendations,
+        "observation_summary": {
+            "history_span_hours": observations.get("history_span_hours"),
+            "status_changes": observations.get("status_changes"),
+            "dead_checks": observations.get("dead_checks"),
+            "checks_per_status_change_ratio": status_change_ratio,
+            "dead_check_ratio": dead_ratio,
+            "status_change_interval_hours": status_intervals,
+            "check_interval_hours": check_intervals,
+            "media_reasons": reasons.get("media_due") or {},
+            "max_dead_ratio_by_hour": round(max_dead_ratio_by_hour, 4),
+        },
+        "recommendation_notes": notes,
+        "recommendation_file": TTL_RECOMMENDATION_PATH,
+    }
+
+
+def _run_ttl_recommendation_action(settings: dict) -> dict:
+    report = _load_json(ANALYSIS_HEALTH_REPORT_PATH, {})
+    if not report:
+        return {
+            "status": "error",
+            "message": (
+                "No analysis health report found. Run Analyze Streams first so"
+                f" it writes {ANALYSIS_HEALTH_REPORT_PATH}."
+            ),
+        }
+
+    result = _recommend_ttls(settings, report=report)
+    _save_json(TTL_RECOMMENDATION_PATH, result)
+
+    current = result["current_ttls"]
+    recommended = result["recommended_ttls"]
+    message = (
+        f"TTL recommendation complete. Health TTL: {_format_hours(current['health_content_ttl_hours'])}h"
+        f" -> {_format_hours(recommended['health_content_ttl_hours'])}h; Dead TTL: "
+        f"{_format_hours(current['dead_content_ttl_hours'])}h -> {_format_hours(recommended['dead_content_ttl_hours'])}h;"
+        f" suggested TTL jitter: {recommended['analysis_ttl_jitter_percent']}%."
+    )
+
+    return {
+        "status": "ok",
+        "message": message,
+        "recommendation_path": TTL_RECOMMENDATION_PATH,
+        "result": result,
+    }
+
+
+def _scheduled_settings(settings: dict, *, allow_parallel_checks: bool) -> dict:
+    scheduled = dict(settings or {})
+    scheduled.pop("stream_sort_schedule_cron", None)
+    scheduled.pop("stream_sort_apply_sort_after_scheduled_scan", None)
+    scheduled.pop("stream_sort_allow_parallel_checks_on_scheduled_scan", None)
+    if not allow_parallel_checks:
+        scheduled["analysis_workers"] = 1
+    return scheduled
+
+
+def _apply_schedule_action(settings: dict) -> dict:
+    state = _load_schedule_state()
+    cron_expr = str(settings.get("stream_sort_schedule_cron") or "").strip()
+    state["cron"] = cron_expr
+    state["apply_sort_after_analysis"] = _safe_bool(
+        settings.get("stream_sort_apply_sort_after_scheduled_scan"), True
+    )
+    state["allow_parallel_checks"] = _safe_bool(
+        settings.get("stream_sort_allow_parallel_checks_on_scheduled_scan"), False
+    )
+    state["settings"] = dict(settings or {})
+    state["settings"].pop("stream_sort_schedule_cron", None)
+    state["settings"].pop("stream_sort_apply_sort_after_scheduled_scan", None)
+    state["settings"].pop("stream_sort_allow_parallel_checks_on_scheduled_scan", None)
+    state["last_scheduled_minute"] = None
+
+    if cron_expr:
+        _parse_cron_expression(cron_expr)
+        state["enabled"] = True
+        status = "ok"
+        state["last_run_status"] = "enabled"
+        state["last_run_message"] = f"Stream Sort schedule enabled with cron '{cron_expr}'."
+        message = (
+            f"Saved stream schedule: cron='{cron_expr}', apply_sort="
+            f"{state['apply_sort_after_analysis']}, parallel_checks="
+            f"{state['allow_parallel_checks']}. First run will occur on the next matching minute."
+        )
+    else:
+        state["enabled"] = False
+        status = "ok"
+        state["last_run_status"] = "disabled"
+        state["last_run_message"] = "Stream Sort schedule disabled (empty cron)."
+        message = "Stream Sort schedule cleared; automatic scheduled analysis is disabled."
+
+    _save_schedule_state(state)
+    return {
+        "status": status,
+        "message": message,
+        "schedule_state": state,
+    }
+
+
+def _disable_schedule_action() -> dict:
+    state = _load_schedule_state()
+    state["enabled"] = False
+    state["last_run_status"] = "disabled"
+    state["last_run_message"] = "Stream Sort schedule disabled by user."
+    state["last_scheduled_minute"] = None
+    _save_schedule_state(state)
+    return {
+        "status": "ok",
+        "message": "Stream Sort scheduled analysis disabled.",
+        "schedule_state": state,
+    }
+
+
+def _schedule_status_action() -> dict:
+    state = _load_schedule_state()
+    message = (
+        f"Stream Sort schedule enabled={state['enabled']}; cron='{state['cron']}'; "
+        f"apply_sort_after_analysis={state['apply_sort_after_analysis']}; "
+        f"allow_parallel_checks={state['allow_parallel_checks']}; "
+        f"last_run_status={state['last_run_status']}; last_run='{state['last_run_at'] or 'never'}'; "
+        f"startup: checks run once per minute on UTC boundary to avoid duplicate immediate restarts."
+    )
+    return {
+        "status": "ok",
+        "message": message,
+        "schedule_state": state,
+    }
+
+
+def _run_scheduled_scan(state: dict, now: datetime) -> dict:
+    state_settings = state.get("settings") if isinstance(state.get("settings"), dict) else {}
+    scheduled_settings = _scheduled_settings(
+        state_settings,
+        allow_parallel_checks=_safe_bool(state.get("allow_parallel_checks"), False),
+    )
+    return _start_background_job(
+        scheduled_settings,
+        kind="analyze",
+        sort_after=bool(state.get("apply_sort_after_analysis", True)),
+    )
+
+
+def _check_schedule_tick(now: datetime | None = None) -> dict:
+    if now is None:
+        now = datetime.now(timezone.utc)
+    now = now.replace(second=0, microsecond=0, tzinfo=timezone.utc) if now.tzinfo is None else now.replace(
+        second=0,
+        microsecond=0,
+    )
+    state = _load_schedule_state()
+    if not state.get("enabled"):
+        return {
+            "status": "skipped",
+            "message": "scheduler disabled",
+            "state": state,
+        }
+    cron_expr = str(state.get("cron") or "").strip()
+    if not cron_expr:
+        state["enabled"] = False
+        state["last_run_status"] = "disabled"
+        state["last_run_message"] = "No cron configured; disabled."
+        _save_schedule_state(state)
+        return {
+            "status": "disabled",
+            "message": "No cron configured; scheduler disabled.",
+            "state": state,
+        }
+
+    try:
+        due = _cron_matches(cron_expr, now)
+    except ValueError as exc:
+        state["last_run_status"] = "error"
+        state["last_run_message"] = f"Invalid cron: {exc}"
+        _save_schedule_state(state)
+        return {
+            "status": "error",
+            "message": str(exc),
+            "state": state,
+        }
+
+    current_minute = now.strftime("%Y%m%d%H%M")
+    if not due:
+        return {
+            "status": "waiting",
+            "message": "not due yet",
+            "state": state,
+        }
+    if current_minute == str(state.get("last_scheduled_minute") or "").strip():
+        return {
+            "status": "skipped",
+            "message": "already checked this minute",
+            "state": state,
+        }
+
+    state["last_scheduled_minute"] = current_minute
+    state["last_run_at"] = _utc_now_iso()
+    result = _run_scheduled_scan(state, now=now)
+    job_id = result.get("job_id")
+    if job_id:
+        state["last_job_id"] = job_id
+    state["last_run_status"] = result.get("status") or "error"
+    state["last_run_message"] = result.get("message") or ""
+    _save_schedule_state(state)
+    return {
+        "status": result.get("status") or "error",
+        "message": result.get("message") or "scheduled run skipped",
+        "state": state,
+        "result": result,
+    }
+
+
+class _StreamSortScheduler:
+    def __init__(self):
+        self.stop_event = threading.Event()
+        self.thread: threading.Thread | None = None
+
+    def start(self):
+        if self.thread is not None:
+            return
+        if not _is_scheduler_process():
+            return
+        self.thread = threading.Thread(
+            target=self._loop,
+            name=SCHEDULER_THREAD_NAME,
+            daemon=True,
+        )
+        self.thread.start()
+
+    def stop(self):
+        self.stop_event.set()
+        thread = self.thread
+        if thread and thread.is_alive():
+            thread.join(timeout=1)
+
+    def _loop(self):
+        while not self.stop_event.is_set():
+            try:
+                _check_schedule_tick()
+            except Exception as exc:
+                LOGGER.exception("Stream Sort scheduler failed: %s", exc)
+                try:
+                    state = _load_schedule_state()
+                    state["last_run_status"] = "error"
+                    state["last_run_message"] = f"{type(exc).__name__}: {exc}"
+                    _save_schedule_state(state)
+                except Exception:
+                    pass
+            self.stop_event.wait(SCHEDULER_POLL_SECONDS)
+
+
+def _start_scheduler() -> None:
+    global _SCHEDULER_THREAD
+    if _SCHEDULER_THREAD is None:
+        _SCHEDULER_THREAD = _StreamSortScheduler()
+    _SCHEDULER_THREAD.start()
+
+
+def _stop_scheduler() -> None:
+    if _SCHEDULER_THREAD is None:
+        return
+    _SCHEDULER_THREAD.stop()
 
 
 def _background_analyze_job(settings: dict, lock_handle, *, sort_after: bool, job_id: str) -> None:
@@ -545,6 +1137,7 @@ class Plugin:
                 self.fields = instance_fields
         else:
             self.fields = instance_fields
+        _start_scheduler()
 
     def run(self, action: str, params: dict, context: dict):
         settings = _settings_with_dynamic_source_scores(context.get("settings") or {})
@@ -562,9 +1155,20 @@ class Plugin:
                     logger=logger,
                     path=RELIABILITY_PATH,
                 )
+            if action == "apply_schedule":
+                return _apply_schedule_action(settings)
+
+            if action == "remove_schedule":
+                return _disable_schedule_action()
+
+            if action == "schedule_status":
+                return _schedule_status_action()
 
             if action == "check_analysis_status":
                 return _analysis_status()
+
+            if action == "recommend_ttls":
+                return _run_ttl_recommendation_action(settings)
 
             if action == "dry_run":
                 result = sort_channels(settings, apply=False, logger=logger)
@@ -607,3 +1211,6 @@ class Plugin:
         except Exception as exc:
             logger.exception("Action %s failed", action)
             return {"status": "error", "message": f"{type(exc).__name__}: {exc}"}
+
+    def stop(self, context=None):
+        _stop_scheduler()

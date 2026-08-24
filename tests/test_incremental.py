@@ -8,6 +8,9 @@ from types import SimpleNamespace
 from stream_sorter import analyzer, incremental
 from stream_sorter.incremental import (
     _fair_account_futures,
+    _build_health_report,
+    _media_stats_changed_for_throughput,
+    _is_significant_bitrate_change,
     _sync_runtime_playback_health,
     analyze_assigned_streams,
     health_check_reason,
@@ -206,6 +209,91 @@ def test_dead_skipped_and_unknown_health_are_rechecked_even_when_fresh():
         assert health_check_reason(entry, url_hash="abc", ttl_hours=24, now=now) == f"status_{status}"
 
 
+def test_dead_health_uses_dead_ttl_before_recheck():
+    now = _now()
+    entry = {
+        "status": "dead",
+        "url_hash": "abc",
+        "health_checked_at": (now - timedelta(minutes=30)).isoformat(),
+    }
+    assert health_check_reason(entry, url_hash="abc", ttl_hours=24, dead_ttl_hours=1, now=now) == "status_dead_ttl"
+    expired = {"status": "dead", "url_hash": "abc", "health_checked_at": (now - timedelta(hours=2)).isoformat()}
+    assert health_check_reason(expired, url_hash="abc", ttl_hours=24, dead_ttl_hours=1, now=now) == "status_dead"
+
+
+def test_dead_ttl_does_not_use_jitter(monkeypatch):
+    now = _now()
+    entry = {
+        "status": "dead",
+        "url_hash": "abc",
+        "health_checked_at": (now - timedelta(minutes=30)).isoformat(),
+    }
+    monkeypatch.setattr(incremental, "_ttl_with_jitter", lambda *_args, **_kwargs: 0)
+    assert health_check_reason(
+        entry,
+        url_hash="abc",
+        ttl_hours=24,
+        dead_ttl_hours=1,
+        ttl_jitter_percent=99,
+        now=now,
+    ) == "status_dead_ttl"
+
+
+def test_ttl_jitter_can_stagger_next_health_check_for_alive_streams():
+    now = _now()
+    entry = {
+        "status": "alive",
+        "url_hash": "abc",
+        "health_checked_at": (now - timedelta(hours=1)).isoformat(),
+    }
+    unjittered = health_check_reason(entry, url_hash="abc", ttl_hours=1, now=now)
+    jittered = health_check_reason(entry, url_hash="abc", ttl_hours=1, ttl_jitter_percent=50, now=now)
+    assert unjittered == "ttl_expired"
+    assert jittered in {"ttl_expired", None}
+
+
+def test_health_report_includes_interval_guidance_from_history():
+    now = _now()
+    stream_one = {
+        "id": 1,
+        "name": "Stream 1",
+    }
+    stream_two = {
+        "id": 2,
+        "name": "Stream 2",
+    }
+    cache = {
+        "1": {
+            "status": "alive",
+            "health_check_history": [
+                {"checked_at": (now - timedelta(hours=3)).isoformat(), "status": "alive", "reason": "ttl_expired"},
+                {"checked_at": (now - timedelta(hours=1)).isoformat(), "status": "dead", "reason": "media_ttl_expired"},
+                {"checked_at": now.isoformat(), "status": "alive", "reason": "media_ttl_expired"},
+            ],
+        },
+        "2": {
+            "status": "alive",
+            "health_check_history": [
+                {"checked_at": (now - timedelta(hours=4)).isoformat(), "status": "dead", "reason": "media_ttl_expired"},
+                {"checked_at": now.isoformat(), "status": "dead", "reason": "media_ttl_expired"},
+            ],
+        },
+    }
+    report = _build_health_report(
+        [stream_one, stream_two],
+        cache,
+        now=now,
+        media_reason_counts={"health_ttl_expired": 3},
+        throughput_reason_counts={"missing": 1},
+        channels_selected=2,
+    )
+    assert report["observations"]["history_rows"] == 5
+    assert report["observations"]["dead_checks"] == 3
+    assert report["observations"]["status_changes"] == 2
+    assert report["observations"]["check_interval_hours"]["p90"] is not None
+    assert report["ttl_tuning_guidance"]["suggested_health_ttl_hours"] is not None
+
+
 def test_url_change_invalidates_health_and_metadata():
     now = _now()
     entry = {
@@ -283,6 +371,41 @@ def test_older_dispatcharr_metadata_is_ignored():
     assert refreshed == 0
     assert changed_ids == set()
     assert cache["42"]["stats"]["resolution"] == "1280x720"
+
+
+def test_media_stats_bitrate_change_is_treated_as_significant_only_above_tolerance():
+    assert not _is_significant_bitrate_change(5000.0, 5600.0)
+    assert _is_significant_bitrate_change(5000.0, 7000.0)
+
+
+def test_media_stats_changed_for_throughput_uses_signature_and_bitrate_tolerance():
+    previous = {"resolution": "1920x1080", "source_fps": 60, "video_bitrate": 5000}
+    noisy_change = {"resolution": "1920x1080", "source_fps": 60, "video_bitrate": 5600}
+    clear_change = {"resolution": "1920x1080", "source_fps": 60, "video_bitrate": 7000}
+    fps_change = {"resolution": "1920x1080", "source_fps": 59.9, "video_bitrate": 5600}
+
+    assert not _media_stats_changed_for_throughput(previous, noisy_change)
+    assert _media_stats_changed_for_throughput(previous, clear_change)
+    assert _media_stats_changed_for_throughput(previous, fps_change)
+    assert not _media_stats_changed_for_throughput(previous, {})
+    assert _media_stats_changed_for_throughput({}, previous)
+
+
+def test_media_change_thresholds_are_configurable():
+    previous = {"resolution": "1920x1080", "source_fps": 60, "video_bitrate": 5000}
+    minor_change = {"resolution": "1920x1080", "source_fps": 60, "video_bitrate": 5600}
+    assert not _media_stats_changed_for_throughput(
+        previous,
+        minor_change,
+        media_bitrate_relative_tolerance=0.05,
+        media_bitrate_absolute_tolerance_kbps=1000.0,
+    )
+    assert _media_stats_changed_for_throughput(
+        previous,
+        minor_change,
+        media_bitrate_relative_tolerance=0.05,
+        media_bitrate_absolute_tolerance_kbps=100.0,
+    )
 
 
 def test_skipped_media_result_preserves_previous_metadata():

@@ -1,7 +1,11 @@
 from __future__ import annotations
 
 import collections
+import hashlib
+import json
+import os
 import time
+import tempfile
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from datetime import datetime, timedelta, timezone
 from typing import Any, Mapping
@@ -16,6 +20,12 @@ from .throughput import (
     load_cache as load_throughput_cache,
     probe_stream,
 )
+
+
+ANALYSIS_HEALTH_REPORT_PATH = "/data/dispatcharr_stream_sort_health_report.json"
+MEDIA_CHECK_HISTORY_LIMIT = 120
+MEDIA_BITRATE_RELATIVE_TOLERANCE = 0.30
+MEDIA_BITRATE_ABSOLUTE_TOLERANCE_KBPS = 500.0
 
 
 def _parse_datetime(value: Any) -> datetime | None:
@@ -42,12 +52,65 @@ def _age_hours(value: Any, now: datetime) -> float | None:
     return max(0.0, (now - parsed).total_seconds() / 3600.0)
 
 
+def _ttl_with_jitter(ttl_hours: float, *, url_hash: str, jitter_percent: float) -> float:
+    if ttl_hours <= 0 or jitter_percent <= 0:
+        return ttl_hours
+    jitter_ratio = jitter_percent / 100.0
+    digest = int(hashlib.md5(str(url_hash or "").encode("utf-8")).hexdigest()[:8], 16)
+    variance = (digest / float(0xFFFFFFFF)) * 2.0 - 1.0
+    adjusted = ttl_hours * (1.0 + (variance * jitter_ratio))
+    return max(0.0, adjusted)
+
+
+def _percentile(values: list[float], quantile: float) -> float | None:
+    if not values:
+        return None
+    normalized: list[float] = [float(value) for value in values]
+    normalized = [value for value in normalized if value is not None]
+    if not normalized:
+        return None
+    normalized.sort()
+    quantile = min(max(float(quantile), 0.0), 1.0)
+    if len(normalized) == 1:
+        return normalized[0]
+    index = (len(normalized) - 1) * quantile
+    lower = int(index)
+    upper = min(lower + 1, len(normalized) - 1)
+    if lower == upper:
+        return normalized[lower]
+    weight = index - lower
+    return normalized[lower] * (1.0 - weight) + normalized[upper] * weight
+
+
+def _round_if_present(value: float | None, digits: int) -> float | None:
+    return round(value, digits) if value is not None else None
+
+
+def _save_json(path: str, data: Mapping[str, Any]) -> None:
+    directory = os.path.dirname(path) or "."
+    os.makedirs(directory, exist_ok=True)
+    fd, temporary_path = tempfile.mkstemp(prefix=".stream-sort-report-", suffix=".json", dir=directory)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(data, handle, sort_keys=True, indent=2, default=str)
+            handle.write("\n")
+        os.replace(temporary_path, path)
+    except Exception:
+        try:
+            os.unlink(temporary_path)
+        except OSError:
+            pass
+        raise
+
+
 def health_check_reason(
     entry: Mapping[str, Any] | None,
     *,
     url_hash: str,
     ttl_hours: float,
+    dead_ttl_hours: float | None = None,
     content_ttl_hours: float | None = None,
+    ttl_jitter_percent: float = 0.0,
     now: datetime,
 ) -> str | None:
     if not entry:
@@ -56,6 +119,18 @@ def health_check_reason(
         return "url_changed"
     status = str(entry.get("status") or "unknown").strip().lower()
     if status != "alive":
+        if status == "dead" and dead_ttl_hours is not None:
+            checked_at = (
+                entry.get("health_checked_at")
+                or entry.get("playback_health_checked_at")
+                or entry.get("media_checked_at")
+                or entry.get("tested_at")
+            )
+            age = _age_hours(checked_at, now)
+            if age is None:
+                return "missing_timestamp"
+            if dead_ttl_hours > 0 and age < dead_ttl_hours:
+                return "status_dead_ttl"
         return f"status_{status or 'unknown'}"
     if ttl_hours <= 0:
         return "ttl_forced"
@@ -68,7 +143,8 @@ def health_check_reason(
     age = _age_hours(checked_at, now)
     if age is None:
         return "missing_timestamp"
-    if age >= ttl_hours:
+    effective_ttl_hours = _ttl_with_jitter(ttl_hours, url_hash=url_hash, jitter_percent=ttl_jitter_percent)
+    if age >= effective_ttl_hours:
         return "ttl_expired"
     if content_ttl_hours is not None:
         content_checked_at = entry.get("content_checked_at")
@@ -79,14 +155,32 @@ def health_check_reason(
         # it does not claim that black/frozen/silent checks were performed.
         if content_age is None:
             playback_age = _age_hours(entry.get("playback_health_checked_at"), now)
-            if playback_age is None or playback_age >= content_ttl_hours:
+            effective_content_ttl_hours = _ttl_with_jitter(
+                content_ttl_hours,
+                url_hash=url_hash,
+                jitter_percent=ttl_jitter_percent,
+            )
+            if playback_age is None or playback_age >= effective_content_ttl_hours:
                 return "content_missing"
-        elif content_ttl_hours <= 0 or content_age >= content_ttl_hours:
-            return "content_ttl_expired"
+        else:
+            effective_content_ttl_hours = _ttl_with_jitter(
+                content_ttl_hours,
+                url_hash=url_hash,
+                jitter_percent=ttl_jitter_percent,
+            )
+            if effective_content_ttl_hours <= 0 or content_age >= effective_content_ttl_hours:
+                return "content_ttl_expired"
     return None
 
 
-def metadata_check_reason(entry: Mapping[str, Any] | None, *, url_hash: str, ttl_hours: float, now: datetime) -> str | None:
+def metadata_check_reason(
+    entry: Mapping[str, Any] | None,
+    *,
+    url_hash: str,
+    ttl_hours: float,
+    ttl_jitter_percent: float = 0.0,
+    now: datetime,
+) -> str | None:
     if not entry:
         return "missing"
     if str(entry.get("url_hash") or "") != url_hash:
@@ -100,7 +194,8 @@ def metadata_check_reason(entry: Mapping[str, Any] | None, *, url_hash: str, ttl
     age = _age_hours(updated_at, now)
     if age is None:
         return "missing_timestamp"
-    if age >= ttl_hours:
+    effective_ttl_hours = _ttl_with_jitter(ttl_hours, url_hash=url_hash, jitter_percent=ttl_jitter_percent)
+    if age >= effective_ttl_hours:
         return "ttl_expired"
     return None
 
@@ -108,7 +203,14 @@ def metadata_check_reason(entry: Mapping[str, Any] | None, *, url_hash: str, ttl
 media_check_reason = health_check_reason
 
 
-def throughput_check_reason(entry: Mapping[str, Any] | None, *, url_hash: str, ttl_hours: float, now: datetime) -> str | None:
+def throughput_check_reason(
+    entry: Mapping[str, Any] | None,
+    *,
+    url_hash: str,
+    ttl_hours: float,
+    ttl_jitter_percent: float = 0.0,
+    now: datetime,
+) -> str | None:
     if not entry:
         return "missing"
     throughput = entry.get("throughput")
@@ -125,7 +227,8 @@ def throughput_check_reason(entry: Mapping[str, Any] | None, *, url_hash: str, t
     age = _age_hours(checked_at, now)
     if age is None:
         return "missing_timestamp"
-    if age >= ttl_hours:
+    effective_ttl_hours = _ttl_with_jitter(ttl_hours, url_hash=url_hash, jitter_percent=ttl_jitter_percent)
+    if age >= effective_ttl_hours:
         return "ttl_expired"
     return None
 
@@ -134,8 +237,60 @@ def _stats_signature(stats: Mapping[str, Any] | None) -> tuple[Any, ...]:
     stats = stats or {}
     width, height = parse_resolution(stats)
     fps = parse_fps(stats)
-    bitrate = stats.get("video_bitrate") or stats.get("video_bitrate_kbps")
-    return width, height, round(float(fps), 3) if fps is not None else None, bitrate
+    return width, height, round(float(fps), 3) if fps is not None else None
+
+
+def _extract_video_bitrate(stats: Mapping[str, Any] | None) -> float | None:
+    if not stats:
+        return None
+    raw = stats.get("video_bitrate")
+    if raw is None:
+        raw = stats.get("video_bitrate_kbps")
+    if raw is None:
+        return None
+    try:
+        bitrate = float(raw)
+    except (TypeError, ValueError):
+        return None
+    return bitrate if bitrate >= 0 else None
+
+
+def _is_significant_bitrate_change(
+    previous_bitrate: float | None,
+    new_bitrate: float | None,
+    *,
+    relative_tolerance: float | None = None,
+    absolute_tolerance_kbps: float | None = None,
+) -> bool:
+    if new_bitrate is None and previous_bitrate is None:
+        return False
+    if previous_bitrate is None or new_bitrate is None:
+        return True
+    relative = MEDIA_BITRATE_RELATIVE_TOLERANCE if relative_tolerance is None else max(0.0, relative_tolerance)
+    absolute = MEDIA_BITRATE_ABSOLUTE_TOLERANCE_KBPS if absolute_tolerance_kbps is None else max(0.0, absolute_tolerance_kbps)
+    tolerance = max(absolute, previous_bitrate * relative)
+    return abs(new_bitrate - previous_bitrate) > tolerance
+
+
+def _media_stats_changed_for_throughput(
+    previous_stats: Mapping[str, Any] | None,
+    new_stats: Mapping[str, Any] | None,
+    *,
+    media_bitrate_relative_tolerance: float = MEDIA_BITRATE_RELATIVE_TOLERANCE,
+    media_bitrate_absolute_tolerance_kbps: float = MEDIA_BITRATE_ABSOLUTE_TOLERANCE_KBPS,
+) -> bool:
+    if not previous_stats:
+        return bool(new_stats)
+    if not new_stats:
+        return False
+    if _stats_signature(previous_stats) != _stats_signature(new_stats):
+        return True
+    return _is_significant_bitrate_change(
+        _extract_video_bitrate(previous_stats),
+        _extract_video_bitrate(new_stats),
+        relative_tolerance=media_bitrate_relative_tolerance,
+        absolute_tolerance_kbps=media_bitrate_absolute_tolerance_kbps,
+    )
 
 
 def _status_counts(items, cache) -> collections.Counter[str]:
@@ -163,6 +318,193 @@ def _overall_health_text(counts) -> str:
 
 def _overall_throughput_text(counts) -> str:
     return f"healthy={counts.get('healthy', 0)} marginal={counts.get('marginal', 0)} insufficient={counts.get('insufficient', 0)} unknown={counts.get('unknown', 0)}"
+
+
+def _append_health_history(
+    entry: dict[str, Any],
+    *,
+    reason: str | None,
+    previous_status: str,
+    new_status: str,
+    tested_at: str,
+    result: Mapping[str, Any],
+) -> None:
+    history = list(entry.get("health_check_history") or [])
+    history.append(
+        {
+            "checked_at": tested_at,
+            "previous_status": previous_status,
+            "status": new_status,
+            "reason": reason or "unknown",
+            "error_type": str(result.get("error_type") or ""),
+            "error": str(result.get("error") or ""),
+            "source": str(result.get("health_source") or entry.get("health_source") or "stream_sort_analyzer"),
+        }
+    )
+    if len(history) > MEDIA_CHECK_HISTORY_LIMIT:
+        history = history[-MEDIA_CHECK_HISTORY_LIMIT:]
+    entry["health_check_history"] = history
+
+
+def _build_health_report(
+    items,
+    cache: Mapping[str, Any],
+    *,
+    now: datetime,
+    media_reason_counts: Mapping[str, int],
+    throughput_reason_counts: Mapping[str, int],
+    channels_selected: int,
+) -> dict[str, Any]:
+    summary: collections.Counter[str] = collections.Counter()
+    status_changes: dict[int, int] = {}
+    dead_counts: dict[int, int] = {}
+    last_reasons: dict[int, str] = {}
+    hourly_dead_checks: collections.Counter[int] = collections.Counter()
+    hourly_total_checks: collections.Counter[int] = collections.Counter()
+    all_checked_at: list[datetime] = []
+    check_intervals_hours: list[float] = []
+    status_change_intervals_hours: list[float] = []
+    total_changes = 0
+    total_dead_checks = 0
+    stream_reports = []
+
+    for item in items:
+        entry = cache.get(str(item["id"])) or {}
+        status = str(entry.get("status") or "unknown").lower()
+        summary[status] += 1
+
+        history = entry.get("health_check_history") or []
+        changes = 0
+        dead = 0
+        timeline: list[tuple[datetime, str]] = []
+        last_status = status
+        for index, row in enumerate(history):
+            row_status = str(row.get("status") or "").lower()
+            if index and row_status and row_status != str(history[index - 1].get("status") or "").lower():
+                changes += 1
+                total_changes += 1
+            if row_status == "dead":
+                dead += 1
+                total_dead_checks += 1
+            if row_status:
+                try:
+                    parsed = _parse_datetime(row.get("checked_at"))
+                except Exception:
+                    parsed = None
+                if parsed is not None:
+                    timeline.append((parsed, row_status))
+                    hourly_total_checks[parsed.hour] += 1
+                    if row_status == "dead":
+                        hourly_dead_checks[parsed.hour] += 1
+                    all_checked_at.append(parsed)
+        if history:
+            last_record = history[-1]
+            last_status = str(last_record.get("status") or "unknown").lower()
+            last_reasons[int(item["id"])] = str(last_record.get("reason") or "none")
+        if len(timeline) >= 2:
+            timeline.sort(key=lambda row: row[0])
+            for index in range(1, len(timeline)):
+                check_intervals_hours.append((timeline[index][0] - timeline[index - 1][0]).total_seconds() / 3600.0)
+                if timeline[index][1] != timeline[index - 1][1]:
+                    status_change_intervals_hours.append((timeline[index][0] - timeline[index - 1][0]).total_seconds() / 3600.0)
+
+        status_changes[int(item["id"])] = changes
+        dead_counts[int(item["id"])] = dead
+        stream_reports.append(
+            {
+                "stream_id": int(item["id"]),
+                "name": str(item.get("name") or ""),
+                "last_status": last_status,
+                "last_reason": last_reasons.get(int(item["id"]), "none"),
+                "history_len": len(history),
+                "status_changes": changes,
+                "dead_checks": dead,
+                "checks_checked_at": len(history) > 0 and _parse_datetime(history[-1].get("checked_at")) is not None,
+                "last_checked_at": history[-1].get("checked_at") if history else None,
+                "age_hours": _age_hours(history[-1].get("checked_at"), now) if history else None,
+            }
+        )
+
+    if all_checked_at:
+        all_checked_at.sort()
+        history_span_hours = (all_checked_at[-1] - all_checked_at[0]).total_seconds() / 3600.0
+    else:
+        history_span_hours = 0.0
+
+    check_interval_p50 = _percentile(check_intervals_hours, 0.5)
+    check_interval_p90 = _percentile(check_intervals_hours, 0.9)
+    status_change_interval_p50 = _percentile(status_change_intervals_hours, 0.5)
+    status_change_interval_p90 = _percentile(status_change_intervals_hours, 0.9)
+    total_history_rows = sum(len((cache.get(str(item["id"])) or {}).get("health_check_history") or []) for item in items)
+
+    hourly = []
+    for hour in range(24):
+        dead = hourly_dead_checks.get(hour, 0)
+        total = hourly_total_checks.get(hour, 0)
+        ratio = dead / total if total else 0.0
+        hourly.append(
+            {
+                "hour": hour,
+                "dead_checks": dead,
+                "total_checks": total,
+                "dead_ratio": round(ratio, 4),
+            }
+        )
+
+    unstable_top = sorted(
+        stream_reports,
+        key=lambda row: (row["dead_checks"], row["status_changes"], row["history_len"]),
+        reverse=True,
+    )[:20]
+
+    return {
+        "generated_at": now.isoformat(),
+        "selected_streams": len(items),
+        "channels_selected": channels_selected,
+        "status_counts": {status: count for status, count in summary.items()},
+        "observations": {
+            "history_rows": total_history_rows,
+            "history_span_hours": round(history_span_hours, 4),
+            "status_changes": total_changes,
+            "dead_checks": total_dead_checks,
+            "checks_per_status_change_ratio": round(
+                total_changes / max(1, total_history_rows),
+                4,
+            ),
+            "dead_check_ratio": round(total_dead_checks / max(1, total_history_rows), 4),
+            "check_interval_hours": {
+                "p50": _round_if_present(check_interval_p50, 4),
+                "p90": _round_if_present(check_interval_p90, 4),
+            },
+            "status_change_interval_hours": {
+                "p50": _round_if_present(status_change_interval_p50, 4),
+                "p90": _round_if_present(status_change_interval_p90, 4),
+            },
+        },
+        "reasons": {
+            "media_due": dict(media_reason_counts),
+            "throughput_due": dict(throughput_reason_counts),
+        },
+        "ttl_tuning_guidance": {
+            "suggested_health_ttl_hours": _round_if_present(check_interval_p90, 2),
+            "suggested_dead_ttl_hours": _round_if_present(status_change_interval_p50, 2),
+        },
+        "status_patterns": {
+            "unstable_streams": unstable_top,
+            "hourly_dead_ratio": hourly,
+        },
+        "stream_stats": {
+            "dead_change_counts": dead_counts,
+            "status_change_counts": status_changes,
+        },
+        "top_metrics": {
+            "max_status_changes": max(status_changes.values()) if status_changes else 0,
+            "max_dead_checks": max(dead_counts.values()) if dead_counts else 0,
+            "dead_dominant_streams": [
+                row["stream_id"] for row in unstable_top if row["dead_checks"] and row["dead_checks"] >= row["history_len"] / 2
+            ],
+        },
+    }
 
 
 def _account_key(item: Mapping[str, Any]) -> tuple[str, Any]:
@@ -405,10 +747,11 @@ def _sync_runtime_playback_health(
     return refreshed
 
 
-def _merge_media_result(item, previous, result) -> dict[str, Any]:
+def _merge_media_result(item, previous, result, *, analysis_reason: str | None = None) -> dict[str, Any]:
     merged = dict(previous or {})
     previous_throughput = merged.get("throughput")
     previous_stats = merged.get("stats")
+    previous_status = str(merged.get("status") or "unknown").lower()
     merged.update(dict(result))
     checked = result.get("tested_at") or analyzer._utc_now_iso()
     merged["health_checked_at"] = checked
@@ -440,6 +783,14 @@ def _merge_media_result(item, previous, result) -> dict[str, Any]:
         merged["throughput"] = dict(previous_throughput)
     else:
         merged.pop("throughput", None)
+    _append_health_history(
+        merged,
+        reason=analysis_reason,
+        previous_status=previous_status,
+        new_status=str(result.get("status") or "unknown").lower(),
+        tested_at=checked,
+        result=result,
+    )
     return merged
 
 
@@ -479,17 +830,35 @@ def _migrate_legacy_throughput(items, cache, *, ttl_hours: float) -> int:
     return migrated
 
 
-def _analysis_reason(entry: Mapping[str, Any] | None, *, url_hash: str, health_ttl_hours: float, content_ttl_hours: float, metadata_ttl_hours: float, now: datetime) -> str | None:
+def _analysis_reason(
+    entry: Mapping[str, Any] | None,
+    *,
+    url_hash: str,
+    health_ttl_hours: float,
+    content_ttl_hours: float,
+    metadata_ttl_hours: float,
+    dead_ttl_hours: float | None = None,
+    ttl_jitter_percent: float = 0.0,
+    now: datetime,
+) -> str | None:
     reason = health_check_reason(
         entry,
         url_hash=url_hash,
         ttl_hours=health_ttl_hours,
         content_ttl_hours=content_ttl_hours,
+        dead_ttl_hours=dead_ttl_hours,
+        ttl_jitter_percent=ttl_jitter_percent,
         now=now,
     )
     if reason:
         return f"health_{reason}"
-    reason = metadata_check_reason(entry, url_hash=url_hash, ttl_hours=metadata_ttl_hours, now=now)
+    reason = metadata_check_reason(
+        entry,
+        url_hash=url_hash,
+        ttl_hours=metadata_ttl_hours,
+        ttl_jitter_percent=ttl_jitter_percent,
+        now=now,
+    )
     if reason:
         return f"metadata_{reason}"
     return None
@@ -506,12 +875,25 @@ def analyze_assigned_streams(settings: Mapping[str, Any], *, logger, cache_path:
     max_streams = max(0, analyzer._as_int(settings.get("analysis_max_streams"), 0))
     metadata_ttl_hours = max(0.0, analyzer._as_float(settings.get("stream_data_ttl_hours"), 12.0))
     health_ttl_hours = max(0.0, analyzer._as_float(settings.get("health_content_ttl_hours"), 24.0))
+    dead_ttl_hours = max(0.0, analyzer._as_float(settings.get("dead_content_ttl_hours"), 1.0))
     content_ttl_hours = max(0.0, analyzer._as_float(settings.get("content_validation_ttl_hours"), 168.0))
+    media_bitrate_relative_tolerance = min(
+        1.0,
+        max(
+            0.0,
+            analyzer._as_float(settings.get("media_bitrate_relative_tolerance_percent"), 30.0) / 100.0,
+        ),
+    )
+    media_bitrate_absolute_tolerance_kbps = max(
+        0.0,
+        analyzer._as_float(settings.get("media_bitrate_absolute_tolerance_kbps"), 500.0),
+    )
     playback_health_reuse = analyzer._as_bool(settings.get("playback_health_reuse"), True)
     playback_health_min_seconds = max(60.0, analyzer._as_float(settings.get("playback_health_min_seconds"), 300.0))
     playback_health_clean_min_seconds = max(30.0, analyzer._as_float(settings.get("playback_health_clean_min_seconds"), 60.0))
     playback_health_ttl_hours = max(0.0, analyzer._as_float(settings.get("playback_health_ttl_hours"), 6.0))
     throughput_ttl_hours = max(0.0, analyzer._as_float(settings.get("healthy_throughput_ttl_hours"), 6.0))
+    analysis_ttl_jitter_percent = max(0.0, min(100.0, analyzer._as_float(settings.get("analysis_ttl_jitter_percent"), 0.0)))
     throughput_duration = max(1.0, analyzer._as_float(settings.get("probe_duration_seconds"), 8.0))
     throughput_timeout = max(throughput_duration + 2.0, analyzer._as_float(settings.get("probe_timeout_seconds"), 10.0))
     throughput_account_delay = max(0.0, analyzer._as_float(settings.get("probe_per_account_delay_seconds"), 1.0))
@@ -572,10 +954,14 @@ def analyze_assigned_streams(settings: Mapping[str, Any], *, logger, cache_path:
             health_ttl_hours=health_ttl_hours,
             content_ttl_hours=content_ttl_hours,
             metadata_ttl_hours=metadata_ttl_hours,
+            dead_ttl_hours=dead_ttl_hours,
+            ttl_jitter_percent=analysis_ttl_jitter_percent,
             now=now,
         )
         if reason:
             media_due.append((item, reason))
+
+    media_reason_counts = collections.Counter(reason for _, reason in media_due)
 
     media_due_ids = {int(item["id"]) for item, _ in media_due}
     initial_throughput_due = 0
@@ -588,6 +974,7 @@ def analyze_assigned_streams(settings: Mapping[str, Any], *, logger, cache_path:
                 entry,
                 url_hash=analyzer._stream_url_hash(str(item.get("url") or "")),
                 ttl_hours=throughput_ttl_hours,
+                ttl_jitter_percent=analysis_ttl_jitter_percent,
                 now=now,
             )
             if reason or int(item["id"]) in dispatcharr_metadata_changed_ids:
@@ -598,9 +985,9 @@ def analyze_assigned_streams(settings: Mapping[str, Any], *, logger, cache_path:
             initial_fully_cached += 1
 
     logger.info(
-        "[Analyze] Starting: streams=%d media_due=%d throughput_due=%d fully_cached=%d playback_health_refreshed=%d dispatcharr_metadata_refreshed=%d metadata_ttl=%.1fh health_ttl=%.1fh content_ttl=%.1fh healthy_throughput_ttl=%.1fh workers=%d",
+        "[Analyze] Starting: streams=%d media_due=%d throughput_due=%d fully_cached=%d playback_health_refreshed=%d dispatcharr_metadata_refreshed=%d metadata_ttl=%.1fh health_ttl=%.1fh dead_ttl=%.1fh content_ttl=%.1fh healthy_throughput_ttl=%.1fh ttl_jitter=%.1f%% workers=%d",
         total, len(media_due), initial_throughput_due, initial_fully_cached, playback_health_refreshed, dispatcharr_metadata_refreshed,
-        metadata_ttl_hours, health_ttl_hours, content_ttl_hours, throughput_ttl_hours, workers,
+        metadata_ttl_hours, health_ttl_hours, dead_ttl_hours, content_ttl_hours, throughput_ttl_hours, analysis_ttl_jitter_percent, workers,
     )
     if not items:
         return {
@@ -617,14 +1004,15 @@ def analyze_assigned_streams(settings: Mapping[str, Any], *, logger, cache_path:
             "status_counts": {},
             "throughput_status_counts": {},
             "cache_path": cache_path,
+            "analysis_health_report_path": ANALYSIS_HEALTH_REPORT_PATH,
         }
 
     capacity_manager = build_capacity_manager(items, logger=logger)
 
     media_results = {}
     media_capacity_deferred_ids = set()
-    old_signatures = {
-        int(item["id"]): _stats_signature((cache.get(str(item["id"])) or {}).get("stats"))
+    previous_media_stats = {
+        int(item["id"]): (cache.get(str(item["id"])) or {}).get("stats")
         for item, _ in media_due
     }
     reason_by_id = {int(item["id"]): reason for item, reason in media_due}
@@ -747,13 +1135,23 @@ def analyze_assigned_streams(settings: Mapping[str, Any], *, logger, cache_path:
             if sid not in media_results:
                 continue
             result = media_results[sid]
-            cache[str(sid)] = _merge_media_result(item, cache.get(str(sid)), result)
+            cache[str(sid)] = _merge_media_result(
+                item,
+                cache.get(str(sid)),
+                result,
+                analysis_reason=reason_by_id.get(sid),
+            )
             analyzer._persist_dispatcharr_result(sid, result, logger)
         analyzer.save_analysis_cache(cache, cache_path)
 
     media_changed_ids = {
         sid for sid, result in media_results.items()
-        if _stats_signature(result.get("stats")) != old_signatures.get(sid)
+        if _media_stats_changed_for_throughput(
+            previous_media_stats.get(sid),
+            result.get("stats"),
+            media_bitrate_relative_tolerance=media_bitrate_relative_tolerance,
+            media_bitrate_absolute_tolerance_kbps=media_bitrate_absolute_tolerance_kbps,
+        )
     }
     media_changed_ids.update(dispatcharr_metadata_changed_ids)
 
@@ -768,12 +1166,14 @@ def analyze_assigned_streams(settings: Mapping[str, Any], *, logger, cache_path:
             entry,
             url_hash=analyzer._stream_url_hash(str(item.get("url") or "")),
             ttl_hours=throughput_ttl_hours,
+            ttl_jitter_percent=analysis_ttl_jitter_percent,
             now=now,
         )
         if sid in media_changed_ids:
             reason = "media_changed"
         if reason:
             throughput_due.append((item, reason))
+    throughput_reason_counts = collections.Counter(reason for _, reason in throughput_due)
 
     throughput_checked_ids = set()
     throughput_capacity_deferred_ids = set()
@@ -868,6 +1268,15 @@ def analyze_assigned_streams(settings: Mapping[str, Any], *, logger, cache_path:
         total, len(media_checked_ids), len(throughput_checked_ids), len(capacity_deferred_ids), fully_cached, playback_health_refreshed, dispatcharr_metadata_refreshed,
         _overall_health_text(health_counts), _overall_throughput_text(throughput_counts),
     )
+    report = _build_health_report(
+        items,
+        cache,
+        now=datetime.now(timezone.utc),
+        media_reason_counts=media_reason_counts,
+        throughput_reason_counts=throughput_reason_counts,
+        channels_selected=len({row.channel_id for row in rows}),
+    )
+    _save_json(ANALYSIS_HEALTH_REPORT_PATH, report)
     return {
         "streams_analyzed": total,
         "streams_selected": total,
@@ -882,6 +1291,7 @@ def analyze_assigned_streams(settings: Mapping[str, Any], *, logger, cache_path:
         "status_counts": {key: value for key, value in health_counts.items() if value > 0},
         "throughput_status_counts": {key: value for key, value in throughput_counts.items() if value > 0},
         "cache_path": cache_path,
+        "analysis_health_report_path": ANALYSIS_HEALTH_REPORT_PATH,
     }
 
 

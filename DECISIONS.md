@@ -125,3 +125,77 @@ The legacy workflow uses moving branches as version artifacts and has accumulate
 - Workspace workflow commit: `matrix2669/workspace@0ccd235`
 - Current published source: `dev-test@283da3aa636b443f39efe89a0216e4f7f837247d`
 - Related conversation: Simplify Plugin Versioning (`6a898c9e-1ffc-83ea-8fcc-b44788fea3c0`)
+
+# ADR-005: Retain post-scan dead status with scoped stale state and retry behavior
+
+## Status
+
+Accepted
+
+## Date
+
+2026-08-24
+
+## Decision
+
+Keep dead-stream behavior in two phases: immediate intra-scan recovery via retry passes, then cooldown control via `dead_content_ttl_hours`.
+
+- During an analysis run, failed checks continue to pass through the existing immediate retry pipeline (`Analyze` -> up to 3 retry passes).
+- If a stream remains dead after retries and the scan completes, it is recorded as dead and marked stale in Dispatcharr (`stream.is_stale = True`).
+- The dead stream is then excluded from being treated as non-stale until it is marked alive by a subsequent completed scan.
+- No hard minimum dead TTL is enforced by code; scheduling is controlled by the configured UI value (`dead_content_ttl_hours`).
+
+## Reason
+
+This preserves recovery from transient transport/auth/login misses while preventing repeated immediate dead rechecks across scans. It also makes stale state explicit and persistent for scheduling and user visibility.
+
+## Consequences
+
+- `dead_content_ttl_hours` is the primary control for how long known-dead streams are deferred between full scans.
+- Operational tuning focuses on keeping provider checks lower while still allowing quick revalidation when needed.
+- `media_bitrate_relative_tolerance_percent` and `media_bitrate_absolute_tolerance_kbps` control when metadata changes trigger `media_changed` throughput rechecks (default 30% and 500 kbps). This makes `media_changed` behavior tunable without code changes while still ignoring normal ffprobe bitrate jitter.
+
+## Provenance
+
+- Stream Sort discussion thread: user-guided TTL tuning and stale-state clarification (`this session`).
+
+# ADR-006: Read-only TTL recommendation action and stream-level TTL jitter strategy
+
+## Status
+
+Accepted
+
+## Date
+
+2026-08-24
+
+## Decision
+
+TTL tuning will be driven by a read/report action from collected health telemetry.
+
+- The recommendation action (`recommend_ttls`) must only analyze and report; it must not mutate plugin settings.
+- Recommendations use report-derived fields from the latest health trend report:
+  - history coverage (`history_rows`, `history_span_hours`),
+  - dead ratio (`dead_check_ratio`),
+  - status transition ratio (`checks_per_status_change_ratio`),
+  - check-interval percentiles (`check_interval_hours`),
+  - status-change-interval percentiles (`status_change_interval_hours`),
+  - per-hour dead concentration (`hourly_dead_ratio`),
+  - unstable stream pattern indicators.
+- Jitter is not applied to dead TTL, only to media analysis/throughput-like TTLs.
+- Start with stream-level jitter only (per-stream randomization around TTL) to smooth expiry without account/provider-aware scheduling complexity.
+- Add provider-aware spread only if empirical metrics show sustained concentration on specific accounts.
+
+## Reason
+
+Users asked to keep control over settings, but still want data-driven recommendations from historical behavior; stream-level jitter is the lowest-complexity initial control that reduces synchronized TTL expiry.
+
+## Consequences
+
+- Recommendation output needs to include confidence/rationale fields, not just scalar TTL suggestions.
+- We should retain health trend artifacts over time so downstream decisions (including potentially removing low-quality streams) can use historical patterns.
+- `media_bitrate_relative_tolerance_percent` and `media_bitrate_absolute_tolerance_kbps` are now first-class analyzer settings so users can tune `media_changed` sensitivity and measure recheck behavior with the recommendation report.
+
+## Provenance
+
+- Stream Sort design discussion in this session (`TTL objective, stale handling, recommendation scope, and jitter policy`).
