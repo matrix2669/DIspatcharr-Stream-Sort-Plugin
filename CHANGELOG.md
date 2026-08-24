@@ -17,6 +17,25 @@ Historical versions below were published through the legacy `dev-test` workflow 
 
 ### Removed
 
+## 0.3.6-beta.3 - 2026-08-24
+
+### Added
+
+- Add cron-based scheduled analysis with configurable automatic sort and optional parallel-worker control.
+- Add dead-stream TTL, media bitrate change thresholds, and health trend reporting and TTL recommendations.
+
+### Changed
+
+- Reduce live scan churn by marking dead streams stale only after scan completion.
+- Add stream-level TTL jitter guidance and keep dead TTL retries excluded from jitter.
+- Update scheduler and analysis behavior to support scheduled post-analyze sorting while keeping immediate retry semantics within each analyze run.
+
+### Fixed
+
+- Keep recommendation outputs read-only and separate from direct setting mutation.
+
+### Removed
+
 ## 0.3.6-beta.2 - 2026-08-22
 
 ### Changed

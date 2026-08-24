@@ -166,6 +166,9 @@ All matching name rules are additive.
 ## Actions
 
 - **Analyze Streams** — incrementally refresh only health/content, metadata, or throughput components that require checking.
+- **Apply Schedule** — save a cron-based automatic analyze schedule for scoped channels.
+- **Check Schedule** — show current scheduled state, next/last run status, and whether auto-sort and parallel-check options are enabled.
+- **Disable Schedule** — stop automatic scheduled analysis and clear any in-memory due-minute state.
 - **Recommend TTLs** — compute health/dead TTL and jitter recommendations from the latest health trend report.
 - **Dry Run** — write `/data/dispatcharr_stream_sort_report.json` without changing order.
 - **Sort Streams** — apply the calculated `ChannelStream.order` only.
