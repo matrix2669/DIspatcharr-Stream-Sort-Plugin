@@ -13,6 +13,7 @@ def test_dynamic_m3u_fields_default_to_zero_and_use_account_ids():
             {"id": 9, "name": "Zulu", "is_active": True},
             {"id": 3, "name": "Alpha", "is_active": True},
             {"id": 7, "name": "Backup", "is_active": False},
+            {"id": 1, "name": "custom", "is_active": True, "locked": True},
         ]
     )
 
@@ -59,6 +60,17 @@ def test_dynamic_source_fields_override_legacy_source_scores():
         }
     )
     assert settings["source_scores"] == "id:4=0"
+
+
+def test_locked_or_removed_dynamic_source_scores_are_ignored():
+    settings = _settings_with_dynamic_source_scores(
+        {
+            "m3u_source_score_1": -20,
+            "m3u_source_score_3": 10,
+        },
+        allowed_account_ids={3},
+    )
+    assert settings["source_scores"] == "id:3=10"
 
 
 def test_invalid_dynamic_source_score_fails_cleanly():

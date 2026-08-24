@@ -16,10 +16,11 @@ def test_plugin_manifest_is_valid_and_matches_version():
         "stop_analysis",
         "apply_schedule",
         "schedule_status",
-            "remove_schedule",
-            "health_report",
-            "recommend_ttls",
-            "reset_statistics",
+        "remove_schedule",
+        "health_report",
+        "recommend_ttls",
+        "reset_scan_statistics",
+        "reset_all_statistics",
         "dry_run",
         "sort_streams",
         "analyze_and_sort",
@@ -49,7 +50,7 @@ def test_plugin_manifest_is_valid_and_matches_version():
     assert "playback_health_ttl_hours" not in field_ids
     assert "content_validation_ttl_hours" in field_ids
     assert "healthy_throughput_ttl_hours" in field_ids
-    assert "reset_statistics_include_history" in field_ids
+    assert "reset_statistics_include_history" not in field_ids
     assert "probe_per_account_delay_seconds" in field_ids
     assert "probe_rate_per_minute" not in field_ids
     assert "reliability_info" in field_ids

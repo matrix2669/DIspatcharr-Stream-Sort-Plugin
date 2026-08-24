@@ -144,7 +144,7 @@ Every action can be restricted by channel group and/or channel profile. Multiple
 
 ## M3U source scores
 
-When enabled, the plugin dynamically lists every configured M3U account with a numeric score box. All sources default to `0`. Positive values promote a source and negative values demote it.
+When enabled, the plugin dynamically lists every operator-managed M3U account with a numeric score box. Locked Dispatcharr system accounts such as the internal `custom` account are excluded. All listed sources default to `0`. Positive values promote a source and negative values demote it.
 
 ## Name rules
 
@@ -176,7 +176,10 @@ All matching name rules are additive.
 - **Disable Schedule** — stop automatic scheduled analysis and clear any in-memory due-minute state.
 - **Health Report** — show problematic streams, directional health transitions, dead recovery, and time concentration in the UI.
 - **Recommend TTLs** — compute read-only health/dead TTL and jitter recommendations from recent directional evidence, with confidence and sparse-data warnings.
-- **Reset Statistics** — clear unified and legacy scan caches/reports for a clean start, or enable **Reset all historical data** to also clear runtime reliability and playback history. It uses the same cross-process lease as analysis and is refused while any scan is active. Schedules, settings, channel order, and provider configuration are preserved.
+- **Reset Scan Statistics** — clear unified and legacy scan caches, scan status, health reports, and TTL recommendations while preserving runtime reliability and playback history.
+- **Reset All Statistics** — clear the same scan evidence plus all runtime reliability and playback history.
+
+Both reset actions use the same cross-process lease as analysis and are refused while any scan is active. Schedules, settings, channel order, sort reports, and provider configuration are preserved.
 - **Dry Run** — write `/data/dispatcharr_stream_sort_report.json` without changing order.
 - **Sort Streams** — apply the calculated `ChannelStream.order` only.
 - **Analyze + Sort** — incrementally analyze, then apply the refreshed ordering.

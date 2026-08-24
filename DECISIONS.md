@@ -412,8 +412,9 @@ Dispatcharr may resolve the same stream through multiple profiles under one M3U 
 - After retries establish that the latest completed phase is dead, put FFprobe, content, and throughput behind one exact dead-TTL recovery gate. A canceled retry sequence remains retry-pending with an effective TTL of zero.
 - A content-dead result invalidates active throughput evidence even when the shared capture delivered bytes successfully. The measurement may remain historical but cannot satisfy the active throughput TTL.
 - Only direct FFprobe completion resets `ffprobe_checked_at`. Separated content checks must not update the generic legacy timestamp used as an FFprobe fallback.
-- Provide a **Reset Statistics** action. Scan-only reset clears analysis/throughput caches, scan status, health reports, and TTL recommendations. Full reset additionally clears runtime reliability and playback history. Neither mode changes the cron schedule, plugin settings, provider configuration, channel order, or sort reports.
+- Provide separate **Reset Scan Statistics** and **Reset All Statistics** actions rather than a scope-setting toggle. Scan reset clears analysis/throughput caches, scan status, health reports, and TTL recommendations. All-statistics reset additionally clears runtime reliability and playback history. Neither action changes the cron schedule, plugin settings, provider configuration, channel order, or sort reports.
 - Serialize statistics reset through the same cross-process execution lease as manual, scheduled, and direct analysis. Reset must also clear the legacy throughput migration cache so evidence cannot be restored on the next scan.
+- Exclude locked Dispatcharr system M3U accounts from source-score settings and ignore any stale saved dynamic score for an account that is no longer operator-managed. Internal accounts do not represent provider preferences and must not influence sorting.
 - Measure combined throughput only across the requested provider capture window, excluding FFmpeg shutdown/flush time. Treat an unexpectedly short successful exit as an incomplete retryable capture.
 - When no enabled content detector applies to a stream, record a completed skipped content decision and satisfy the content TTL without reserving provider capacity or affecting sorting viability.
 
@@ -430,7 +431,9 @@ Dispatcharr may resolve the same stream through multiple profiles under one M3U 
 - URL-hash attribution for playback: rejected because profile credentials change the resolved URL without changing the underlying provider stream.
 - Stream-ID-only attribution: rejected because it could reuse evidence after the same ID moves to another provider.
 - Immediate rechecks for every degraded throughput result: rejected because it defeats the provider-check reduction goal and the configured dead recovery cadence.
+- A reset-scope settings toggle: rejected because separate explicit actions make the destructive scope visible at click and confirmation time.
 - Clearing schedules or sorting configuration during statistics reset: rejected because those are operational settings, not collected evidence.
+- Exposing or scoring locked Dispatcharr system M3U accounts: rejected because they are internal ownership records rather than operator-managed providers.
 
 ## Provenance
 

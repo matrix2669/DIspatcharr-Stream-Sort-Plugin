@@ -424,9 +424,10 @@ class _ProgressLogger:
 
 
 def _build_m3u_source_score_fields(accounts):
-    """Return one neutral numeric score field per configured M3U account."""
+    """Return one neutral numeric score field per operator-managed M3U account."""
+    rows = [dict(account) for account in accounts]
     rows = sorted(
-        (dict(account) for account in accounts),
+        (row for row in rows if not bool(row.get("locked", False))),
         key=lambda row: (
             str(row.get("name") or "").casefold(),
             int(row.get("id") or 0),
@@ -452,9 +453,14 @@ def _build_m3u_source_score_fields(accounts):
     return fields
 
 
-def _settings_with_dynamic_source_scores(settings):
+def _settings_with_dynamic_source_scores(settings, *, allowed_account_ids=None):
     """Translate per-account score fields into the existing source-rule format."""
     normalized = dict(settings or {})
+    allowed_ids = (
+        None
+        if allowed_account_ids is None
+        else {int(account_id) for account_id in allowed_account_ids}
+    )
     dynamic_scores = []
     for key, value in normalized.items():
         if not str(key).startswith(M3U_SOURCE_SCORE_PREFIX):
@@ -462,13 +468,16 @@ def _settings_with_dynamic_source_scores(settings):
         account_id = str(key)[len(M3U_SOURCE_SCORE_PREFIX):]
         if not account_id.isdigit():
             continue
+        account_id_int = int(account_id)
+        if allowed_ids is not None and account_id_int not in allowed_ids:
+            continue
         try:
             score = float(value)
         except (TypeError, ValueError) as exc:
             raise ValueError(
                 f"Invalid score for M3U source ID {account_id}: {value!r}"
             ) from exc
-        dynamic_scores.append((int(account_id), score))
+        dynamic_scores.append((account_id_int, score))
 
     if dynamic_scores:
         dynamic_scores.sort(key=lambda item: item[0])
@@ -1388,7 +1397,7 @@ def _start_background_job(
     }
 
 
-def _run_reset_statistics_action(settings: Mapping[str, object]) -> dict:
+def _run_reset_statistics_action(*, include_history: bool) -> dict:
     try:
         lease = analysis_maintenance_execution()
         lease.__enter__()
@@ -1398,7 +1407,6 @@ def _run_reset_statistics_action(settings: Mapping[str, object]) -> dict:
             "message": "Statistics cannot be reset while an analysis scan is running. Stop the scan and wait for it to finish first.",
         }
     try:
-        include_history = _safe_bool(settings.get("reset_statistics_include_history"), False)
         scan_paths = (
             ANALYSIS_CACHE_PATH,
             LEGACY_CACHE_PATH,
@@ -1447,6 +1455,7 @@ class Plugin:
         # numeric input per current M3U account while retaining the old setting
         # internally for migration compatibility.
         instance_fields = [dict(field) for field in type(self).fields]
+        self._m3u_source_score_account_ids = None
         source_index = next(
             (index for index, field in enumerate(instance_fields) if field.get("id") == "source_scores"),
             None,
@@ -1455,7 +1464,14 @@ class Plugin:
             try:
                 from apps.m3u.models import M3UAccount
 
-                accounts = list(M3UAccount.objects.all().values("id", "name", "is_active"))
+                accounts = list(
+                    M3UAccount.objects.filter(locked=False).values(
+                        "id", "name", "is_active", "locked"
+                    )
+                )
+                self._m3u_source_score_account_ids = {
+                    int(account["id"]) for account in accounts
+                }
                 replacement = [
                     {
                         "id": "m3u_source_scores_info",
@@ -1492,7 +1508,10 @@ class Plugin:
         _start_scheduler()
 
     def run(self, action: str, params: dict, context: dict):
-        settings = _settings_with_dynamic_source_scores(context.get("settings") or {})
+        settings = _settings_with_dynamic_source_scores(
+            context.get("settings") or {},
+            allowed_account_ids=self._m3u_source_score_account_ids,
+        )
         # Deliberately do not use context["logger"]. Dispatcharr passes a shared
         # apps.plugins.loader logger, and IPTV Checker currently installs a
         # persistent [IPTV Checker] filter on that shared object. A dedicated
@@ -1528,8 +1547,11 @@ class Plugin:
             if action == "health_report":
                 return _run_health_report_action()
 
-            if action == "reset_statistics":
-                return _run_reset_statistics_action(settings)
+            if action == "reset_scan_statistics":
+                return _run_reset_statistics_action(include_history=False)
+
+            if action == "reset_all_statistics":
+                return _run_reset_statistics_action(include_history=True)
 
             if action == "dry_run":
                 result = sort_channels(settings, apply=False, logger=logger)

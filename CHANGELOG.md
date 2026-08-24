@@ -4,7 +4,7 @@
 
 ### Added
 
-- Add a guarded **Reset Statistics** action with scan-only and scan-plus-runtime-history scopes while preserving schedules, settings, provider configuration, and channel order.
+- Add separate guarded **Reset Scan Statistics** and **Reset All Statistics** actions while preserving schedules, settings, provider configuration, and channel order.
 
 ### Changed
 
@@ -13,6 +13,7 @@
 - Log every individual FFprobe and content retry with the same stream health, media statistics, progress, totals, and ETA fields used by initial media checks.
 - Attribute reusable Dispatcharr playback by stream ID and M3U provider account while treating profiles and credential-only URL differences as equivalent.
 - Apply the exact dead-stream TTL without jitter to marginal, insufficient, and unknown throughput evidence.
+- Exclude locked Dispatcharr system accounts from M3U source-score controls and ignore their stale saved dynamic scores.
 
 ### Fixed
 
