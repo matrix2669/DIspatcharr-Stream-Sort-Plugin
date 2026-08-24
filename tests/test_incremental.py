@@ -13,6 +13,7 @@ from stream_sorter.incremental import (
     _is_significant_bitrate_change,
     _sync_runtime_playback_health,
     analyze_assigned_streams,
+    content_check_reason,
     health_check_reason,
     metadata_check_reason,
     throughput_check_reason,
@@ -132,8 +133,11 @@ def test_throughput_parallelism_is_limited_per_source_not_globally(tmp_path, mon
         str(stream.id): {
             "status": "alive",
             "url_hash": analyzer._stream_url_hash(stream.url),
+            "m3u_account_id": stream.m3u_account_id,
             "health_checked_at": now,
+            "ffprobe_checked_at": now,
             "content_checked_at": now,
+            "content_m3u_account_id": stream.m3u_account_id,
             "metadata_updated_at": now,
             "stats": {"resolution": "1920x1080", "source_fps": 30},
         }
@@ -212,6 +216,31 @@ def test_health_and_metadata_have_independent_ttls():
     assert health_check_reason(entry, url_hash="abc", ttl_hours=24, now=now) is None
     assert metadata_check_reason(entry, url_hash="abc", ttl_hours=12, now=now) is None
     assert health_check_reason(entry, url_hash="abc", ttl_hours=12, now=now) == "ttl_expired"
+
+
+def test_content_ttl_is_independent_and_confirmed_dead_uses_dead_ttl():
+    now = _now()
+    alive = {
+        "status": "alive",
+        "url_hash": "same",
+        "content_checked_at": (now - timedelta(hours=8)).isoformat(),
+    }
+    dead = {
+        **alive,
+        "status": "dead",
+        "content_checked_at": now.isoformat(),
+        "dead_checked_at": now.isoformat(),
+    }
+
+    assert content_check_reason(
+        alive, url_hash="same", ttl_hours=7, dead_ttl_hours=1, now=now,
+    ) == "ttl_expired"
+    assert content_check_reason(
+        dead, url_hash="same", ttl_hours=168, dead_ttl_hours=1, now=now,
+    ) is None
+    assert content_check_reason(
+        dead, url_hash="same", ttl_hours=168, dead_ttl_hours=1, now=now + timedelta(hours=1),
+    ) == "dead_ttl_expired"
 
 
 def test_dead_skipped_and_unknown_health_are_rechecked_even_when_fresh():
@@ -425,11 +454,152 @@ def test_fresh_healthy_throughput_is_cached():
     assert throughput_check_reason(entry, url_hash="abc", ttl_hours=6, now=now) is None
 
 
-def test_nonhealthy_throughput_is_rechecked_even_when_fresh():
+def test_nonhealthy_throughput_uses_exact_dead_ttl():
     now = _now()
     for status in ("marginal", "insufficient", "unknown"):
         entry = {"throughput": {"status": status, "url_hash": "abc", "checked_at": now.isoformat()}}
-        assert throughput_check_reason(entry, url_hash="abc", ttl_hours=6, now=now) == f"status_{status}"
+        assert throughput_check_reason(
+            entry,
+            url_hash="abc",
+            ttl_hours=6,
+            dead_ttl_hours=1,
+            ttl_jitter_percent=30,
+            now=now,
+        ) is None
+        assert throughput_check_reason(
+            entry,
+            url_hash="abc",
+            ttl_hours=6,
+            dead_ttl_hours=1,
+            ttl_jitter_percent=30,
+            now=now + timedelta(hours=1),
+        ) == f"status_{status}"
+
+
+def test_provider_attributed_playback_reuses_profiles_but_not_other_providers():
+    from stream_sorter import incremental
+
+    now = _now()
+    item = {
+        "id": 42,
+        "name": "Example",
+        "url": "http://provider.test/live/base",
+        "account_id": 7,
+        "dispatcharr_stats": {"resolution": "1920x1080", "fps": 30},
+    }
+    url_hash = analyzer._stream_url_hash(item["url"])
+    cache = {"42": {"status": "alive", "url_hash": url_hash, "stats": item["dispatcharr_stats"]}}
+    reliability = {
+        "streams": {
+            "42": {
+                "m3u_account_id": 7,
+                "last_clean_playback_at": now.isoformat(),
+                "last_clean_playback_seconds": 300,
+                "last_clean_playback_m3u_account_id": 7,
+                "playback_throughput_history": [{
+                    "observed_at": now.isoformat(),
+                    "kind": "clean_playback",
+                    "runtime_seconds": 300,
+                    "measured_mbps": 20.0,
+                    "m3u_account_id": 7,
+                    "eligible_for_throughput": True,
+                }],
+            }
+        }
+    }
+
+    assert incremental._sync_runtime_playback_evidence(
+        [item], cache, reliability,
+        min_clean_playback_seconds=60,
+        min_throughput_playback_seconds=300,
+    ) == 1
+    assert cache["42"]["content_source"] == "dispatcharr_playback_assumed"
+    assert cache["42"]["content_m3u_account_id"] == 7
+    assert cache["42"]["throughput"]["source"] == "dispatcharr_playback"
+    assert content_check_reason(
+        cache["42"],
+        url_hash=url_hash,
+        ttl_hours=168,
+        dead_ttl_hours=1,
+        provider_id=8,
+        now=now,
+    ) == "provider_changed"
+    assert throughput_check_reason(
+        cache["42"],
+        url_hash=url_hash,
+        ttl_hours=6,
+        dead_ttl_hours=1,
+        provider_id=8,
+        now=now,
+    ) == "provider_changed"
+
+    other_provider_cache = {"42": {"status": "alive", "url_hash": url_hash, "stats": item["dispatcharr_stats"]}}
+    reliability["streams"]["42"]["last_clean_playback_m3u_account_id"] = 8
+    reliability["streams"]["42"]["playback_throughput_history"][0]["m3u_account_id"] = 8
+    incremental._sync_runtime_playback_evidence(
+        [item], other_provider_cache, reliability,
+        min_clean_playback_seconds=60,
+        min_throughput_playback_seconds=300,
+    )
+    assert "content_checked_at" not in other_provider_cache["42"]
+    assert "throughput" not in other_provider_cache["42"]
+    assert other_provider_cache["42"]["playback_throughput_history"][0]["provider_attribution_valid"] is False
+
+
+def test_terminal_content_dead_uses_dead_ttl_for_every_phase():
+    from stream_sorter import incremental
+
+    now = _now()
+    item = {"id": 9, "name": "Dead", "url": "http://provider.test/dead", "account_id": 7}
+    url_hash = analyzer._stream_url_hash(item["url"])
+    previous = {
+        "status": "alive",
+        "url_hash": url_hash,
+        "ffprobe_checked_at": (now - timedelta(minutes=5)).isoformat(),
+        "throughput": {"status": "healthy", "url_hash": url_hash, "checked_at": now.isoformat()},
+    }
+    dead = {
+        "status": "dead",
+        "error_type": "black_screen",
+        "error": "black",
+        "tested_at": now.isoformat(),
+        "retry_pending": False,
+        "details": {"content": {"measured": True, "tested_at": now.isoformat(), "black": True}},
+    }
+    merged = incremental._merge_content_result(item, previous, dead, analysis_reason="ttl_expired")
+
+    assert incremental.ffprobe_check_reason(
+        merged, url_hash=url_hash, ttl_hours=12, dead_ttl_hours=1, ttl_jitter_percent=30, now=now,
+    ) is None
+    assert content_check_reason(
+        merged, url_hash=url_hash, ttl_hours=168, dead_ttl_hours=1, ttl_jitter_percent=30, now=now,
+    ) is None
+    assert throughput_check_reason(
+        merged, url_hash=url_hash, ttl_hours=6, dead_ttl_hours=1, ttl_jitter_percent=30, now=now,
+    ) is None
+    assert "health_checked_at" not in merged
+    assert incremental.ffprobe_check_reason(
+        merged, url_hash=url_hash, ttl_hours=12, dead_ttl_hours=1, ttl_jitter_percent=30, now=now + timedelta(hours=1),
+    ) == "dead_ttl_expired"
+
+
+def test_no_applicable_content_detectors_complete_without_provider_work():
+    result = {
+        "status": "alive",
+        "stats": {},
+        "details": {"has_audio": False},
+    }
+    settings = {
+        "black_screen_detection": False,
+        "frozen_video_detection": False,
+        "silent_audio_detection": True,
+    }
+
+    assert incremental._content_checks_applicable(result, settings) is False
+    skipped = incremental._content_skipped_result(result)
+    assert skipped["status"] == "alive"
+    assert skipped["details"]["content"]["measured"] is True
+    assert skipped["details"]["content"]["skip_reason"] == "no_applicable_detectors"
 
 
 def test_dispatcharr_metadata_refresh_does_not_refresh_health_or_throughput():

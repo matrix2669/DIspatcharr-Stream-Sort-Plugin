@@ -347,3 +347,92 @@ The zero-capacity and deferred scan was caused by two Stream Sort analyses overl
 
 - Live scan and provider-counter investigation completed on 2026-08-24.
 - Builds on ADR-003 and ADR-008 without changing their capacity, retry, scheduling, or telemetry decisions.
+
+## ADR-010: Stage media analysis and combine overlapping provider work
+
+**Status:** Accepted
+
+**Date:** 2026-08-24
+
+## Context
+
+FFprobe metadata collection is fast and useful independently of content detection. The previous pipeline coupled it to a separate 6-second FFmpeg content probe, then opened the same provider again for an 8-second throughput measurement when both TTLs were due. Retry logs also showed only aggregate pass counts, hiding which streams repeatedly required recovery.
+
+## Decision
+
+- Run FFprobe metadata and reachability first without FFmpeg content detection, and finish its configured immediate retry sequence before downstream phases.
+- Keep the existing 6-second remote FFmpeg content sample when content alone is due.
+- Keep the raw wall-clock byte probe when throughput alone is due.
+- When content and throughput are both due, capture one MPEG-TS stream-copy sample for 8 seconds of wall-clock provider time, calculate throughput from captured bytes and actual elapsed time, release provider capacity, and run content detection against the local sample.
+- Preserve content and throughput timestamps independently. A completed throughput result remains valid if content needs confirmation retries or the scan is canceled.
+- Retry content failures with the shorter content-only provider path rather than repeating a valid throughput capture.
+- Log every individual retry result with the same identifying, media-statistic, progress, aggregate-health, pending-work, and ETA fields as an initial media result.
+
+## Consequences
+
+- Provider checks are reduced when content and throughput expire together, while metadata-only and throughput-only checks avoid unnecessary decoding.
+- Stream-copy output bytes are a remuxed measurement rather than exact raw input bytes. Reports identify this measurement source so collected data can be compared with the existing raw probe before further threshold tuning.
+- Provider reservations end after the remote capture and before local decoding, protecting viewer capacity and improving scan concurrency.
+- FFprobe and content failures have separate immediate confirmation sequences, while terminal health history still records only the completed scan outcome and aggregate retry dependence.
+
+## ADR-011: Use three scan-start TTL decisions and sustained playback evidence
+
+**Status:** Accepted
+
+**Date:** 2026-08-24
+
+## Decision
+
+- Calculate independent FFprobe, grouped content, and throughput due flags at scan start. The exact confirmed-dead TTL remains a separate recovery gate without jitter.
+- Only a completed direct FFprobe resets the FFprobe TTL. Dispatcharr playback and imported stream statistics never reset it.
+- Attributable clean Dispatcharr playback of at least 60 seconds satisfies grouped black/frozen/silent content evidence, labeled `dispatcharr_playback_assumed` because it is not direct frame/audio detection.
+- Attributable clean unswitched playback of at least 300 seconds supplies sustained throughput from `total_bytes * 8 / runtime`. Ratios at or above `1.10x` nominal are initially healthy, `1.00x` through `1.10x` are marginal, and below `1.00x` is insufficient.
+- Buffering-related Dispatcharr failover is immediate insufficient throughput evidence for the replaced stream and supersedes older successful measurements. Other connection or media failures remain health evidence.
+- Retain every clean sustained ratio and failure for 90 days and report percentiles plus buckets around `1.03x`, `1.05x`, `1.07x`, and `1.10x`. The initial threshold is provisional and must be changed only after analyzing collected playback outcomes.
+
+---
+
+# ADR-012: Attribute playback by stream and provider and unify terminal-dead recovery
+
+**Status:** Accepted
+
+**Date:** 2026-08-24
+
+## Context
+
+Dispatcharr may resolve the same stream through multiple profiles under one M3U provider. Those profiles share the same base service and differ only by credentials, so their resolved URL hashes are expected to differ even though media and delivery behavior are equivalent. Review also found that unmeasured content probes could be treated as alive, degraded throughput bypassed TTLs, content checks could refresh a legacy FFprobe fallback timestamp, and a combined throughput result could overwrite a content-driven dead invalidation.
+
+## Decision
+
+- Attribute reusable Dispatcharr playback with the pair `stream_id + m3u_account_id`. Treat every profile and credential-only URL variation under that provider account as equivalent. Do not require URL-hash equality for playback evidence.
+- Preserve observations without a matching provider ID for historical reporting, but do not use them to satisfy content or throughput TTLs.
+- Persist the provider account with active content and throughput evidence. A provider reassignment invalidates that evidence immediately; profile or credential changes under the same provider do not.
+- Treat remote FFmpeg content timeouts, exceptions, and nonzero exits as provisional retryable failures. Only a completed initial check plus the configured immediate retries can establish terminal dead content.
+- Use the exact Dead stream TTL without jitter for marginal, insufficient, and unknown throughput evidence. Healthy throughput continues to use the configured jittered Throughput TTL.
+- After retries establish that the latest completed phase is dead, put FFprobe, content, and throughput behind one exact dead-TTL recovery gate. A canceled retry sequence remains retry-pending with an effective TTL of zero.
+- A content-dead result invalidates active throughput evidence even when the shared capture delivered bytes successfully. The measurement may remain historical but cannot satisfy the active throughput TTL.
+- Only direct FFprobe completion resets `ffprobe_checked_at`. Separated content checks must not update the generic legacy timestamp used as an FFprobe fallback.
+- Provide a **Reset Statistics** action. Scan-only reset clears analysis/throughput caches, scan status, health reports, and TTL recommendations. Full reset additionally clears runtime reliability and playback history. Neither mode changes the cron schedule, plugin settings, provider configuration, channel order, or sort reports.
+- Serialize statistics reset through the same cross-process execution lease as manual, scheduled, and direct analysis. Reset must also clear the legacy throughput migration cache so evidence cannot be restored on the next scan.
+- Measure combined throughput only across the requested provider capture window, excluding FFmpeg shutdown/flush time. Treat an unexpectedly short successful exit as an incomplete retryable capture.
+- When no enabled content detector applies to a stream, record a completed skipped content decision and satisfy the content TTL without reserving provider capacity or affecting sorting viability.
+
+## Consequences
+
+- Profile rotation does not discard valid playback evidence or cause credential-only attribution churn.
+- Evidence cannot cross provider boundaries when a stream ID is reassigned or provider metadata changes.
+- Degraded streams no longer create direct throughput probes on every scheduled scan.
+- Every confirmed-dead path follows the same recovery cadence, while interrupted retries remain immediately due.
+- Operators can deliberately start a new measurement window without rebuilding plugin configuration or schedules.
+
+## Rejected alternatives
+
+- URL-hash attribution for playback: rejected because profile credentials change the resolved URL without changing the underlying provider stream.
+- Stream-ID-only attribution: rejected because it could reuse evidence after the same ID moves to another provider.
+- Immediate rechecks for every degraded throughput result: rejected because it defeats the provider-check reduction goal and the configured dead recovery cadence.
+- Clearing schedules or sorting configuration during statistics reset: rejected because those are operational settings, not collected evidence.
+
+## Provenance
+
+- Operator clarification and post-implementation review decisions completed on 2026-08-24.
+- Supersedes ADR-011 only where playback attribution and nonhealthy throughput cadence are made more precise; all other ADR-011 thresholds remain provisional and active.

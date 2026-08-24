@@ -74,6 +74,28 @@ def test_analyze_stream_alive_calculates_packet_bitrate(monkeypatch):
     assert result["details"]["packet_count"] == 30
 
 
+def test_metadata_only_analysis_does_not_run_content_ffmpeg(monkeypatch):
+    payload = _probe_payload(packet_count=30)
+    calls = []
+
+    def fake_run(*args, **kwargs):
+        calls.append(args[0])
+        return subprocess.CompletedProcess(args[0], 0, stdout=json.dumps(payload), stderr="")
+
+    monkeypatch.setattr(analyzer.subprocess, "run", fake_run)
+    result = analyzer.analyze_stream(
+        "http://example.test/live.ts",
+        stream_id=7,
+        stream_name="Example",
+        settings=_settings(),
+        include_content=False,
+    )
+
+    assert result["status"] == "alive"
+    assert len(calls) == 1
+    assert "content" not in result["details"]
+
+
 def test_zero_dimensions_are_dead_and_retryable(monkeypatch):
     payload = _probe_payload()
     payload["streams"][0]["width"] = 0
@@ -183,3 +205,50 @@ def test_streamlink_host_is_skipped_without_running_ffprobe(monkeypatch):
     )
     assert result["status"] == "skipped"
     assert result["error_type"] == "streamlink_only"
+def test_content_timeout_is_retryable_dead_result(monkeypatch):
+    import logging
+    import subprocess
+
+    from stream_sorter import analyzer
+
+    def timeout(*args, **kwargs):
+        raise subprocess.TimeoutExpired(args[0], 20)
+
+    monkeypatch.setattr(analyzer.subprocess, "run", timeout)
+    result = analyzer.apply_content_analysis(
+        {"status": "alive", "stats": {}, "details": {}},
+        "http://provider.test/live",
+        settings={
+            "black_screen_detection": True,
+            "frozen_video_detection": False,
+            "silent_audio_detection": False,
+            "content_ffmpeg_timeout_seconds": 20,
+        },
+        logger=logging.getLogger("test"),
+    )
+
+    assert result["status"] == "dead"
+    assert result["error_type"] == "timeout"
+    assert result["details"]["content"]["measured"] is False
+
+
+def test_no_applicable_content_detectors_are_completed_without_ffmpeg(monkeypatch):
+    from stream_sorter import analyzer
+
+    def should_not_run(*args, **kwargs):
+        raise AssertionError("ffmpeg should not run")
+
+    monkeypatch.setattr(analyzer.subprocess, "run", should_not_run)
+    result = analyzer.apply_content_analysis(
+        {"status": "alive", "stats": {}, "details": {"has_audio": False}},
+        "http://provider.test/live",
+        settings={
+            "black_screen_detection": False,
+            "frozen_video_detection": False,
+            "silent_audio_detection": True,
+        },
+    )
+
+    assert result["status"] == "alive"
+    assert result["details"]["content"]["measured"] is True
+    assert result["details"]["content"]["skip_reason"] == "no_applicable_detectors"

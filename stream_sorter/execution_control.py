@@ -163,6 +163,32 @@ def close_analysis_cancel_window():
         return canceled
 
 
+@contextmanager
+def analysis_maintenance_execution():
+    """Acquire the analyzer lease for short non-scan maintenance actions."""
+    lock_handle = open(ANALYSIS_EXECUTION_LOCK_PATH, "a+", encoding="utf-8")
+    acquired = False
+    try:
+        try:
+            fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            acquired = True
+        except BlockingIOError as exc:
+            state = _read_json(ANALYSIS_EXECUTION_STATE_PATH)
+            owner = state.get("owner_pid")
+            detail = f" by process {owner}" if owner else ""
+            raise AnalysisAlreadyRunning(
+                f"Another stream analysis is already running{detail}"
+            ) from exc
+        yield
+    finally:
+        if acquired:
+            try:
+                fcntl.flock(lock_handle.fileno(), fcntl.LOCK_UN)
+            except OSError:
+                pass
+        lock_handle.close()
+
+
 def exclusive_analysis_execution(function):
     """Ensure every caller, including direct shell callers, shares one lease."""
 

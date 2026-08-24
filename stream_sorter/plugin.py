@@ -16,11 +16,16 @@ except ImportError:  # pragma: no cover - Dispatcharr runs on Linux
     fcntl = None
 
 from .analyzer import ANALYSIS_CACHE_PATH, probe_assigned_streams
-from .execution_control import AnalysisAlreadyRunning, AnalysisCancelled, request_analysis_cancel
+from .execution_control import (
+    AnalysisAlreadyRunning,
+    AnalysisCancelled,
+    analysis_maintenance_execution,
+    request_analysis_cancel,
+)
 from .incremental import ANALYSIS_HEALTH_REPORT_PATH, _parse_datetime, analyze_assigned_streams
-from .reliability import RELIABILITY_PATH, record_runtime_event
+from .reliability import RELIABILITY_PATH, record_runtime_event, reset_reliability_cache
 from .sorter import REPORT_PATH, resolve_channel_scope, sort_channels
-from .throughput import DEFAULT_CACHE_PATH
+from .throughput import LEGACY_CACHE_PATH
 
 
 PROBE_LOCK_PATH = "/data/dispatcharr_stream_sort_probe.lock"
@@ -390,11 +395,18 @@ class _ProgressLogger:
             text = str(msg) % args if args else str(msg)
             if text.startswith("[Analyze Media]"):
                 phase = "media_analysis"
+            elif text.startswith("[Analyze Combined Content]"):
+                phase = "content_analysis"
+            elif text.startswith("[Analyze Combined]"):
+                phase = "combined_analysis"
+            elif text.startswith("[Analyze Content Retry"):
+                phase = "content_retry"
+            elif text.startswith("[Analyze Content]"):
+                phase = "content_analysis"
             elif text.startswith("[Analyze Throughput]"):
                 phase = "throughput_analysis"
             elif text.startswith("[Analyze Retry"):
-                _update_status(self.job_id, phase="media_retry")
-                return
+                phase = "media_retry"
             else:
                 return
             match = re.search(r"\]\s+(\d+)%\s+\((\d+)/(\d+)\)", text)
@@ -637,7 +649,7 @@ def _recommend_ttls(settings: dict, *, report: dict) -> dict:
     hourly = status_patterns.get("hourly_dead_ratio") if isinstance(status_patterns.get("hourly_dead_ratio"), list) else []
     reasons = report.get("reasons") if isinstance(report.get("reasons"), Mapping) else {}
 
-    health_current = _safe_float(settings.get("health_content_ttl_hours"), 24.0)
+    health_current = _safe_float(settings.get("stream_data_ttl_hours"), 12.0)
     dead_current = _safe_float(settings.get("dead_content_ttl_hours"), 1.0)
     jitter_current = _safe_float(settings.get("analysis_ttl_jitter_percent"), 30.0)
 
@@ -705,7 +717,7 @@ def _recommend_ttls(settings: dict, *, report: dict) -> dict:
         confidence = "medium"
 
     recommendations = {
-        "health_content_ttl_hours": suggested_health,
+        "stream_data_ttl_hours": suggested_health,
         "dead_content_ttl_hours": suggested_dead,
         "analysis_ttl_jitter_percent": suggested_jitter,
     }
@@ -717,7 +729,7 @@ def _recommend_ttls(settings: dict, *, report: dict) -> dict:
         "history_rows": history_rows,
         "confidence": confidence,
         "current_ttls": {
-            "health_content_ttl_hours": health_current,
+            "stream_data_ttl_hours": health_current,
             "dead_content_ttl_hours": dead_current,
             "analysis_ttl_jitter_percent": jitter_current,
         },
@@ -774,8 +786,8 @@ def _run_ttl_recommendation_action(settings: dict) -> dict:
     current = result["current_ttls"]
     recommended = result["recommended_ttls"]
     message = (
-        f"TTL recommendation complete. Health TTL: {_format_hours(current['health_content_ttl_hours'])}h"
-        f" -> {_format_hours(recommended['health_content_ttl_hours'])}h; Dead TTL: "
+        f"TTL recommendation complete. FFprobe TTL: {_format_hours(current['stream_data_ttl_hours'])}h"
+        f" -> {_format_hours(recommended['stream_data_ttl_hours'])}h; Dead TTL: "
         f"{_format_hours(current['dead_content_ttl_hours'])}h -> {_format_hours(recommended['dead_content_ttl_hours'])}h;"
         f" suggested TTL jitter: {recommended['analysis_ttl_jitter_percent']}%."
     )
@@ -1376,6 +1388,50 @@ def _start_background_job(
     }
 
 
+def _run_reset_statistics_action(settings: Mapping[str, object]) -> dict:
+    try:
+        lease = analysis_maintenance_execution()
+        lease.__enter__()
+    except AnalysisAlreadyRunning:
+        return {
+            "status": "error",
+            "message": "Statistics cannot be reset while an analysis scan is running. Stop the scan and wait for it to finish first.",
+        }
+    try:
+        include_history = _safe_bool(settings.get("reset_statistics_include_history"), False)
+        scan_paths = (
+            ANALYSIS_CACHE_PATH,
+            LEGACY_CACHE_PATH,
+            ANALYSIS_HEALTH_REPORT_PATH,
+            TTL_RECOMMENDATION_PATH,
+            STATUS_PATH,
+        )
+        removed = []
+        for path in scan_paths:
+            try:
+                os.unlink(path)
+                removed.append(path)
+            except FileNotFoundError:
+                continue
+
+        if include_history:
+            reset_reliability_cache(RELIABILITY_PATH)
+
+        scope = "scan data and all runtime history" if include_history else "scan data only"
+        return {
+            "status": "ok",
+            "message": (
+                f"Stream Sort statistics reset complete ({scope}). "
+                "The schedule and plugin settings were preserved; the next analysis starts with no cached scan evidence."
+            ),
+            "reset_scope": "all_history" if include_history else "scan_only",
+            "removed_paths": removed,
+            "reliability_reset": include_history,
+        }
+    finally:
+        lease.__exit__(None, None, None)
+
+
 class Plugin:
     name = _MANIFEST["name"]
     version = _MANIFEST["version"]
@@ -1471,6 +1527,9 @@ class Plugin:
 
             if action == "health_report":
                 return _run_health_report_action()
+
+            if action == "reset_statistics":
+                return _run_reset_statistics_action(settings)
 
             if action == "dry_run":
                 result = sort_channels(settings, apply=False, logger=logger)

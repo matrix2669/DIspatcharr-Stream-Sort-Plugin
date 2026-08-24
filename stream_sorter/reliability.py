@@ -5,7 +5,7 @@ import os
 import tempfile
 import threading
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import math
 from typing import Any, Callable, Mapping
 
@@ -20,6 +20,9 @@ MAX_RECENT_EVENTS = 200
 SCHEMA_VERSION = 2
 EVIDENCE_HALF_LIFE_DAYS = 14.0
 STARTUP_WINDOW_SECONDS = 60.0
+PLAYBACK_THROUGHPUT_MIN_SECONDS = 300.0
+PLAYBACK_THROUGHPUT_HISTORY_DAYS = 90
+PLAYBACK_THROUGHPUT_HISTORY_MAX_ROWS = 1000
 SWITCH_FAILOVER_WINDOW_SECONDS = 15.0
 SWITCH_RECONNECT_SUPPRESSION_SECONDS = 2.0
 TRACKED_EVENTS = {
@@ -224,8 +227,24 @@ def _new_stream_entry(stream_id: int) -> dict[str, Any]:
         "last_failure_at": None,
         "last_failure_reason": None,
         "recent_events": [],
+        "playback_throughput_history": [],
         "reliability_evidence": _new_evidence(),
     }
+
+
+def _append_playback_throughput(entry: dict[str, Any], row: Mapping[str, Any], now: datetime) -> None:
+    history = list(entry.get("playback_throughput_history") or [])
+    history.append(dict(row))
+    cutoff = now - timedelta(days=PLAYBACK_THROUGHPUT_HISTORY_DAYS)
+    history = [
+        candidate for candidate in history
+        if (_parse_datetime(candidate.get("observed_at")) or now) >= cutoff
+    ]
+    entry["playback_throughput_history"] = history[-PLAYBACK_THROUGHPUT_HISTORY_MAX_ROWS:]
+
+
+def _provider_id(entry: Mapping[str, Any]) -> int | None:
+    return _as_int(entry.get("m3u_account_id"))
 
 
 def _new_evidence() -> dict[str, Any]:
@@ -334,6 +353,12 @@ def _switch_context(channel_state: Mapping[str, Any], now: datetime) -> tuple[in
     )
 
 
+def reset_reliability_cache(path: str = RELIABILITY_PATH) -> None:
+    """Clear runtime history without racing the event-driven collector."""
+    with _locked_cache(path):
+        _save_reliability_cache(_empty_cache(), path)
+
+
 def record_runtime_event(
     event_name: str | None,
     payload: Mapping[str, Any] | None,
@@ -386,6 +411,7 @@ def record_runtime_event(
                 "last_switch_stream_id": None,
                 "last_switch_at": None,
                 "session_failure_at": None,
+                "session_switched": False,
             },
         )
         if payload_dict.get("channel_name"):
@@ -410,6 +436,7 @@ def record_runtime_event(
                 channel_state["active_stream_id"] = sid
                 channel_state["active_since"] = now_iso
                 channel_state["session_failure_at"] = None
+                channel_state["session_switched"] = False
                 recorded_stream_id = sid
 
         elif event == "stream_switch":
@@ -435,6 +462,7 @@ def record_runtime_event(
             channel_state["last_switch_previous_stream_id"] = previous_sid
             channel_state["last_switch_stream_id"] = new_sid
             channel_state["last_switch_at"] = now_iso
+            channel_state["session_switched"] = True
 
         elif event == "channel_failover":
             previous_sid = _as_int(payload_dict.get("previous_stream_id"))
@@ -456,6 +484,15 @@ def record_runtime_event(
                         entry["buffering_failover_seconds"] = round(
                             float(entry.get("buffering_failover_seconds") or 0.0) + max(0.0, duration), 3
                         )
+                    _append_playback_throughput(entry, {
+                        "observed_at": now_iso,
+                        "kind": "delivery_failure",
+                        "status": "insufficient",
+                        "reason": reason,
+                        "speed": payload_dict.get("speed"),
+                        "m3u_account_id": _provider_id(entry),
+                        "eligible_for_throughput": True,
+                    }, now_dt)
                 _touch_failure(entry, now_iso, reason)
                 channel_state["session_failure_at"] = now_iso
                 _append_recent(entry, event=event, at=now_iso, payload=payload_dict)
@@ -542,11 +579,32 @@ def record_runtime_event(
                     started is not None
                     and clean_seconds >= STARTUP_WINDOW_SECONDS
                     and (session_failure is None or session_failure < started)
+                    and not bool(channel_state.get("session_switched"))
                 )
                 if clean_session:
                     _add_evidence(entry, now_dt, clean_stops=1)
                     entry["last_clean_playback_at"] = now_iso
                     entry["last_clean_playback_seconds"] = round(clean_seconds, 3)
+                    entry["last_clean_playback_m3u_account_id"] = _provider_id(entry)
+                    try:
+                        runtime = float(payload_dict.get("runtime") or clean_seconds)
+                        total_bytes = int(payload_dict.get("total_bytes"))
+                    except (TypeError, ValueError):
+                        runtime = 0.0
+                        total_bytes = 0
+                    if runtime > 0 and total_bytes > 0:
+                        measured_mbps = total_bytes * 8.0 / runtime / 1_000_000.0
+                        _append_playback_throughput(entry, {
+                            "observed_at": now_iso,
+                            "kind": "clean_playback",
+                            "status": "observed",
+                            "runtime_seconds": round(runtime, 3),
+                            "total_bytes": total_bytes,
+                            "measured_mbps": round(measured_mbps, 4),
+                            "m3u_account_id": _provider_id(entry),
+                            "eligible_for_content": runtime >= STARTUP_WINDOW_SECONDS,
+                            "eligible_for_throughput": runtime >= PLAYBACK_THROUGHPUT_MIN_SECONDS,
+                        }, now_dt)
                 _append_recent(entry, event=event, at=now_iso, payload=payload_dict)
                 recorded_stream_id = int(entry["stream_id"])
             channel_state["active_stream_id"] = None
@@ -555,6 +613,7 @@ def record_runtime_event(
             channel_state["last_switch_stream_id"] = None
             channel_state["last_switch_at"] = None
             channel_state["session_failure_at"] = None
+            channel_state["session_switched"] = False
 
         channel_state["updated_at"] = now_iso
         data["updated_at"] = now_iso

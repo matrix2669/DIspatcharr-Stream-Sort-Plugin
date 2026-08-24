@@ -24,6 +24,7 @@ from .reliability import RELIABILITY_PATH, load_reliability_cache
 from .throughput import (
     DEFAULT_USER_AGENT,
     LEGACY_CACHE_PATH,
+    capture_stream_sample,
     load_cache as load_throughput_cache,
     probe_stream,
 )
@@ -36,6 +37,8 @@ MEDIA_CHECK_ROLLUP_RETENTION_DAYS = 365
 HEALTH_REPORT_TIMEZONE = ZoneInfo("America/New_York")
 MEDIA_BITRATE_RELATIVE_TOLERANCE = 0.30
 MEDIA_BITRATE_ABSOLUTE_TOLERANCE_KBPS = 500.0
+SUSTAINED_PLAYBACK_HEALTHY_RATIO = 1.10
+SUSTAINED_PLAYBACK_MINIMUM_RATIO = 1.00
 
 
 def _parse_datetime(value: Any) -> datetime | None:
@@ -215,11 +218,102 @@ def metadata_check_reason(
 media_check_reason = health_check_reason
 
 
+def _provider_matches(expected, observed) -> bool:
+    if expected in (None, "") or observed in (None, ""):
+        return False
+    return str(expected) == str(observed)
+
+
+def ffprobe_check_reason(
+    entry: Mapping[str, Any] | None,
+    *,
+    url_hash: str,
+    ttl_hours: float,
+    dead_ttl_hours: float,
+    provider_id: Any = None,
+    ttl_jitter_percent: float,
+    now: datetime,
+) -> str | None:
+    if not entry:
+        return "missing"
+    if str(entry.get("url_hash") or "") != url_hash:
+        return "url_changed"
+    cached_provider = entry.get("m3u_account_id")
+    if provider_id not in (None, "") and cached_provider not in (None, "") and not _provider_matches(provider_id, cached_provider):
+        return "provider_changed"
+    status = str(entry.get("status") or "unknown").lower()
+    if status == "dead":
+        checked_at = entry.get("dead_checked_at") or entry.get("health_checked_at") or entry.get("tested_at") or entry.get("ffprobe_checked_at")
+        age = _age_hours(checked_at, now)
+        if entry.get("retry_pending"):
+            return "dead_retry_pending"
+        if age is not None and dead_ttl_hours > 0 and age < dead_ttl_hours:
+            return None
+        return "dead_ttl_expired"
+    if status != "alive":
+        return f"status_{status}"
+    checked_at = entry.get("ffprobe_checked_at") or entry.get("media_checked_at")
+    age = _age_hours(checked_at, now)
+    if age is None:
+        return "missing_timestamp"
+    if ttl_hours <= 0:
+        return "ttl_forced"
+    effective_ttl = _ttl_with_jitter(ttl_hours, url_hash=url_hash, jitter_percent=ttl_jitter_percent)
+    if age >= effective_ttl:
+        return "ttl_expired"
+    return None
+
+
+def content_check_reason(
+    entry: Mapping[str, Any] | None,
+    *,
+    url_hash: str,
+    ttl_hours: float,
+    dead_ttl_hours: float,
+    provider_id: Any = None,
+    ttl_jitter_percent: float = 0.0,
+    now: datetime,
+) -> str | None:
+    if not entry:
+        return "missing"
+    if str(entry.get("url_hash") or "") != url_hash:
+        return "url_changed"
+    if entry.get("content_checked_at"):
+        cached_provider = entry.get("content_m3u_account_id")
+        if provider_id not in (None, "") and cached_provider in (None, ""):
+            return "provider_missing"
+        if provider_id not in (None, "") and not _provider_matches(provider_id, cached_provider):
+            return "provider_changed"
+    status = str(entry.get("status") or "unknown").lower()
+    if status == "dead":
+        checked_at = entry.get("dead_checked_at") or entry.get("health_checked_at") or entry.get("tested_at")
+        age = _age_hours(checked_at, now)
+        if entry.get("retry_pending"):
+            return "dead_retry_pending"
+        if age is not None and dead_ttl_hours is not None and dead_ttl_hours > 0 and age < dead_ttl_hours:
+            return None
+        return "dead_ttl_expired"
+    if status != "alive":
+        return "health_revalidation"
+    checked_at = entry.get("content_checked_at")
+    age = _age_hours(checked_at, now)
+    if age is None:
+        return "missing"
+    if ttl_hours <= 0:
+        return "ttl_forced"
+    effective_ttl_hours = _ttl_with_jitter(ttl_hours, url_hash=url_hash, jitter_percent=ttl_jitter_percent)
+    if age >= effective_ttl_hours:
+        return "ttl_expired"
+    return None
+
+
 def throughput_check_reason(
     entry: Mapping[str, Any] | None,
     *,
     url_hash: str,
     ttl_hours: float,
+    dead_ttl_hours: float | None = None,
+    provider_id: Any = None,
     ttl_jitter_percent: float = 0.0,
     now: datetime,
 ) -> str | None:
@@ -230,8 +324,18 @@ def throughput_check_reason(
         return "missing"
     if str(throughput.get("url_hash") or "") != url_hash:
         return "url_changed"
+    cached_provider = throughput.get("m3u_account_id")
+    if provider_id not in (None, "") and cached_provider in (None, ""):
+        return "provider_missing"
+    if provider_id not in (None, "") and not _provider_matches(provider_id, cached_provider):
+        return "provider_changed"
     status = str(throughput.get("status") or "unknown").strip().lower()
     if status != "healthy":
+        checked_at = throughput.get("checked_at") or throughput.get("tested_at")
+        age = _age_hours(checked_at, now)
+        effective_dead_ttl = ttl_hours if dead_ttl_hours is None else dead_ttl_hours
+        if age is not None and effective_dead_ttl > 0 and age < effective_dead_ttl:
+            return None
         return f"status_{status or 'unknown'}"
     if ttl_hours <= 0:
         return "ttl_forced"
@@ -330,6 +434,98 @@ def _overall_health_text(counts) -> str:
 
 def _overall_throughput_text(counts) -> str:
     return f"healthy={counts.get('healthy', 0)} marginal={counts.get('marginal', 0)} insufficient={counts.get('insufficient', 0)} unknown={counts.get('unknown', 0)}"
+
+
+def _playback_throughput_report(items, cache) -> dict[str, Any]:
+    ratios = []
+    failures = 0
+    streams = set()
+    buckets = collections.Counter()
+    for item in items:
+        entry = cache.get(str(item["id"])) or {}
+        for row in entry.get("playback_throughput_history") or []:
+            if row.get("kind") == "delivery_failure":
+                failures += 1
+                streams.add(int(item["id"]))
+                continue
+            ratio = row.get("ratio")
+            if not isinstance(ratio, (int, float)):
+                continue
+            ratio = float(ratio)
+            ratios.append(ratio)
+            streams.add(int(item["id"]))
+            if ratio < 1.0:
+                buckets["below_1_00"] += 1
+            elif ratio < 1.03:
+                buckets["1_00_to_1_03"] += 1
+            elif ratio < 1.05:
+                buckets["1_03_to_1_05"] += 1
+            elif ratio < 1.07:
+                buckets["1_05_to_1_07"] += 1
+            elif ratio < 1.10:
+                buckets["1_07_to_1_10"] += 1
+            else:
+                buckets["at_or_above_1_10"] += 1
+    return {
+        "clean_observations": len(ratios),
+        "delivery_failures": failures,
+        "streams_observed": len(streams),
+        "ratio_percentiles": {
+            "p10": _round_if_present(_percentile(ratios, 0.10), 4),
+            "p25": _round_if_present(_percentile(ratios, 0.25), 4),
+            "p50": _round_if_present(_percentile(ratios, 0.50), 4),
+            "p75": _round_if_present(_percentile(ratios, 0.75), 4),
+            "p90": _round_if_present(_percentile(ratios, 0.90), 4),
+        },
+        "ratio_buckets": dict(buckets),
+        "initial_healthy_ratio": SUSTAINED_PLAYBACK_HEALTHY_RATIO,
+    }
+
+
+def _projected_status_counts(items, cache, media_results) -> collections.Counter[str]:
+    counts = _status_counts(items, cache)
+    for sid, result in media_results.items():
+        previous = str((cache.get(str(sid)) or {}).get("status") or "unknown").lower()
+        current = str(result.get("status") or "unknown").lower()
+        counts[previous] -= 1
+        counts[current] += 1
+    return counts
+
+
+def _log_media_progress(
+    logger,
+    *,
+    prefix: str,
+    completed: int,
+    phase_total: int,
+    item: Mapping[str, Any],
+    reason: str,
+    result: Mapping[str, Any],
+    items,
+    cache,
+    media_results,
+    cached_media: int,
+    pending_media: int,
+    eta_seconds: float,
+) -> None:
+    stats = result.get("stats") or {}
+    logger.info(
+        "%s %d%% (%d/%d) stream=%s reason=%s health=%s resolution=%s fps=%s bitrate=%skbps | overall %s cached_media=%d pending_media=%d | ETA=%s",
+        prefix,
+        int(round(completed / max(phase_total, 1) * 100)),
+        completed,
+        phase_total,
+        item["id"],
+        reason,
+        str(result.get("status") or "unknown").lower(),
+        stats.get("resolution") or "n/a",
+        f"{float(stats['source_fps']):.1f}" if stats.get("source_fps") is not None else "n/a",
+        f"{float(stats['video_bitrate']):.0f}" if stats.get("video_bitrate") is not None else "n/a",
+        _overall_health_text(_projected_status_counts(items, cache, media_results)),
+        cached_media,
+        pending_media,
+        analyzer._format_eta(eta_seconds),
+    )
 
 
 def _append_health_history(
@@ -641,6 +837,7 @@ def _build_health_report(
             "media_due": dict(media_reason_counts),
             "throughput_due": dict(throughput_reason_counts),
         },
+        "playback_throughput": _playback_throughput_report(items, cache),
         "ttl_tuning_guidance": {
             "suggested_health_ttl_hours": _round_if_present(alive_episode_p25, 2),
             "suggested_dead_ttl_hours": _round_if_present(dead_recovery_p50, 2),
@@ -963,7 +1160,146 @@ def _sync_runtime_playback_health(
     return refreshed
 
 
-def _merge_media_result(item, previous, result, *, analysis_reason: str | None = None) -> dict[str, Any]:
+def _sync_runtime_playback_evidence(
+    items,
+    cache,
+    reliability_cache,
+    *,
+    min_clean_playback_seconds: float,
+    min_throughput_playback_seconds: float,
+) -> int:
+    refreshed = 0
+    streams = reliability_cache.get("streams") if isinstance(reliability_cache, Mapping) else {}
+    streams = streams if isinstance(streams, Mapping) else {}
+    for item in items:
+        telemetry = streams.get(str(item["id"]))
+        if not isinstance(telemetry, Mapping):
+            continue
+        key = str(item["id"])
+        current_hash = analyzer._stream_url_hash(str(item.get("url") or ""))
+        previous = cache.get(key)
+        entry = dict(previous) if isinstance(previous, Mapping) and str(previous.get("url_hash") or "") == current_hash else {}
+        changed = False
+
+        clean_at = _parse_datetime(telemetry.get("last_clean_playback_at"))
+        try:
+            clean_seconds = float(telemetry.get("last_clean_playback_seconds") or 0.0)
+        except (TypeError, ValueError):
+            clean_seconds = 0.0
+        clean_provider_matches = _provider_matches(
+            item.get("account_id"),
+            telemetry.get("last_clean_playback_m3u_account_id"),
+        )
+        current_content_at = _parse_datetime(entry.get("content_checked_at"))
+        if (
+            clean_at is not None
+            and clean_seconds >= min_clean_playback_seconds
+            and clean_provider_matches
+            and (current_content_at is None or clean_at > current_content_at)
+        ):
+            entry["content_checked_at"] = clean_at.isoformat()
+            entry["content_source"] = "dispatcharr_playback_assumed"
+            entry["content_playback_seconds"] = round(clean_seconds, 3)
+            entry["content_m3u_account_id"] = item.get("account_id")
+            entry["content_validation_separated"] = True
+            changed = True
+
+        imported = list(entry.get("playback_throughput_history") or [])
+        imported_keys = {
+            (
+                str(row.get("observed_at") or ""),
+                str(row.get("kind") or ""),
+                str(row.get("reason") or ""),
+                str(row.get("m3u_account_id") or ""),
+            )
+            for row in imported if isinstance(row, Mapping)
+        }
+        stats = entry.get("stats") or item.get("dispatcharr_stats") or {}
+        _width, height = parse_resolution(stats)
+        nominal_kbps = estimate_nominal_throughput_kbps(height, parse_fps(stats))
+        for raw in telemetry.get("playback_throughput_history") or []:
+            if not isinstance(raw, Mapping):
+                continue
+            observed_at = _parse_datetime(raw.get("observed_at"))
+            if observed_at is None:
+                continue
+            row_key = (
+                observed_at.isoformat(),
+                str(raw.get("kind") or ""),
+                str(raw.get("reason") or ""),
+                str(raw.get("m3u_account_id") or ""),
+            )
+            if row_key in imported_keys:
+                continue
+            row = dict(raw)
+            row["observed_at"] = observed_at.isoformat()
+            row["nominal_video_kbps"] = nominal_kbps
+            attribution_valid = _provider_matches(item.get("account_id"), row.get("m3u_account_id"))
+            row["provider_attribution_valid"] = attribution_valid
+            if row.get("kind") == "delivery_failure":
+                row["status"] = "insufficient"
+                row["source"] = "dispatcharr_playback_failure"
+                eligible = attribution_valid
+            else:
+                measured = row.get("measured_mbps")
+                if not isinstance(measured, (int, float)) or nominal_kbps <= 0:
+                    imported.append(row)
+                    imported_keys.add(row_key)
+                    changed = True
+                    continue
+                ratio = float(measured) / (float(nominal_kbps) / 1000.0)
+                row["ratio"] = round(ratio, 4)
+                row["source"] = "dispatcharr_playback"
+                if ratio >= SUSTAINED_PLAYBACK_HEALTHY_RATIO:
+                    row["status"] = "healthy"
+                elif ratio >= SUSTAINED_PLAYBACK_MINIMUM_RATIO:
+                    row["status"] = "marginal"
+                else:
+                    row["status"] = "insufficient"
+                eligible = (
+                    attribution_valid
+                    and bool(row.get("eligible_for_throughput"))
+                    and float(row.get("runtime_seconds") or 0.0) >= min_throughput_playback_seconds
+                )
+            imported.append(row)
+            imported_keys.add(row_key)
+            changed = True
+            current_throughput_at = _parse_datetime((entry.get("throughput") or {}).get("checked_at"))
+            if eligible and (current_throughput_at is None or observed_at > current_throughput_at):
+                result = {
+                    "status": row["status"],
+                    "tested_at": observed_at.isoformat(),
+                    "measured_mbps": row.get("measured_mbps"),
+                    "nominal_video_kbps": nominal_kbps,
+                    "capacity_ratio": row.get("ratio"),
+                    "duration_seconds": row.get("runtime_seconds"),
+                    "source": row.get("source"),
+                    "reason": row.get("reason"),
+                }
+                entry = _merge_throughput_result(item, entry, result, ttl_hours=0.0)
+
+        cutoff = datetime.now(timezone.utc) - timedelta(days=MEDIA_CHECK_HISTORY_RETENTION_DAYS)
+        entry["playback_throughput_history"] = [
+            row for row in imported
+            if (_parse_datetime(row.get("observed_at")) or cutoff) >= cutoff
+        ][-MEDIA_CHECK_HISTORY_MAX_ROWS:]
+        if changed:
+            entry["stream_id"] = item.get("id")
+            entry["stream_name"] = item.get("name")
+            entry["url_hash"] = current_hash
+            cache[key] = entry
+            refreshed += 1
+    return refreshed
+
+
+def _merge_media_result(
+    item,
+    previous,
+    result,
+    *,
+    analysis_reason: str | None = None,
+    record_history: bool = True,
+) -> dict[str, Any]:
     merged = dict(previous or {})
     previous_throughput = merged.get("throughput")
     previous_stats = merged.get("stats")
@@ -972,7 +1308,13 @@ def _merge_media_result(item, previous, result, *, analysis_reason: str | None =
     checked = result.get("tested_at") or analyzer._utc_now_iso()
     merged["health_checked_at"] = checked
     merged["media_checked_at"] = checked
-    merged["content_checked_at"] = checked
+    merged["ffprobe_checked_at"] = checked
+    merged["content_validation_separated"] = True
+    details = result.get("details")
+    content = details.get("content") if isinstance(details, Mapping) else None
+    if isinstance(content, Mapping) and content.get("measured"):
+        merged["content_checked_at"] = content.get("tested_at") or checked
+        merged["content_m3u_account_id"] = item.get("account_id")
     merged["health_source"] = "stream_sort_analyzer"
     merged["stream_id"] = item.get("id")
     merged["stream_name"] = item.get("name")
@@ -980,6 +1322,10 @@ def _merge_media_result(item, previous, result, *, analysis_reason: str | None =
     merged["m3u_account_name"] = item.get("account_name")
     merged["url_hash"] = analyzer._stream_url_hash(str(item.get("url") or ""))
     status = str(result.get("status") or "unknown").lower()
+    if status == "dead":
+        merged["dead_checked_at"] = checked
+    elif status == "alive":
+        merged.pop("dead_checked_at", None)
     result_stats = result.get("stats")
     if isinstance(result_stats, Mapping) and result_stats:
         merged["stats"] = dict(result_stats)
@@ -999,9 +1345,86 @@ def _merge_media_result(item, previous, result, *, analysis_reason: str | None =
         merged["throughput"] = dict(previous_throughput)
     else:
         merged.pop("throughput", None)
+    if record_history:
+        _append_health_history(
+            merged,
+            reason=analysis_reason,
+            previous_status=previous_status,
+            new_status=str(result.get("status") or "unknown").lower(),
+            tested_at=checked,
+            result=result,
+        )
+    return merged
+
+
+def _content_checks_applicable(result: Mapping[str, Any], settings: Mapping[str, Any]) -> bool:
+    if analyzer._as_bool(settings.get("black_screen_detection"), True):
+        return True
+    if analyzer._as_bool(settings.get("frozen_video_detection"), True):
+        return True
+    details = result.get("details") if isinstance(result.get("details"), Mapping) else {}
+    stats = result.get("stats") if isinstance(result.get("stats"), Mapping) else {}
+    has_audio = bool(details.get("has_audio") or stats.get("audio_codec"))
+    return analyzer._as_bool(settings.get("silent_audio_detection"), True) and has_audio
+
+
+def _content_skipped_result(result: Mapping[str, Any]) -> dict[str, Any]:
+    updated = dict(result)
+    details = dict(updated.get("details") or {})
+    checked = analyzer._utc_now_iso()
+    details["content"] = {
+        "black": None,
+        "frozen": None,
+        "mean_volume_db": None,
+        "measured": True,
+        "skipped": True,
+        "skip_reason": "no_applicable_detectors",
+        "tested_at": checked,
+    }
+    updated.update({
+        "status": "alive",
+        "error_type": None,
+        "error": "",
+        "tested_at": checked,
+        "details": details,
+    })
+    return updated
+
+
+def _merge_content_result(item, previous, result, *, analysis_reason: str | None = None) -> dict[str, Any]:
+    merged = dict(previous or {})
+    previous_status = str(merged.get("status") or "unknown").lower()
+    details = dict(result.get("details") or {})
+    content = details.get("content") if isinstance(details.get("content"), Mapping) else {}
+    checked = content.get("tested_at") or result.get("tested_at") or analyzer._utc_now_iso()
+    for key in ("status", "error_type", "error", "retry_pending", "retry_telemetry"):
+        if key in result:
+            merged[key] = result.get(key)
+    merged["details"] = details
+    merged["tested_at"] = checked
+    merged["health_source"] = "stream_sort_content"
+    merged["content_validation_separated"] = True
+    if content.get("measured"):
+        merged["content_checked_at"] = checked
+        merged["content_source"] = "stream_sort_content"
+        merged["content_m3u_account_id"] = item.get("account_id")
+    merged["stream_id"] = item.get("id")
+    merged["stream_name"] = item.get("name")
+    merged["m3u_account_id"] = item.get("account_id")
+    merged["m3u_account_name"] = item.get("account_name")
+    merged["url_hash"] = analyzer._stream_url_hash(str(item.get("url") or ""))
+    if str(result.get("status") or "unknown").lower() == "dead":
+        merged["dead_checked_at"] = checked
+        merged["throughput"] = {
+            "status": "unknown",
+            "tested_at": checked,
+            "checked_at": checked,
+            "url_hash": merged["url_hash"],
+            "error": "throughput invalidated because content analysis marked the stream dead",
+        }
     _append_health_history(
         merged,
-        reason=analysis_reason,
+        reason=f"content_{analysis_reason or 'unknown'}",
         previous_status=previous_status,
         new_status=str(result.get("status") or "unknown").lower(),
         tested_at=checked,
@@ -1053,32 +1476,22 @@ def _analysis_reason(
     health_ttl_hours: float,
     content_ttl_hours: float,
     metadata_ttl_hours: float,
+    provider_id: Any = None,
     dead_ttl_hours: float | None = None,
     ttl_jitter_percent: float = 0.0,
     now: datetime,
 ) -> str | None:
-    reason = health_check_reason(
+    reason = ffprobe_check_reason(
         entry,
         url_hash=url_hash,
         ttl_hours=health_ttl_hours,
-        content_ttl_hours=content_ttl_hours,
         dead_ttl_hours=dead_ttl_hours,
-        ttl_jitter_percent=ttl_jitter_percent,
-        now=now,
-    )
-    if reason == "status_dead_ttl":
-        return None
-    if reason:
-        return f"health_{reason}"
-    reason = metadata_check_reason(
-        entry,
-        url_hash=url_hash,
-        ttl_hours=metadata_ttl_hours,
+        provider_id=provider_id,
         ttl_jitter_percent=ttl_jitter_percent,
         now=now,
     )
     if reason:
-        return f"metadata_{reason}"
+        return f"ffprobe_{reason}"
     return None
 
 
@@ -1108,8 +1521,9 @@ def analyze_assigned_streams(
     retries = max(0, min(5, analyzer._as_int(settings.get("analysis_retries"), 3)))
     account_delay = max(0.0, analyzer._as_float(settings.get("analysis_per_account_delay_seconds"), 1.0))
     max_streams = max(0, analyzer._as_int(settings.get("analysis_max_streams"), 0))
-    metadata_ttl_hours = max(0.0, analyzer._as_float(settings.get("stream_data_ttl_hours"), 12.0))
-    health_ttl_hours = max(0.0, analyzer._as_float(settings.get("health_content_ttl_hours"), 24.0))
+    ffprobe_ttl_hours = max(0.0, analyzer._as_float(settings.get("stream_data_ttl_hours"), 12.0))
+    metadata_ttl_hours = ffprobe_ttl_hours
+    health_ttl_hours = ffprobe_ttl_hours
     dead_ttl_hours = max(0.0, analyzer._as_float(settings.get("dead_content_ttl_hours"), 1.0))
     content_ttl_hours = max(0.0, analyzer._as_float(settings.get("content_validation_ttl_hours"), 168.0))
     media_bitrate_relative_tolerance = min(
@@ -1126,7 +1540,6 @@ def analyze_assigned_streams(
     playback_health_reuse = analyzer._as_bool(settings.get("playback_health_reuse"), True)
     playback_health_min_seconds = max(60.0, analyzer._as_float(settings.get("playback_health_min_seconds"), 300.0))
     playback_health_clean_min_seconds = max(30.0, analyzer._as_float(settings.get("playback_health_clean_min_seconds"), 60.0))
-    playback_health_ttl_hours = max(0.0, analyzer._as_float(settings.get("playback_health_ttl_hours"), 6.0))
     throughput_ttl_hours = max(0.0, analyzer._as_float(settings.get("healthy_throughput_ttl_hours"), 6.0))
     analysis_ttl_jitter_percent = max(0.0, min(100.0, analyzer._as_float(settings.get("analysis_ttl_jitter_percent"), 30.0)))
     throughput_duration = max(1.0, analyzer._as_float(settings.get("probe_duration_seconds"), 8.0))
@@ -1154,19 +1567,17 @@ def analyze_assigned_streams(
 
     playback_health_refreshed = 0
     if playback_health_reuse:
-        playback_health_refreshed = _sync_runtime_playback_health(
+        playback_health_refreshed = _sync_runtime_playback_evidence(
             items,
             cache,
             load_reliability_cache(RELIABILITY_PATH),
-            min_playback_seconds=playback_health_min_seconds,
             min_clean_playback_seconds=playback_health_clean_min_seconds,
-            ttl_hours=playback_health_ttl_hours,
-            now=datetime.now(timezone.utc),
+            min_throughput_playback_seconds=playback_health_min_seconds,
         )
         if playback_health_refreshed:
             analyzer.save_analysis_cache(cache, cache_path)
             logger.info(
-                "[Analyze] Reused recent successful playback as reachability evidence for %d streams",
+                "[Analyze] Imported Dispatcharr playback content/throughput evidence for %d streams",
                 playback_health_refreshed,
             )
 
@@ -1187,23 +1598,40 @@ def analyze_assigned_streams(
 
     now = datetime.now(timezone.utc)
     media_due = []
+    content_reason_by_id = {}
     for item in items:
+        sid = int(item["id"])
+        entry = cache.get(str(sid))
+        url_hash = analyzer._stream_url_hash(str(item.get("url") or ""))
         reason = _analysis_reason(
-            cache.get(str(item["id"])),
-            url_hash=analyzer._stream_url_hash(str(item.get("url") or "")),
+            entry,
+            url_hash=url_hash,
             health_ttl_hours=health_ttl_hours,
             content_ttl_hours=content_ttl_hours,
             metadata_ttl_hours=metadata_ttl_hours,
+            provider_id=item.get("account_id"),
             dead_ttl_hours=dead_ttl_hours,
             ttl_jitter_percent=analysis_ttl_jitter_percent,
             now=now,
         )
+        content_reason = content_check_reason(
+            entry,
+            url_hash=url_hash,
+            ttl_hours=content_ttl_hours,
+            dead_ttl_hours=dead_ttl_hours,
+            provider_id=item.get("account_id"),
+            ttl_jitter_percent=analysis_ttl_jitter_percent,
+            now=now,
+        )
+        if content_reason:
+            content_reason_by_id[sid] = content_reason
         if reason:
             media_due.append((item, reason))
 
     media_reason_counts = collections.Counter(reason for _, reason in media_due)
 
     media_due_ids = {int(item["id"]) for item, _ in media_due}
+    initial_due_ids = media_due_ids | set(content_reason_by_id)
     initial_throughput_due = 0
     initial_fully_cached = 0
     for item in items:
@@ -1214,20 +1642,22 @@ def analyze_assigned_streams(
                 entry,
                 url_hash=analyzer._stream_url_hash(str(item.get("url") or "")),
                 ttl_hours=throughput_ttl_hours,
+                dead_ttl_hours=dead_ttl_hours,
+                provider_id=item.get("account_id"),
                 ttl_jitter_percent=analysis_ttl_jitter_percent,
                 now=now,
             )
             if reason or int(item["id"]) in dispatcharr_metadata_changed_ids:
                 initial_throughput_due += 1
-            elif int(item["id"]) not in media_due_ids:
+            elif int(item["id"]) not in initial_due_ids:
                 initial_fully_cached += 1
-        elif int(item["id"]) not in media_due_ids:
+        elif int(item["id"]) not in initial_due_ids:
             initial_fully_cached += 1
 
     logger.info(
-        "[Analyze] Starting: streams=%d media_due=%d throughput_due=%d fully_cached=%d playback_health_refreshed=%d dispatcharr_metadata_refreshed=%d metadata_ttl=%.1fh health_ttl=%.1fh dead_ttl=%.1fh content_ttl=%.1fh healthy_throughput_ttl=%.1fh ttl_jitter=%.1f%% workers=%d",
-        total, len(media_due), initial_throughput_due, initial_fully_cached, playback_health_refreshed, dispatcharr_metadata_refreshed,
-        metadata_ttl_hours, health_ttl_hours, dead_ttl_hours, content_ttl_hours, throughput_ttl_hours, analysis_ttl_jitter_percent, workers,
+        "[Analyze] Starting: streams=%d ffprobe_due=%d content_due=%d throughput_due=%d fully_cached=%d playback_evidence_refreshed=%d dispatcharr_metadata_refreshed=%d ffprobe_ttl=%.1fh dead_ttl=%.1fh content_ttl=%.1fh healthy_throughput_ttl=%.1fh ttl_jitter=%.1f%% workers=%d",
+        total, len(media_due), len(content_reason_by_id), initial_throughput_due, initial_fully_cached, playback_health_refreshed, dispatcharr_metadata_refreshed,
+        ffprobe_ttl_hours, dead_ttl_hours, content_ttl_hours, throughput_ttl_hours, analysis_ttl_jitter_percent, workers,
     )
     if not items:
         _save_json(
@@ -1282,6 +1712,7 @@ def analyze_assigned_streams(
             settings=settings,
             user_agent=str(item.get("user_agent") or DEFAULT_USER_AGENT),
             logger=logger,
+            include_content=False,
         )
         if result.get("error_type") == "rate_limited":
             analyzer._RATE_LIMIT_GUARD.record_hit(logger)
@@ -1335,22 +1766,24 @@ def analyze_assigned_streams(
                 "retry_attempts": 0,
                 "retry_deferred": 0,
                 "failure_types": [initial_error_type] if initial_error_type else [],
+                "current_retry_attempts": 0,
             }
             elapsed = max(time.monotonic() - media_started, 0.001)
             eta = elapsed / completed * (len(media_due) - completed) if completed < len(media_due) else 0.0
-            counts = _status_counts(items, cache)
-            old_status = str((cache.get(str(item["id"])) or {}).get("status") or "unknown").lower()
-            new_status = str(result.get("status") or "unknown").lower()
-            counts[old_status] -= 1
-            counts[new_status] += 1
-            stats = result.get("stats") or {}
-            logger.info(
-                "[Analyze Media] %d%% (%d/%d) stream=%s reason=%s health=%s resolution=%s fps=%s bitrate=%skbps | overall %s cached_media=%d pending_media=%d | ETA=%s",
-                int(round(completed / len(media_due) * 100)), completed, len(media_due), item["id"],
-                reason_by_id[int(item["id"])], new_status, stats.get("resolution") or "n/a",
-                f"{float(stats['source_fps']):.1f}" if stats.get("source_fps") is not None else "n/a",
-                f"{float(stats['video_bitrate']):.0f}" if stats.get("video_bitrate") is not None else "n/a",
-                _overall_health_text(counts), total - len(media_due), len(media_due) - completed, analyzer._format_eta(eta),
+            _log_media_progress(
+                logger,
+                prefix="[Analyze Media]",
+                completed=completed,
+                phase_total=len(media_due),
+                item=item,
+                reason=reason_by_id[sid],
+                result=result,
+                items=items,
+                cache=cache,
+                media_results=media_results,
+                cached_media=total - len(media_due),
+                pending_media=len(media_due) - completed,
+                eta_seconds=eta,
             )
 
         canceled = analysis_cancel_requested()
@@ -1376,13 +1809,17 @@ def analyze_assigned_streams(
             if canceled:
                 break
             retry_items = [by_id[sid] for sid in retry_ids]
-            for item, future in _fair_account_futures(
-                retry_items,
-                run_media,
-                max_workers=workers,
-                thread_name_prefix="stream-sort-media-retry",
-                capacity_manager=capacity_manager,
-                max_per_account=1,
+            retry_started = time.monotonic()
+            for retry_completed, (item, future) in enumerate(
+                _fair_account_futures(
+                    retry_items,
+                    run_media,
+                    max_workers=workers,
+                    thread_name_prefix="stream-sort-media-retry",
+                    capacity_manager=capacity_manager,
+                    max_per_account=1,
+                ),
+                start=1,
             ):
                 if future is None:
                     media_retry_telemetry[int(item["id"])]["retry_deferred"] += 1
@@ -1408,46 +1845,30 @@ def analyze_assigned_streams(
                 media_results[sid] = retry_result
                 telemetry = media_retry_telemetry[sid]
                 telemetry["retry_attempts"] += 1
+                telemetry["current_retry_attempts"] += 1
                 error_type = str(retry_result.get("error_type") or "")
                 if error_type and error_type not in telemetry["failure_types"]:
                     telemetry["failure_types"].append(error_type)
+                elapsed = max(time.monotonic() - retry_started, 0.001)
+                eta = elapsed / retry_completed * (len(retry_items) - retry_completed) if retry_completed < len(retry_items) else 0.0
+                _log_media_progress(
+                    logger,
+                    prefix=f"[Analyze Retry {retry_pass}/{retries}]",
+                    completed=retry_completed,
+                    phase_total=len(retry_items),
+                    item=item,
+                    reason=reason_by_id[sid],
+                    result=retry_result,
+                    items=items,
+                    cache=cache,
+                    media_results=media_results,
+                    cached_media=total - len(media_due),
+                    pending_media=len(retry_items) - retry_completed,
+                    eta_seconds=eta,
+                )
             canceled = analysis_cancel_requested()
 
-        canceled = canceled or analysis_cancel_requested()
-
-        for item, _ in media_due:
-            sid = int(item["id"])
-            if sid not in media_results:
-                continue
-            result = media_results[sid]
-            telemetry = media_retry_telemetry[sid]
-            terminal_status = str(result.get("status") or "unknown").lower()
-            telemetry["terminal_status"] = terminal_status
-            telemetry["recovered_after_retries"] = bool(
-                telemetry["initial_failed"]
-                and telemetry["retry_attempts"]
-                and terminal_status == "alive"
-            )
-            telemetry["retries_exhausted"] = bool(
-                retries > 0
-                and telemetry["retry_attempts"] >= retries
-                and str(result.get("error_type") or "") in analyzer.RETRYABLE_ERROR_TYPES
-            )
-            telemetry["retry_pending"] = bool(
-                terminal_status == "dead"
-                and retries > 0
-                and telemetry["retry_attempts"] < retries
-                and str(result.get("error_type") or "") in analyzer.RETRYABLE_ERROR_TYPES
-            )
-            result["retry_pending"] = telemetry["retry_pending"]
-            result["retry_telemetry"] = telemetry
-            cache[str(sid)] = _merge_media_result(
-                item,
-                cache.get(str(sid)),
-                result,
-                analysis_reason=reason_by_id.get(sid),
-            )
-
+    canceled = canceled or analysis_cancel_requested()
     media_changed_ids = {
         sid for sid, result in media_results.items()
         if _media_stats_changed_for_throughput(
@@ -1464,12 +1885,15 @@ def analyze_assigned_streams(
     for item in items:
         sid = int(item["id"])
         entry = cache.get(str(sid)) or {}
-        if str(entry.get("status") or "unknown").lower() != "alive":
+        effective = media_results.get(sid) or entry
+        if str(effective.get("status") or "unknown").lower() != "alive":
             continue
         reason = throughput_check_reason(
             entry,
             url_hash=analyzer._stream_url_hash(str(item.get("url") or "")),
             ttl_hours=throughput_ttl_hours,
+            dead_ttl_hours=dead_ttl_hours,
+            provider_id=item.get("account_id"),
             ttl_jitter_percent=analysis_ttl_jitter_percent,
             now=now,
         )
@@ -1479,18 +1903,371 @@ def analyze_assigned_streams(
             throughput_due.append((item, reason))
     throughput_reason_counts = collections.Counter(reason for _, reason in throughput_due)
 
+    content_results = {}
+    throughput_results = {}
     throughput_checked_ids = set()
     throughput_capacity_deferred_ids = set()
+    content_checked_ids = set()
+    content_attempted_ids = set()
+    content_capacity_deferred_ids = set()
+    item_by_id = {int(item["id"]): item for item in items}
+    throughput_reason_by_id = {int(item["id"]): reason for item, reason in throughput_due}
+    content_candidate_ids = {
+        sid for sid in content_reason_by_id
+        if str((media_results.get(sid) or cache.get(str(sid)) or {}).get("status") or "unknown").lower() == "alive"
+    }
+
+    def effective_result(sid):
+        return content_results.get(sid) or media_results.get(sid) or cache.get(str(sid)) or {}
+
+    def projected_results():
+        return {**media_results, **content_results}
+
+    for sid in content_candidate_ids:
+        if sid in media_retry_telemetry:
+            continue
+        base_result = effective_result(sid)
+        media_retry_telemetry[sid] = {
+            "initial_failed": False,
+            "initial_status": str(base_result.get("status") or "alive").lower(),
+            "initial_error_type": "",
+            "retry_attempts": 0,
+            "retry_deferred": 0,
+            "failure_types": [],
+            "current_retry_attempts": 0,
+        }
+
+    for sid in list(content_candidate_ids):
+        if _content_checks_applicable(effective_result(sid), settings):
+            continue
+        content_results[sid] = _content_skipped_result(effective_result(sid))
+        content_checked_ids.add(sid)
+        content_candidate_ids.remove(sid)
+
+    combined_ids = content_candidate_ids & set(throughput_reason_by_id)
+
+    def note_content_result(sid, result):
+        content_attempted_ids.add(sid)
+        if str(result.get("status") or "unknown").lower() == "alive":
+            return
+        telemetry = media_retry_telemetry[sid]
+        if not telemetry["initial_failed"]:
+            telemetry["initial_failed"] = True
+            telemetry["initial_status"] = str(result.get("status") or "unknown").lower()
+            telemetry["initial_error_type"] = str(result.get("error_type") or "")
+        telemetry["current_retry_attempts"] = 0
+        error_type = str(result.get("error_type") or "")
+        if error_type and error_type not in telemetry["failure_types"]:
+            telemetry["failure_types"].append(error_type)
+
+    def run_content(item):
+        sid = int(item["id"])
+        return analyzer.apply_content_analysis(
+            effective_result(sid),
+            str(item.get("url") or ""),
+            settings=settings,
+            user_agent=str(item.get("user_agent") or DEFAULT_USER_AGENT),
+            logger=logger,
+        )
+
+    content_only_items = [item_by_id[sid] for sid in content_candidate_ids - combined_ids]
+    if content_only_items and not canceled:
+        content_started = time.monotonic()
+        for completed, (item, future) in enumerate(
+            _fair_account_futures(
+                content_only_items,
+                run_content,
+                max_workers=workers,
+                thread_name_prefix="stream-sort-content",
+                capacity_manager=capacity_manager,
+            ),
+            start=1,
+        ):
+            sid = int(item["id"])
+            if future is None:
+                content_capacity_deferred_ids.add(sid)
+                logger.info("[Analyze Content] stream=%s deferred because its M3U connection limit is occupied", sid)
+                continue
+            try:
+                result = dict(future.result())
+            except Exception as exc:
+                result = dict(effective_result(sid))
+                result.update({"status": "dead", "error_type": "stream_unreachable", "error": str(exc)})
+            content_results[sid] = result
+            content_checked_ids.add(sid)
+            note_content_result(sid, result)
+            elapsed = max(time.monotonic() - content_started, 0.001)
+            eta = elapsed / completed * (len(content_only_items) - completed) if completed < len(content_only_items) else 0.0
+            _log_media_progress(
+                logger,
+                prefix="[Analyze Content]",
+                completed=completed,
+                phase_total=len(content_only_items),
+                item=item,
+                reason=content_reason_by_id[sid],
+                result=result,
+                items=items,
+                cache=cache,
+                media_results=projected_results(),
+                cached_media=total - len(content_candidate_ids),
+                pending_media=len(content_only_items) - completed,
+                eta_seconds=eta,
+            )
+        canceled = analysis_cancel_requested()
+
+    capture_paths = {}
+    combined_items = [item_by_id[sid] for sid in combined_ids]
+    if combined_items and not canceled:
+        combined_started = time.monotonic()
+
+        def run_combined_capture(item):
+            sid = int(item["id"])
+            stats = effective_result(sid).get("stats") or {}
+            _width, height = parse_resolution(stats)
+            fps = parse_fps(stats)
+            nominal = estimate_nominal_throughput_kbps(height, fps)
+            result, sample_path = capture_stream_sample(
+                str(item.get("url") or ""),
+                nominal_video_kbps=nominal,
+                duration_seconds=throughput_duration,
+                timeout_seconds=throughput_timeout,
+                user_agent=str(item.get("user_agent") or DEFAULT_USER_AGENT),
+                ffmpeg_path=str(settings.get("analysis_ffmpeg_path") or "/usr/local/bin/ffmpeg"),
+            )
+            return result, sample_path, nominal
+
+        for completed, (item, future) in enumerate(
+            _fair_account_futures(
+                combined_items,
+                run_combined_capture,
+                max_workers=workers,
+                thread_name_prefix="stream-sort-combined-capture",
+                capacity_manager=capacity_manager,
+            ),
+            start=1,
+        ):
+            sid = int(item["id"])
+            if future is None:
+                content_capacity_deferred_ids.add(sid)
+                throughput_capacity_deferred_ids.add(sid)
+                logger.info("[Analyze Combined] stream=%s deferred because its M3U connection limit is occupied", sid)
+                continue
+            try:
+                throughput_result, sample_path, nominal = future.result()
+            except Exception as exc:
+                throughput_result = {"status": "unknown", "tested_at": analyzer._utc_now_iso(), "error": str(exc)}
+                sample_path = None
+                nominal = None
+            throughput_results[sid] = dict(throughput_result)
+            throughput_checked_ids.add(sid)
+            if sample_path:
+                capture_paths[sid] = sample_path
+            else:
+                failed = dict(effective_result(sid))
+                failed.update({
+                    "status": "dead",
+                    "error_type": str(throughput_result.get("error_type") or "stream_unreachable"),
+                    "error": str(throughput_result.get("error") or "Combined capture failed"),
+                })
+                content_results[sid] = failed
+                note_content_result(sid, failed)
+            elapsed = max(time.monotonic() - combined_started, 0.001)
+            eta = elapsed / completed * (len(combined_items) - completed) if completed < len(combined_items) else 0.0
+            logger.info(
+                "[Analyze Combined] %d%% (%d/%d) stream=%s content=%s throughput=%s measured=%sMbps nominal=%skbps | ETA=%s",
+                int(round(completed / len(combined_items) * 100)), completed, len(combined_items), sid,
+                "captured" if sample_path else "capture_failed", throughput_result.get("status") or "unknown",
+                throughput_result.get("measured_mbps", "n/a"), nominal, analyzer._format_eta(eta),
+            )
+        canceled = analysis_cancel_requested()
+
+    try:
+        local_items = [item_by_id[sid] for sid in capture_paths]
+        if local_items and not canceled:
+            local_started = time.monotonic()
+
+            def run_local_content(item):
+                sid = int(item["id"])
+                return analyzer.apply_content_analysis(
+                    effective_result(sid),
+                    capture_paths[sid],
+                    settings=settings,
+                    user_agent=str(item.get("user_agent") or DEFAULT_USER_AGENT),
+                    logger=logger,
+                    local_source=True,
+                )
+
+            for completed, (item, future) in enumerate(
+                _fair_account_futures(
+                    local_items,
+                    run_local_content,
+                    max_workers=workers,
+                    thread_name_prefix="stream-sort-local-content",
+                ),
+                start=1,
+            ):
+                sid = int(item["id"])
+                if future is None:
+                    continue
+                try:
+                    result = dict(future.result())
+                except Exception as exc:
+                    result = dict(effective_result(sid))
+                    result.update({"status": "dead", "error_type": "stream_unreachable", "error": str(exc)})
+                content_results[sid] = result
+                content_checked_ids.add(sid)
+                note_content_result(sid, result)
+                elapsed = max(time.monotonic() - local_started, 0.001)
+                eta = elapsed / completed * (len(local_items) - completed) if completed < len(local_items) else 0.0
+                _log_media_progress(
+                    logger,
+                    prefix="[Analyze Combined Content]",
+                    completed=completed,
+                    phase_total=len(local_items),
+                    item=item,
+                    reason=content_reason_by_id[sid],
+                    result=result,
+                    items=items,
+                    cache=cache,
+                    media_results=projected_results(),
+                    cached_media=total - len(content_candidate_ids),
+                    pending_media=len(local_items) - completed,
+                    eta_seconds=eta,
+                )
+            canceled = analysis_cancel_requested()
+    finally:
+        for sample_path in capture_paths.values():
+            try:
+                os.unlink(sample_path)
+            except OSError:
+                pass
+
+    for retry_pass in range(1, retries + 1):
+        if canceled:
+            break
+        retry_ids = [
+            sid for sid in content_attempted_ids
+            if str((content_results.get(sid) or {}).get("error_type") or "") in analyzer.RETRYABLE_ERROR_TYPES
+        ]
+        if not retry_ids:
+            break
+        backoff = max(1.0, account_delay * 3.0)
+        logger.info("[Analyze Content Retry %d/%d] waiting %.1fs before retrying %d content checks", retry_pass, retries, backoff, len(retry_ids))
+        deadline = time.monotonic() + backoff
+        while time.monotonic() < deadline:
+            if analysis_cancel_requested():
+                canceled = True
+                break
+            time.sleep(min(0.25, max(0.0, deadline - time.monotonic())))
+        if canceled:
+            break
+        retry_started = time.monotonic()
+        retry_items = [item_by_id[sid] for sid in retry_ids]
+        for completed, (item, future) in enumerate(
+            _fair_account_futures(
+                retry_items,
+                run_content,
+                max_workers=workers,
+                thread_name_prefix="stream-sort-content-retry",
+                capacity_manager=capacity_manager,
+                max_per_account=1,
+            ),
+            start=1,
+        ):
+            sid = int(item["id"])
+            telemetry = media_retry_telemetry[sid]
+            if future is None:
+                telemetry["retry_deferred"] += 1
+                logger.info("[Analyze Content Retry %d/%d] stream=%s deferred because its M3U connection limit is occupied", retry_pass, retries, sid)
+                continue
+            try:
+                result = dict(future.result())
+            except Exception as exc:
+                result = dict(effective_result(sid))
+                result.update({"status": "dead", "error_type": "stream_unreachable", "error": str(exc)})
+            content_results[sid] = result
+            content_checked_ids.add(sid)
+            telemetry["retry_attempts"] += 1
+            telemetry["current_retry_attempts"] += 1
+            error_type = str(result.get("error_type") or "")
+            if error_type and error_type not in telemetry["failure_types"]:
+                telemetry["failure_types"].append(error_type)
+            elapsed = max(time.monotonic() - retry_started, 0.001)
+            eta = elapsed / completed * (len(retry_items) - completed) if completed < len(retry_items) else 0.0
+            _log_media_progress(
+                logger,
+                prefix=f"[Analyze Content Retry {retry_pass}/{retries}]",
+                completed=completed,
+                phase_total=len(retry_items),
+                item=item,
+                reason=content_reason_by_id[sid],
+                result=result,
+                items=items,
+                cache=cache,
+                media_results=projected_results(),
+                cached_media=total - len(content_candidate_ids),
+                pending_media=len(retry_items) - completed,
+                eta_seconds=eta,
+            )
+        canceled = analysis_cancel_requested()
+
     canceled = canceled or analysis_cancel_requested()
+    terminal_result_ids = set(media_results) | set(content_results)
+    for sid in terminal_result_ids:
+        result = effective_result(sid)
+        telemetry = media_retry_telemetry[sid]
+        terminal_status = str(result.get("status") or "unknown").lower()
+        telemetry["terminal_status"] = terminal_status
+        telemetry["recovered_after_retries"] = bool(
+            telemetry["initial_failed"] and telemetry["retry_attempts"] and terminal_status == "alive"
+        )
+        telemetry["retries_exhausted"] = bool(
+            retries > 0
+            and telemetry["current_retry_attempts"] >= retries
+            and str(result.get("error_type") or "") in analyzer.RETRYABLE_ERROR_TYPES
+        )
+        telemetry["retry_pending"] = bool(
+            terminal_status == "dead"
+            and retries > 0
+            and telemetry["current_retry_attempts"] < retries
+            and str(result.get("error_type") or "") in analyzer.RETRYABLE_ERROR_TYPES
+        )
+        result["retry_pending"] = telemetry["retry_pending"]
+        result["retry_telemetry"] = telemetry
+        if sid in content_results:
+            content_results[sid] = result
+        else:
+            media_results[sid] = result
+
+    for item, _ in media_due:
+        sid = int(item["id"])
+        if sid not in media_results:
+            continue
+        cache[str(sid)] = _merge_media_result(
+            item,
+            cache.get(str(sid)),
+            media_results[sid],
+            analysis_reason=reason_by_id.get(sid),
+            record_history=sid not in content_results,
+        )
+
+    for sid, result in content_results.items():
+        item = item_by_id[sid]
+        cache[str(sid)] = _merge_content_result(
+            item,
+            cache.get(str(sid)),
+            result,
+            analysis_reason=content_reason_by_id.get(sid),
+        )
+
     if throughput_due and not canceled:
         throughput_started = time.monotonic()
         account_probe_limiter = analyzer._PerAccountStartLimiter(throughput_account_delay)
-        throughput_reason_by_id = {int(item["id"]): reason for item, reason in throughput_due}
 
         def run_throughput(item):
             account_probe_limiter.wait(item.get("account_id"))
             entry = cache.get(str(item["id"])) or {}
-            stats = entry.get("stats") or {}
+            stats = (media_results.get(int(item["id"])) or entry).get("stats") or {}
             _width, height = parse_resolution(stats)
             fps = parse_fps(stats)
             nominal = estimate_nominal_throughput_kbps(height, fps)
@@ -1503,7 +2280,9 @@ def analyze_assigned_streams(
             )
             return result, nominal
 
-        throughput_items = [item for item, _reason in throughput_due]
+        throughput_items = [item for item, _reason in throughput_due if int(item["id"]) not in combined_ids]
+        if not throughput_items:
+            throughput_due = []
         for completed, (item, future) in enumerate(
             _fair_account_futures(
                 throughput_items,
@@ -1519,12 +2298,12 @@ def analyze_assigned_streams(
                 sid = int(item["id"])
                 throughput_capacity_deferred_ids.add(sid)
                 elapsed = max(time.monotonic() - throughput_started, 0.001)
-                eta = elapsed / completed * (len(throughput_due) - completed) if completed < len(throughput_due) else 0.0
+                eta = elapsed / completed * (len(throughput_items) - completed) if completed < len(throughput_items) else 0.0
                 logger.info(
                     "[Analyze Throughput] %d%% (%d/%d) stream=%s reason=%s throughput=deferred_capacity measured=n/aMbps nominal=n/akbps | M3U connection limit is occupied; cached result preserved | ETA=%s",
-                    int(round(completed / len(throughput_due) * 100)),
+                    int(round(completed / len(throughput_items) * 100)),
                     completed,
-                    len(throughput_due),
+                    len(throughput_items),
                     sid,
                     reason,
                     analyzer._format_eta(eta),
@@ -1539,11 +2318,11 @@ def analyze_assigned_streams(
                     "error": f"{type(exc).__name__}: {exc}",
                 }
                 nominal = None
-            entry = cache.get(str(item["id"])) or {}
-            cache[str(item["id"])] = _merge_throughput_result(item, entry, result, ttl_hours=throughput_ttl_hours)
-            throughput_checked_ids.add(int(item["id"]))
+            sid = int(item["id"])
+            throughput_results[sid] = dict(result)
+            throughput_checked_ids.add(sid)
             elapsed = max(time.monotonic() - throughput_started, 0.001)
-            eta = elapsed / completed * (len(throughput_due) - completed) if completed < len(throughput_due) else 0.0
+            eta = elapsed / completed * (len(throughput_items) - completed) if completed < len(throughput_items) else 0.0
             counts = _throughput_counts(items, cache)
             alive_count = sum(
                 1 for candidate in items
@@ -1551,30 +2330,39 @@ def analyze_assigned_streams(
             )
             logger.info(
                 "[Analyze Throughput] %d%% (%d/%d) stream=%s reason=%s throughput=%s measured=%sMbps nominal=%skbps | overall %s cached_throughput=%d pending_throughput=%d | ETA=%s",
-                int(round(completed / len(throughput_due) * 100)), completed, len(throughput_due), item["id"], reason,
+                int(round(completed / len(throughput_items) * 100)), completed, len(throughput_items), item["id"], reason,
                 result.get("status") or "unknown", result.get("measured_mbps", "n/a"), nominal,
                 _overall_throughput_text(counts), max(0, alive_count - len(throughput_due)),
-                len(throughput_due) - completed, analyzer._format_eta(eta),
+                len(throughput_items) - completed, analyzer._format_eta(eta),
             )
         canceled = analysis_cancel_requested()
 
+    for sid, result in throughput_results.items():
+        item = item_by_id[sid]
+        terminal = content_results.get(sid) or media_results.get(sid) or {}
+        if str(terminal.get("status") or "unknown").lower() == "dead":
+            continue
+        cache[str(sid)] = _merge_throughput_result(item, cache.get(str(sid)) or {}, result, ttl_hours=throughput_ttl_hours)
+
     media_checked_ids = set(media_results)
-    capacity_deferred_ids = media_capacity_deferred_ids | throughput_capacity_deferred_ids
+    capacity_deferred_ids = media_capacity_deferred_ids | content_capacity_deferred_ids | throughput_capacity_deferred_ids
     fully_cached = sum(
         1 for item in items
         if int(item["id"]) not in media_checked_ids
+        and int(item["id"]) not in content_checked_ids
         and int(item["id"]) not in throughput_checked_ids
         and int(item["id"]) not in capacity_deferred_ids
     )
     canceled = bool(close_analysis_cancel_window() or canceled)
-    for sid, result in media_results.items():
+    terminal_results = {**media_results, **content_results}
+    for sid, result in terminal_results.items():
         analyzer._persist_dispatcharr_result(sid, result, logger)
     analyzer.save_analysis_cache(cache, cache_path)
     health_counts = _status_counts(items, cache)
     throughput_counts = _throughput_counts(items, cache)
     logger.info(
-        "[Analyze] Complete: streams=%d media_checked=%d throughput_checked=%d capacity_deferred=%d fully_cached=%d playback_health_refreshed=%d dispatcharr_metadata_refreshed=%d | health %s | throughput %s",
-        total, len(media_checked_ids), len(throughput_checked_ids), len(capacity_deferred_ids), fully_cached, playback_health_refreshed, dispatcharr_metadata_refreshed,
+        "[Analyze] Complete: streams=%d media_checked=%d content_checked=%d throughput_checked=%d capacity_deferred=%d fully_cached=%d playback_health_refreshed=%d dispatcharr_metadata_refreshed=%d | health %s | throughput %s",
+        total, len(media_checked_ids), len(content_checked_ids), len(throughput_checked_ids), len(capacity_deferred_ids), fully_cached, playback_health_refreshed, dispatcharr_metadata_refreshed,
         _overall_health_text(health_counts), _overall_throughput_text(throughput_counts),
     )
     report = _build_health_report(
@@ -1591,6 +2379,7 @@ def analyze_assigned_streams(
         "streams_analyzed": total,
         "streams_selected": total,
         "media_checked": len(media_checked_ids),
+        "content_checked": len(content_checked_ids),
         "throughput_checked": len(throughput_checked_ids),
         "capacity_deferred": len(capacity_deferred_ids),
         "fully_cached": fully_cached,

@@ -49,7 +49,7 @@ def test_recommend_ttl_action_writes_recommendation_file(tmp_path, monkeypatch):
 
     result = plugin._run_ttl_recommendation_action(
         {
-            "health_content_ttl_hours": "24",
+            "stream_data_ttl_hours": "24",
             "dead_content_ttl_hours": "1",
             "analysis_ttl_jitter_percent": "0",
         }
@@ -59,7 +59,7 @@ def test_recommend_ttl_action_writes_recommendation_file(tmp_path, monkeypatch):
     assert recommend_path.exists()
     assert result["recommendation_path"] == str(recommend_path)
     loaded = json.loads(recommend_path.read_text(encoding="utf-8"))
-    assert loaded["recommended_ttls"]["health_content_ttl_hours"] == 36.0
+    assert loaded["recommended_ttls"]["stream_data_ttl_hours"] == 36.0
     assert loaded["recommended_ttls"]["dead_content_ttl_hours"] == 2.0
     assert loaded["confidence"] == "medium"
 

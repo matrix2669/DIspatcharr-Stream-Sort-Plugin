@@ -2,7 +2,7 @@ import json
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from stream_sorter.throughput import _split_url_headers, load_cache, probe_stream, save_cache
+from stream_sorter.throughput import _split_url_headers, capture_stream_sample, load_cache, probe_stream, save_cache
 
 
 def test_split_m3u_url_headers():
@@ -77,3 +77,62 @@ def test_missing_url_probe_is_unknown_not_dead():
     result = probe_stream("", nominal_video_kbps=6000)
     assert result["status"] == "unknown"
     assert "error" in result
+
+
+def test_combined_capture_uses_wall_clock_not_media_duration(monkeypatch):
+    commands = []
+
+    class FakeProcess:
+        returncode = 255
+
+        def __init__(self, command):
+            commands.append(command)
+            Path(command[-1]).write_bytes(b"x" * 2_000_000)
+            self.calls = 0
+
+        def communicate(self, timeout=None):
+            self.calls += 1
+            if self.calls == 1:
+                raise __import__("subprocess").TimeoutExpired(commands[0], timeout)
+            return "", ""
+
+        def send_signal(self, _signal):
+            return None
+
+    monkeypatch.setattr("stream_sorter.throughput.subprocess.Popen", lambda command, **_kwargs: FakeProcess(command))
+    moments = iter((100.0, 108.0))
+    monkeypatch.setattr("stream_sorter.throughput.time.monotonic", lambda: next(moments))
+    result, sample_path = capture_stream_sample(
+        "http://example.test/live.ts",
+        nominal_video_kbps=1000,
+        duration_seconds=8.0,
+    )
+
+    assert sample_path is not None
+    assert result["measurement_source"] == "ffmpeg_stream_copy"
+    assert result["elapsed_seconds"] == 8.0
+    assert result["measured_mbps"] == 2.0
+    assert "-t" not in commands[0]
+    Path(sample_path).unlink()
+
+
+def test_combined_capture_rejects_early_successful_exit(monkeypatch):
+    class ShortProcess:
+        returncode = 0
+
+        def __init__(self, command):
+            Path(command[-1]).write_bytes(b"x" * 1000)
+
+        def communicate(self, timeout=None):
+            return "", ""
+
+    monkeypatch.setattr("stream_sorter.throughput.subprocess.Popen", lambda command, **_kwargs: ShortProcess(command))
+    result, sample_path = capture_stream_sample(
+        "http://example.test/live.ts",
+        nominal_video_kbps=1000,
+        duration_seconds=8.0,
+    )
+
+    assert sample_path is None
+    assert result["status"] == "unknown"
+    assert "expected at least" in result["error"]

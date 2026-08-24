@@ -17,11 +17,10 @@ Stream Sort no longer requires IPTV Checker for sorting data. `Analyze Streams` 
 
 The analyzer tracks five independent freshness components:
 
-- **Stream metadata TTL:** 12 hours by default. Newer `Stream.stream_stats` / `stream_stats_updated_at` from Dispatcharr playback can refresh resolution/FPS/codec/bitrate metadata without opening another Stream Sort connection.
-- **Reachability TTL:** 24 hours after a direct analyzer check. A clean runtime session of at least 60 seconds, or five minutes of established playback, can independently satisfy reachability for 6 hours without another provider connection.
+- **FFprobe statistics TTL:** 12 hours by default. Only a completed direct FFprobe resets it; playback and imported Dispatcharr metadata never move this clock.
 - **Dead stream TTL:** dead streams are rechecked when this period expires (1 hour by default). This reduces repetitive dead-stream retries across full scans while still confirming network failures, invalid `0x0` video dimensions, placeholder files, black video, frozen video, and silent audio through retry passes inside the same analyze job.
-- **Content validation interval:** 7 days by default. Reused playback does not claim that black/frozen/silent checks ran; it only defers an initially missing content validation until this interval expires.
-- **Healthy throughput TTL:** 6 hours by default. Marginal, insufficient, and unknown throughput are rechecked on every Analyze run.
+- **Content validation TTL:** 7 days by default. Direct black/frozen/silent analysis or at least 60 seconds of clean attributable Dispatcharr playback resets it; playback evidence is explicitly labeled as assumed rather than direct detection. If no enabled detector applies, Stream Sort records a completed skipped decision without reserving provider capacity.
+- **Throughput TTL:** 6 hours by default for healthy evidence. Direct probes and at least 300 seconds of clean provider-attributed playback at `1.10x` nominal or higher can reset it. Every clean ratio is retained for threshold analysis; marginal, insufficient, and unknown throughput wait for the exact Dead stream TTL before rechecking.
 
 Confirmed-dead streams are deferred by the exact Dead stream TTL between Analyze runs. Skipped and unknown health states remain eligible for revalidation.
 
@@ -40,7 +39,7 @@ Use the **Health Report** action, or inspect that file directly, to find:
 
 If you want to reduce scan waves when many streams are discovered at the same time, set **TTL jitter percent** (0-100) to spread expiry windows per stream.
 
-When newer Dispatcharr stream data is imported, the cache records `metadata_source: "dispatcharr_stream_stats"`. Qualifying runtime playback records `health_source: "runtime_playback"`; sessions containing a channel error or failover do not qualify as clean. Runtime evidence never clears a confirmed-dead result; only a completed analyzer scan can do that. If imported resolution/FPS changes, or bitrate changes beyond configured thresholds, throughput is rechecked so its delivery classification uses the new media characteristics.
+When newer Dispatcharr stream data is imported, the cache records `metadata_source: "dispatcharr_stream_stats"`. Qualifying runtime playback is matched by stream ID and M3U provider account. Profiles under that provider are equivalent because credential-only URL differences do not change the underlying stream. Sessions containing a channel error or failover do not qualify as clean. Runtime evidence never clears a confirmed-dead result; only a completed analyzer scan can do that. If imported resolution/FPS changes, or bitrate changes beyond configured thresholds, throughput is rechecked so its delivery classification uses the new media characteristics.
 
 Dispatcharr's `Stream.is_stale` field belongs to provider refresh and is not a playback exclusion flag. Stream Sort therefore does not write it. Confirmed-dead state is reported and used for sorting, but current Dispatcharr releases require a core-supported exclusion mechanism before a plugin can guarantee that playback skips a dead stream.
 
@@ -53,7 +52,7 @@ so bitrate changes count only when the delta is greater than both of these limit
 - `Media bitrate relative tolerance (%)`
 - `Media bitrate absolute tolerance (kbps)`
 
-Analysis and throughput share one cache:
+Analysis uses three independent scan-start decisions: FFprobe statistics/reachability, grouped content validation, and throughput. FFprobe runs only when its direct TTL is due. Streams due only for content use the configured 6-second FFmpeg sample. Streams due for both content and throughput use one 8-second wall-clock-bounded stream-copy capture; capture bytes are divided by provider capture time before FFmpeg shutdown, and unexpectedly short captures are retried rather than scored. Stream Sort releases the provider reservation before decoding that local sample. Streams due only for throughput keep the raw byte-delivery probe. Clean Dispatcharr playback can independently satisfy content and sustained-throughput decisions.
 
 ```text
 /data/dispatcharr_stream_sort_analysis.json
@@ -129,7 +128,7 @@ Throughput is delivery capacity, not the stream's encoded video bitrate.
 - Insufficient: < 1.10x nominal: **-30**
 - Unknown: **0**
 
-Healthy throughput is cached for the configured TTL. Any non-healthy throughput result is eligible for another probe on the next Analyze run.
+Healthy throughput is cached for the configured jittered Throughput TTL. Marginal, insufficient, and unknown results are cached for the exact Dead stream TTL without jitter, preventing hourly schedules from repeatedly probing the same degraded stream.
 
 The **Parallel tests** setting controls both media checks and integrated throughput probes (maximum 16). When the worker count is less than or equal to the number of M3U sources with pending work, every active worker uses a different source. Additional workers are distributed round-robin across sources, and capacity is reassigned when a source runs out of pending streams. The per-source start delay still applies, but different M3U sources can start throughput probes at the same time.
 
@@ -137,7 +136,7 @@ Before a worker opens an M3U source, it selects from all active profiles using D
 
 Analysis runs in the background. Use **Check Status** to see the active media, retry, throughput, or sorting phase and its latest progress, or to review the outcome of the last run.
 
-Retry passes run at most one recheck per M3U source at a time, while different sources may retry in parallel. Network errors and provisional media/content failures (`0x0`, placeholder, black, frozen, or silent) all enter this confirmation queue. This prevents a provider-wide connection burst from being repeated while confirming an initial failure.
+Retry passes run at most one recheck per M3U source at a time, while different sources may retry in parallel. FFprobe retries finish before downstream content and throughput phases begin. Network errors and provisional media/content failures (`0x0`, placeholder, black, frozen, or silent) all enter confirmation queues. A valid combined throughput result is retained while content is retried with the shorter content-only path. Every retry logs an individual stream result using the same health, resolution, FPS, bitrate, progress, totals, and ETA fields as the initial check.
 
 ## Channel scope
 
@@ -177,6 +176,7 @@ All matching name rules are additive.
 - **Disable Schedule** — stop automatic scheduled analysis and clear any in-memory due-minute state.
 - **Health Report** — show problematic streams, directional health transitions, dead recovery, and time concentration in the UI.
 - **Recommend TTLs** — compute read-only health/dead TTL and jitter recommendations from recent directional evidence, with confidence and sparse-data warnings.
+- **Reset Statistics** — clear unified and legacy scan caches/reports for a clean start, or enable **Reset all historical data** to also clear runtime reliability and playback history. It uses the same cross-process lease as analysis and is refused while any scan is active. Schedules, settings, channel order, and provider configuration are preserved.
 - **Dry Run** — write `/data/dispatcharr_stream_sort_report.json` without changing order.
 - **Sort Streams** — apply the calculated `ChannelStream.order` only.
 - **Analyze + Sort** — incrementally analyze, then apply the refreshed ordering.
@@ -184,11 +184,11 @@ All matching name rules are additive.
 
 Separate `Probe Throughput` actions are no longer shown because throughput is part of Analyze Streams.
 
-Stopping a scan checkpoints every media and throughput probe that has already completed, then skips remaining probes and post-analysis sorting. A dead media result that has not completed its configured retry sequence is saved as retry-pending with an effective dead TTL of zero, so the next scan immediately resumes confirmation instead of treating it as confirmed dead. Retry-pending observations remain visible as provisional evidence but are excluded from terminal dead percentages. Stopping a scan does not disable its recurring schedule.
+Stopping a scan checkpoints every media and throughput probe that has already completed, then skips remaining probes and post-analysis sorting. A dead media result that has not completed its configured retry sequence is saved as retry-pending with an effective dead TTL of zero, so the next scan immediately resumes confirmation instead of treating it as confirmed dead. Once retries confirm the terminal result as dead, FFprobe, content, and throughput all wait behind the same exact Dead stream TTL recovery gate. Retry-pending observations remain visible as provisional evidence but are excluded from terminal dead percentages. Stopping a scan does not disable its recurring schedule.
 
 ## Logging
 
-The plugin owns the `plugins.stream_sorter` logger and prefixes its messages with `[Stream Sort]`. Incremental runs report media checks, throughput checks, Dispatcharr metadata refresh counts, cached counts, pending work, health totals, throughput totals, and ETA. Runtime telemetry is logged with `[Reliability]` inside the Stream Sort logger, including whether an event was counted and its classification.
+The plugin owns the `plugins.stream_sorter` logger and prefixes its messages with `[Stream Sort]`. Incremental runs report FFprobe, content, combined, retry, and throughput work with per-stream progress. Runtime telemetry retains clean playback duration, bytes, measured Mbps, nominal ratio, threshold classification, buffering failures, and attribution. Health reports include sustained-throughput percentiles and buckets around `1.03x`, `1.05x`, `1.07x`, and `1.10x` for evidence-based tuning.
 
 ## Development
 

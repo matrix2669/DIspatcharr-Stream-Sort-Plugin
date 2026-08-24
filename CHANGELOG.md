@@ -1,5 +1,34 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- Add a guarded **Reset Statistics** action with scan-only and scan-plus-runtime-history scopes while preserving schedules, settings, provider configuration, and channel order.
+
+### Changed
+
+- Split incremental analysis into FFprobe metadata/reachability, content-only FFmpeg, combined content-plus-throughput capture, and throughput-only phases.
+- Reuse one 8-second wall-clock-bounded FFmpeg stream-copy capture when both content validation and throughput are due, then release provider capacity before decoding that sample locally.
+- Log every individual FFprobe and content retry with the same stream health, media statistics, progress, totals, and ETA fields used by initial media checks.
+- Attribute reusable Dispatcharr playback by stream ID and M3U provider account while treating profiles and credential-only URL differences as equivalent.
+- Apply the exact dead-stream TTL without jitter to marginal, insufficient, and unknown throughput evidence.
+
+### Fixed
+
+- Preserve independent content and throughput timestamps and completed phase results when a later phase fails, retries, or is canceled.
+- Use direct FFprobe completion as the only FFprobe TTL reset while allowing clean Dispatcharr playback to satisfy content and sustained-throughput TTLs.
+- Retain playback Mbps, nominal ratios, duration, source, failures, percentiles, and ratio buckets so the initial `1.10x` sustained threshold can be tuned from observed clean sessions.
+- Route remote content execution failures through confirmation retries instead of treating unmeasured content as alive.
+- Put FFprobe, content, and throughput behind the same exact dead-TTL recovery gate after retries confirm a terminal dead result.
+- Preserve content-driven throughput invalidation when a combined capture has adequate delivery but black, frozen, or silent content.
+- Prevent separated content checks from refreshing legacy FFprobe fallback timestamps.
+- Serialize statistics reset with every analysis entry point and clear the actual legacy throughput migration cache so reset data cannot be restored on the next scan.
+- Enforce the current M3U provider account on cached content and throughput evidence while continuing to reuse evidence across credential-only profile changes.
+- Measure combined throughput at the capture boundary rather than after FFmpeg shutdown, and reject captures that end before the requested sampling window.
+- Complete content TTL decisions without provider scheduling when no enabled detector applies to the stream.
+- Align dead-content regression tests with the exact dead-TTL and retry-pending contract.
+
 All notable user-visible changes to Dispatcharr Stream Sort are documented here.
 
 Historical versions below were published through the legacy `dev-test` workflow and were not Git tags or GitHub Releases.
