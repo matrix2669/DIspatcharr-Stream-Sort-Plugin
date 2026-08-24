@@ -17,6 +17,13 @@ Historical versions below were published through the legacy `dev-test` workflow 
 
 ### Removed
 
+## 0.3.6-beta.5 - 2026-08-24
+
+### Changed
+
+- Treat analyzer-produced `0x0` video dimensions as a provisional dead result and run it through the configured immediate retry passes.
+- Run placeholder-file, black-video, frozen-video, and silent-audio detections through the same immediate confirmation retry queue before retaining a dead result.
+
 ## 0.3.6-beta.4 - 2026-08-24
 
 ### Added

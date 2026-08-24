@@ -18,7 +18,18 @@ from .throughput import DEFAULT_USER_AGENT, load_cache as load_throughput_cache,
 ANALYSIS_CACHE_PATH = '/data/dispatcharr_stream_sort_analysis.json'
 MIN_PACKETS_FOR_BITRATE_CALC = 30
 DEFAULT_STREAMLINK_HOSTS = 'youtube.com, youtu.be, twitch.tv, kick.com'
-RETRYABLE_ERROR_TYPES = {'timeout', 'connection_refused', 'network_unreachable', 'stream_unreachable', 'server_error'}
+RETRYABLE_ERROR_TYPES = {
+    'timeout',
+    'connection_refused',
+    'network_unreachable',
+    'stream_unreachable',
+    'server_error',
+    'invalid_video_dimensions',
+    'placeholder_file',
+    'black_screen',
+    'frozen_video',
+    'silent_audio',
+}
 
 def _utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
@@ -355,6 +366,15 @@ def analyze_stream(raw_url: str, *, stream_id: Any, stream_name: str, settings: 
     details: dict[str, Any] = {'probe_elapsed_seconds': round(elapsed, 3), 'packet_count': len(video_packets), 'analysis_duration_seconds': analysis_duration}
     if calculated_bitrate is not None:
         details['calculated_bitrate_kbps'] = round(calculated_bitrate, 1)
+    if width <= 0 or height <= 0:
+        return {
+            **base,
+            'status': 'dead',
+            'error_type': 'invalid_video_dimensions',
+            'error': f'Video stream reported invalid dimensions ({width}x{height})',
+            'stats': stats,
+            'details': details,
+        }
     container_duration = _parse_container_duration(probe_data)
     if container_duration is not None:
         details['container_duration_seconds'] = round(container_duration, 3)

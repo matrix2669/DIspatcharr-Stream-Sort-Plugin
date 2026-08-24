@@ -1,6 +1,6 @@
 {
   "name": "Dispatcharr Stream Sort",
-  "version": "0.3.6-beta.4",
+  "version": "0.3.6-beta.5",
   "description": "Analyzes stream health, quality, delivery performance, and runtime reliability telemetry with M3U connection-capacity reservations, reuses fresh Dispatcharr playback metadata, then scores and reorders streams already assigned to channels.",
   "author": "matrix2669",
   "help_url": "https://github.com/matrix2669/DIspatcharr-Stream-Sort-Plugin",
@@ -17,7 +17,7 @@
     {"id":"media_bitrate_relative_tolerance_percent","label":"Media bitrate relative tolerance (%)","type":"number","default":30,"help_text":"Bitrate changes at or below this percentage of the previous bitrate are ignored when resolution and FPS are unchanged."},
     {"id":"media_bitrate_absolute_tolerance_kbps","label":"Media bitrate absolute tolerance (kbps)","type":"number","default":500,"help_text":"Bitrate deltas at or below this floor are ignored. A media_changed throughput recheck requires the delta to exceed this floor and the relative threshold."},
     {"id":"health_content_ttl_hours","label":"Reachability TTL (hours)","type":"number","default":24,"help_text":"How long direct analyzer reachability remains valid. Recent qualifying playback uses the shorter playback-reuse TTL below."},
-    {"id":"dead_content_ttl_hours","label":"Dead stream TTL (hours)","type":"number","default":1,"help_text":"After the initial check plus immediate retry passes confirm a stream dead, new Analyze runs defer it until this TTL expires. Dead TTL is exact and never jittered. Set to 0 to check confirmed-dead streams on every Analyze run."},
+    {"id":"dead_content_ttl_hours","label":"Dead stream TTL (hours)","type":"number","default":1,"help_text":"After the initial check plus immediate retry passes confirm a stream dead, new Analyze runs defer it until this TTL expires. Network failures, invalid 0x0 video dimensions, placeholder files, black video, frozen video, and silent audio all receive confirmation retries. Dead TTL is exact and never jittered. Set to 0 to check confirmed-dead streams on every Analyze run."},
     {"id":"stream_sort_schedule_cron","label":"Scheduled analyze cron","type":"text","default":"","placeholder":"*/30 * * * *","help_text":"Use standard 5-field UTC cron (minute hour day-of-month month day-of-week, e.g. */30 * * * *). Sunday may be 0 or 7. Day-of-month and day-of-week use standard OR behavior when both are restricted. Workers poll frequently but atomically claim each due minute only once."},
     {"id":"stream_sort_apply_sort_after_scheduled_scan","label":"Apply sort after scheduled analysis","type":"boolean","default":true,"help_text":"Apply Stream Sort after the scheduled Analyze scope. When enabled, scheduling keeps channel order sorted after each scan."},
     {"id":"stream_sort_allow_parallel_checks_on_scheduled_scan","label":"Allow parallel checks on scheduled scan","type":"boolean","default":false,"help_text":"When enabled, scheduled scans use the configured Parallel tests value. When disabled, scheduled scans use exactly one check at a time."},

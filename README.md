@@ -19,7 +19,7 @@ The analyzer tracks five independent freshness components:
 
 - **Stream metadata TTL:** 12 hours by default. Newer `Stream.stream_stats` / `stream_stats_updated_at` from Dispatcharr playback can refresh resolution/FPS/codec/bitrate metadata without opening another Stream Sort connection.
 - **Reachability TTL:** 24 hours after a direct analyzer check. A clean runtime session of at least 60 seconds, or five minutes of established playback, can independently satisfy reachability for 6 hours without another provider connection.
-- **Dead stream TTL:** dead streams are rechecked when this period expires (1 hour by default). This reduces repetitive dead-stream retries across full scans while still running retry passes inside the same analyze job.
+- **Dead stream TTL:** dead streams are rechecked when this period expires (1 hour by default). This reduces repetitive dead-stream retries across full scans while still confirming network failures, invalid `0x0` video dimensions, placeholder files, black video, frozen video, and silent audio through retry passes inside the same analyze job.
 - **Content validation interval:** 7 days by default. Reused playback does not claim that black/frozen/silent checks ran; it only defers an initially missing content validation until this interval expires.
 - **Healthy throughput TTL:** 6 hours by default. Marginal, insufficient, and unknown throughput are rechecked on every Analyze run.
 
@@ -137,7 +137,7 @@ Before a worker opens an M3U source, it selects from all active profiles using D
 
 Analysis runs in the background. Use **Check Status** to see the active media, retry, throughput, or sorting phase and its latest progress, or to review the outcome of the last run.
 
-Retry passes run at most one recheck per M3U source at a time, while different sources may retry in parallel. This prevents a provider-wide connection burst from being repeated while confirming an initial failure.
+Retry passes run at most one recheck per M3U source at a time, while different sources may retry in parallel. Network errors and provisional media/content failures (`0x0`, placeholder, black, frozen, or silent) all enter this confirmation queue. This prevents a provider-wide connection burst from being repeated while confirming an initial failure.
 
 ## Channel scope
 

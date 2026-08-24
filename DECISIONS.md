@@ -140,7 +140,7 @@ Accepted
 
 Keep dead-stream behavior in two phases: immediate intra-scan recovery via retry passes, then cooldown control via `dead_content_ttl_hours`.
 
-- During an analysis run, failed checks continue to pass through the existing immediate retry pipeline (`Analyze` -> up to 3 retry passes).
+- During an analysis run, network failures and provisional media/content failures (`0x0` dimensions, placeholder files, black video, frozen video, and silent audio) pass through the immediate retry pipeline (`Analyze` -> up to 3 retry passes) before the final result is retained.
 - If a stream remains dead after retries and the scan completes, it is recorded as dead and marked stale in Dispatcharr (`stream.is_stale = True`).
 - The dead stream is then excluded from being treated as non-stale until it is marked alive by a subsequent completed scan.
 - No hard minimum dead TTL is enforced by code; scheduling is controlled by the configured UI value (`dead_content_ttl_hours`).

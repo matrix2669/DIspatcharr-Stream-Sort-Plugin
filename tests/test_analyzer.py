@@ -74,6 +74,28 @@ def test_analyze_stream_alive_calculates_packet_bitrate(monkeypatch):
     assert result["details"]["packet_count"] == 30
 
 
+def test_zero_dimensions_are_dead_and_retryable(monkeypatch):
+    payload = _probe_payload()
+    payload["streams"][0]["width"] = 0
+    payload["streams"][0]["height"] = 0
+
+    def fake_run(*args, **kwargs):
+        return subprocess.CompletedProcess(args[0], 0, stdout=json.dumps(payload), stderr="")
+
+    monkeypatch.setattr(analyzer.subprocess, "run", fake_run)
+    result = analyzer.analyze_stream(
+        "http://example.test/zero-dimensions.ts",
+        stream_id=12,
+        stream_name="Zero dimensions",
+        settings=_settings(),
+    )
+
+    assert result["status"] == "dead"
+    assert result["error_type"] == "invalid_video_dimensions"
+    assert result["error_type"] in analyzer.RETRYABLE_ERROR_TYPES
+    assert result["stats"]["resolution"] == "0x0"
+
+
 def test_fixed_duration_placeholder_is_dead(monkeypatch):
     payload = _probe_payload(duration=600)
 
@@ -90,6 +112,7 @@ def test_fixed_duration_placeholder_is_dead(monkeypatch):
 
     assert result["status"] == "dead"
     assert result["error_type"] == "placeholder_file"
+    assert result["error_type"] in analyzer.RETRYABLE_ERROR_TYPES
     assert result["stats"]["resolution"] == "1920x1080"
 
 
@@ -136,6 +159,15 @@ def test_black_frozen_and_silent_parsers():
     assert analyzer._parse_blackdetect_output(stderr) == [(0.0, 4.2, 4.2)]
     assert analyzer._parse_freezedetect_output(stderr) == [0.0]
     assert analyzer._parse_mean_volume_db(stderr) == -91.0
+
+
+def test_content_health_failures_are_retryable():
+    assert {
+        "placeholder_file",
+        "black_screen",
+        "frozen_video",
+        "silent_audio",
+    } <= analyzer.RETRYABLE_ERROR_TYPES
 
 
 def test_streamlink_host_is_skipped_without_running_ffprobe(monkeypatch):
