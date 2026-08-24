@@ -64,6 +64,19 @@ def test_cancel_before_commit_raises_cancelled(control_paths):
         operation()
 
 
+def test_cancel_check_falls_back_to_persisted_execution_token(control_paths):
+    execution_control._write_json(
+        execution_control.ANALYSIS_EXECUTION_STATE_PATH,
+        {"token": "persisted-token"},
+    )
+    execution_control._write_json(
+        execution_control.ANALYSIS_CANCEL_PATH,
+        {"token": "persisted-token"},
+    )
+
+    assert execution_control.analysis_cancel_requested() is True
+
+
 def test_stop_is_rejected_after_commit_window_closes(control_paths):
     @execution_control.exclusive_analysis_execution
     def operation():

@@ -27,6 +27,7 @@ def capture_stream_sample(
     timeout_seconds: float = 10.0,
     user_agent: str | None = None,
     ffmpeg_path: str = "ffmpeg",
+    temp_directory: str | None = None,
 ) -> tuple[dict[str, Any], str | None]:
     """Capture one wall-clock-bounded provider sample for throughput and local analysis.
 
@@ -47,7 +48,11 @@ def capture_stream_sample(
     headers = dict(embedded_headers)
     headers.setdefault("User-Agent", user_agent or DEFAULT_USER_AGENT)
     header_blob = "".join(f"{key}: {value}\r\n" for key, value in headers.items())
-    fd, sample_path = tempfile.mkstemp(prefix="stream-sort-capture-", suffix=".ts")
+    fd, sample_path = tempfile.mkstemp(
+        prefix="stream-sort-capture-",
+        suffix=".ts",
+        dir=temp_directory,
+    )
     os.close(fd)
     command = [
         ffmpeg_path,

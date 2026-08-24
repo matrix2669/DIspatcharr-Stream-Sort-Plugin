@@ -869,6 +869,61 @@ def _build_health_report(
     }
 
 
+_SHARED_MEMORY_CAPTURE_ROOT = "/dev/shm/stream-sorter"
+_CAPTURE_BYTES_PER_WORKER = 256 * 1024 * 1024
+_CAPTURE_HEADROOM_BYTES = 256 * 1024 * 1024
+
+
+def _select_capture_temp_directory(
+    worker_count: int,
+    *,
+    shared_memory_root: str = _SHARED_MEMORY_CAPTURE_ROOT,
+) -> str | None:
+    """Use shared memory only when a bounded capture pipeline has safe headroom."""
+    parent = os.path.dirname(shared_memory_root) or shared_memory_root
+    required = _CAPTURE_HEADROOM_BYTES + max(1, int(worker_count)) * _CAPTURE_BYTES_PER_WORKER
+    try:
+        stats = os.statvfs(parent)
+        block_size = stats.f_frsize or stats.f_bsize
+        if stats.f_bavail * block_size < required:
+            return None
+        os.makedirs(shared_memory_root, mode=0o700, exist_ok=True)
+    except OSError:
+        return None
+    return shared_memory_root
+
+
+def _analyze_local_capture(
+    item: Mapping[str, Any],
+    base_result: Mapping[str, Any],
+    sample_path: str,
+    *,
+    settings: Mapping[str, Any],
+    logger,
+) -> dict[str, Any]:
+    """Analyze one completed capture and always release its temporary storage."""
+    try:
+        return dict(
+            analyzer.apply_content_analysis(
+                base_result,
+                sample_path,
+                settings=settings,
+                user_agent=str(item.get("user_agent") or DEFAULT_USER_AGENT),
+                logger=logger,
+                local_source=True,
+            )
+        )
+    except Exception as exc:
+        result = dict(base_result)
+        result.update({"status": "dead", "error_type": "stream_unreachable", "error": str(exc)})
+        return result
+    finally:
+        try:
+            os.unlink(sample_path)
+        except OSError:
+            pass
+
+
 def _account_key(item: Mapping[str, Any]) -> tuple[str, Any]:
     account_id = item.get("account_id")
     if account_id is not None:
@@ -2015,10 +2070,15 @@ def analyze_assigned_streams(
             )
         canceled = analysis_cancel_requested()
 
-    capture_paths = {}
     combined_items = [item_by_id[sid] for sid in combined_ids]
     if combined_items and not canceled:
         combined_started = time.monotonic()
+        capture_temp_directory = _select_capture_temp_directory(workers)
+        logger.info(
+            "[Analyze Combined] capture temporary storage=%s workers=%s",
+            capture_temp_directory or "system-default",
+            workers,
+        )
 
         def run_combined_capture(item):
             sid = int(item["id"])
@@ -2033,114 +2093,136 @@ def analyze_assigned_streams(
                 timeout_seconds=throughput_timeout,
                 user_agent=str(item.get("user_agent") or DEFAULT_USER_AGENT),
                 ffmpeg_path=str(settings.get("analysis_ffmpeg_path") or "/usr/local/bin/ffmpeg"),
+                temp_directory=capture_temp_directory,
             )
             return result, sample_path, nominal
 
-        for completed, (item, future) in enumerate(
-            _fair_account_futures(
-                combined_items,
-                run_combined_capture,
-                max_workers=workers,
-                thread_name_prefix="stream-sort-combined-capture",
-                capacity_manager=capacity_manager,
-            ),
-            start=1,
-        ):
+        local_pending = {}
+        local_completed = 0
+
+        def record_local_result(item, result, *, checked):
+            nonlocal local_completed
             sid = int(item["id"])
-            if future is None:
-                content_capacity_deferred_ids.add(sid)
-                throughput_capacity_deferred_ids.add(sid)
-                logger.info("[Analyze Combined] stream=%s deferred because its M3U connection limit is occupied", sid)
-                continue
-            try:
-                throughput_result, sample_path, nominal = future.result()
-            except Exception as exc:
-                throughput_result = {"status": "unknown", "tested_at": analyzer._utc_now_iso(), "error": str(exc)}
-                sample_path = None
-                nominal = None
-            throughput_results[sid] = dict(throughput_result)
-            throughput_checked_ids.add(sid)
-            if sample_path:
-                capture_paths[sid] = sample_path
-            else:
-                failed = dict(effective_result(sid))
-                failed.update({
-                    "status": "dead",
-                    "error_type": str(throughput_result.get("error_type") or "stream_unreachable"),
-                    "error": str(throughput_result.get("error") or "Combined capture failed"),
-                })
-                content_results[sid] = failed
-                note_content_result(sid, failed)
+            content_results[sid] = dict(result)
+            if checked:
+                content_checked_ids.add(sid)
+            note_content_result(sid, result)
+            local_completed += 1
             elapsed = max(time.monotonic() - combined_started, 0.001)
-            eta = elapsed / completed * (len(combined_items) - completed) if completed < len(combined_items) else 0.0
-            logger.info(
-                "[Analyze Combined] %d%% (%d/%d) stream=%s content=%s throughput=%s measured=%sMbps nominal=%skbps | ETA=%s",
-                int(round(completed / len(combined_items) * 100)), completed, len(combined_items), sid,
-                "captured" if sample_path else "capture_failed", throughput_result.get("status") or "unknown",
-                throughput_result.get("measured_mbps", "n/a"), nominal, analyzer._format_eta(eta),
+            eta = (
+                elapsed / local_completed * (len(combined_items) - local_completed)
+                if local_completed < len(combined_items)
+                else 0.0
             )
-        canceled = analysis_cancel_requested()
+            _log_media_progress(
+                logger,
+                prefix="[Analyze Combined Content]",
+                completed=local_completed,
+                phase_total=len(combined_items),
+                item=item,
+                reason=content_reason_by_id[sid],
+                result=result,
+                items=items,
+                cache=cache,
+                media_results=projected_results(),
+                cached_media=total - len(content_candidate_ids),
+                pending_media=len(combined_items) - local_completed,
+                eta_seconds=eta,
+            )
 
-    try:
-        local_items = [item_by_id[sid] for sid in capture_paths]
-        if local_items and not canceled:
-            local_started = time.monotonic()
-
-            def run_local_content(item):
+        def finish_local_futures(done):
+            for local_future in done:
+                local_item = local_pending.pop(local_future)
                 sid = int(item["id"])
-                return analyzer.apply_content_analysis(
-                    effective_result(sid),
-                    capture_paths[sid],
-                    settings=settings,
-                    user_agent=str(item.get("user_agent") or DEFAULT_USER_AGENT),
-                    logger=logger,
-                    local_source=True,
-                )
+                try:
+                    result = dict(local_future.result())
+                except Exception as exc:
+                    sid = int(local_item["id"])
+                    result = dict(effective_result(sid))
+                    result.update({"status": "dead", "error_type": "stream_unreachable", "error": str(exc)})
+                record_local_result(local_item, result, checked=True)
 
+        with ThreadPoolExecutor(
+            max_workers=workers,
+            thread_name_prefix="stream-sort-local-content",
+        ) as local_executor:
             for completed, (item, future) in enumerate(
                 _fair_account_futures(
-                    local_items,
-                    run_local_content,
+                    combined_items,
+                    run_combined_capture,
                     max_workers=workers,
-                    thread_name_prefix="stream-sort-local-content",
+                    thread_name_prefix="stream-sort-combined-capture",
+                    capacity_manager=capacity_manager,
                 ),
                 start=1,
             ):
                 sid = int(item["id"])
                 if future is None:
+                    content_capacity_deferred_ids.add(sid)
+                    throughput_capacity_deferred_ids.add(sid)
+                    logger.info("[Analyze Combined] stream=%s deferred because its M3U connection limit is occupied", sid)
                     continue
                 try:
-                    result = dict(future.result())
+                    throughput_result, sample_path, nominal = future.result()
                 except Exception as exc:
-                    result = dict(effective_result(sid))
-                    result.update({"status": "dead", "error_type": "stream_unreachable", "error": str(exc)})
-                content_results[sid] = result
-                content_checked_ids.add(sid)
-                note_content_result(sid, result)
-                elapsed = max(time.monotonic() - local_started, 0.001)
-                eta = elapsed / completed * (len(local_items) - completed) if completed < len(local_items) else 0.0
-                _log_media_progress(
-                    logger,
-                    prefix="[Analyze Combined Content]",
-                    completed=completed,
-                    phase_total=len(local_items),
-                    item=item,
-                    reason=content_reason_by_id[sid],
-                    result=result,
-                    items=items,
-                    cache=cache,
-                    media_results=projected_results(),
-                    cached_media=total - len(content_candidate_ids),
-                    pending_media=len(local_items) - completed,
-                    eta_seconds=eta,
+                    throughput_result = {
+                        "status": "unknown",
+                        "tested_at": analyzer._utc_now_iso(),
+                        "error_type": "stream_unreachable",
+                        "error": str(exc),
+                    }
+                    sample_path = None
+                    nominal = None
+                throughput_results[sid] = dict(throughput_result)
+                throughput_checked_ids.add(sid)
+                if sample_path:
+                    try:
+                        local_future = local_executor.submit(
+                            _analyze_local_capture,
+                            item,
+                            effective_result(sid),
+                            sample_path,
+                            settings=settings,
+                            logger=logger,
+                        )
+                        local_pending[local_future] = item
+                    except Exception as exc:
+                        try:
+                            os.unlink(sample_path)
+                        except OSError:
+                            pass
+                        failed = dict(effective_result(sid))
+                        failed.update({"status": "dead", "error_type": "stream_unreachable", "error": str(exc)})
+                        record_local_result(item, failed, checked=True)
+                else:
+                    failed = dict(effective_result(sid))
+                    failed.update({
+                        "status": "dead",
+                        "error_type": str(throughput_result.get("error_type") or "stream_unreachable"),
+                        "error": str(throughput_result.get("error") or "Combined capture failed"),
+                    })
+                    record_local_result(item, failed, checked=False)
+
+                ready = [local_future for local_future in local_pending if local_future.done()]
+                if ready:
+                    finish_local_futures(ready)
+                while len(local_pending) >= workers:
+                    done, _pending = wait(local_pending, return_when=FIRST_COMPLETED)
+                    finish_local_futures(done)
+
+                elapsed = max(time.monotonic() - combined_started, 0.001)
+                eta = elapsed / completed * (len(combined_items) - completed) if completed < len(combined_items) else 0.0
+                logger.info(
+                    "[Analyze Combined] %d%% (%d/%d) stream=%s content=%s throughput=%s measured=%sMbps nominal=%skbps | ETA=%s",
+                    int(round(completed / len(combined_items) * 100)), completed, len(combined_items), sid,
+                    "captured" if sample_path else "capture_failed", throughput_result.get("status") or "unknown",
+                    throughput_result.get("measured_mbps", "n/a"), nominal, analyzer._format_eta(eta),
                 )
-            canceled = analysis_cancel_requested()
-    finally:
-        for sample_path in capture_paths.values():
-            try:
-                os.unlink(sample_path)
-            except OSError:
-                pass
+
+            while local_pending:
+                done, _pending = wait(local_pending, return_when=FIRST_COMPLETED)
+                finish_local_futures(done)
+        canceled = analysis_cancel_requested()
 
     for retry_pass in range(1, retries + 1):
         if canceled:

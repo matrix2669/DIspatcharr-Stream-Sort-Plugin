@@ -107,7 +107,7 @@ def _execution_lease_is_held():
 
 
 def analysis_cancel_requested():
-    token = _active_token
+    token = _active_token or _read_json(ANALYSIS_EXECUTION_STATE_PATH).get("token")
     return bool(token and _read_json(ANALYSIS_CANCEL_PATH).get("token") == token)
 
 

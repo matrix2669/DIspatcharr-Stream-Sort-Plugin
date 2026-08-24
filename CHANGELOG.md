@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+## 0.3.6-beta.8 - 2026-08-24
+
+### Fixed
+
+- Bound combined throughput/content capture storage to active workers, analyze and delete samples through a backpressured local pipeline, and automatically use sufficiently sized `/dev/shm` storage without requiring it.
+- Make cancellation checks fall back to the persisted execution token so Stop Current Scan remains visible across plugin import contexts and stops replacement probes while active work drains.
+
 ## 0.3.6-beta.7 - 2026-08-24
 
 ### Added

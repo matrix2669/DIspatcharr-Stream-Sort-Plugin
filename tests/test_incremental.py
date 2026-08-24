@@ -3,6 +3,7 @@ import sys
 import threading
 import types
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from types import SimpleNamespace
 
 from stream_sorter import analyzer, incremental
@@ -600,6 +601,42 @@ def test_no_applicable_content_detectors_complete_without_provider_work():
     assert skipped["status"] == "alive"
     assert skipped["details"]["content"]["measured"] is True
     assert skipped["details"]["content"]["skip_reason"] == "no_applicable_detectors"
+
+
+def test_shared_memory_capture_directory_requires_worker_headroom(tmp_path, monkeypatch):
+    class EnoughSpace:
+        f_frsize = 1
+        f_bsize = 1
+        f_bavail = 4 * 1024 * 1024 * 1024
+
+    root = tmp_path / "stream-sorter"
+    monkeypatch.setattr(incremental.os, "statvfs", lambda _path: EnoughSpace())
+    assert incremental._select_capture_temp_directory(12, shared_memory_root=str(root)) == str(root)
+    assert root.is_dir()
+
+    EnoughSpace.f_bavail = 1
+    assert incremental._select_capture_temp_directory(12, shared_memory_root=str(root)) is None
+
+
+def test_local_combined_analysis_always_deletes_capture(tmp_path, monkeypatch):
+    sample_path = tmp_path / "stream-sort-capture-test.ts"
+    sample_path.write_bytes(b"sample")
+
+    def analyze(_base_result, path, **_kwargs):
+        assert Path(path).exists()
+        return {"status": "alive", "details": {"content": {"measured": True}}}
+
+    monkeypatch.setattr(incremental.analyzer, "apply_content_analysis", analyze)
+    result = incremental._analyze_local_capture(
+        {"id": 42, "user_agent": "test"},
+        {"status": "alive"},
+        str(sample_path),
+        settings={},
+        logger=SimpleNamespace(),
+    )
+
+    assert result["status"] == "alive"
+    assert not sample_path.exists()
 
 
 def test_dispatcharr_metadata_refresh_does_not_refresh_health_or_throughput():

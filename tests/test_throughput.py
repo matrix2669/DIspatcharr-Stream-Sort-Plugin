@@ -79,7 +79,7 @@ def test_missing_url_probe_is_unknown_not_dead():
     assert "error" in result
 
 
-def test_combined_capture_uses_wall_clock_not_media_duration(monkeypatch):
+def test_combined_capture_uses_wall_clock_not_media_duration(monkeypatch, tmp_path):
     commands = []
 
     class FakeProcess:
@@ -106,6 +106,7 @@ def test_combined_capture_uses_wall_clock_not_media_duration(monkeypatch):
         "http://example.test/live.ts",
         nominal_video_kbps=1000,
         duration_seconds=8.0,
+        temp_directory=str(tmp_path),
     )
 
     assert sample_path is not None
@@ -113,6 +114,7 @@ def test_combined_capture_uses_wall_clock_not_media_duration(monkeypatch):
     assert result["elapsed_seconds"] == 8.0
     assert result["measured_mbps"] == 2.0
     assert "-t" not in commands[0]
+    assert Path(sample_path).parent == tmp_path
     Path(sample_path).unlink()
 
 

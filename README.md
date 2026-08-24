@@ -54,6 +54,8 @@ so bitrate changes count only when the delta is greater than both of these limit
 
 Analysis uses three independent scan-start decisions: FFprobe statistics/reachability, grouped content validation, and throughput. FFprobe runs only when its direct TTL is due. Streams due only for content use the configured 6-second FFmpeg sample. Streams due for both content and throughput use one 8-second wall-clock-bounded stream-copy capture; capture bytes are divided by provider capture time before FFmpeg shutdown, and unexpectedly short captures are retried rather than scored. Stream Sort releases the provider reservation before decoding that local sample. Streams due only for throughput keep the raw byte-delivery probe. Clean Dispatcharr playback can independently satisfy content and sustained-throughput decisions.
 
+Combined captures use a bounded two-stage pipeline and are deleted by the local-analysis worker immediately after use. When `/dev/shm` has conservative worker-scaled headroom, samples are written under `/dev/shm/stream-sorter`; otherwise Stream Sort falls back to the system temporary directory. A host `/dev/shm` passthrough can avoid overlay or persistent-volume writes, but it is optional and must have enough real memory for the configured worker count. Backpressure limits retained samples to active capture and local-analysis workers instead of the total number of due streams.
+
 ```text
 /data/dispatcharr_stream_sort_analysis.json
 ```
