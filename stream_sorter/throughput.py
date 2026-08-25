@@ -48,43 +48,45 @@ def capture_stream_sample(
     headers = dict(embedded_headers)
     headers.setdefault("User-Agent", user_agent or DEFAULT_USER_AGENT)
     header_blob = "".join(f"{key}: {value}\r\n" for key, value in headers.items())
-    fd, sample_path = tempfile.mkstemp(
-        prefix="stream-sort-capture-",
-        suffix=".ts",
-        dir=temp_directory,
-    )
-    os.close(fd)
-    command = [
-        ffmpeg_path,
-        "-hide_banner",
-        "-loglevel",
-        "error",
-        "-nostdin",
-        "-y",
-        "-rw_timeout",
-        str(int(max(1.0, timeout_seconds) * 1_000_000)),
-    ]
-    if header_blob:
-        command.extend(["-headers", header_blob])
-    command.extend([
-        "-i",
-        clean_url,
-        "-map",
-        "0:v:0",
-        "-map",
-        "0:a:0?",
-        "-c",
-        "copy",
-        "-f",
-        "mpegts",
-        sample_path,
-    ])
-
     started = time.monotonic()
+    fd = None
+    sample_path = None
     intentionally_stopped = False
     capture_elapsed = 0.0
     stderr = ""
     try:
+        fd, sample_path = tempfile.mkstemp(
+            prefix="stream-sort-capture-",
+            suffix=".ts",
+            dir=temp_directory,
+        )
+        os.close(fd)
+        fd = None
+        command = [
+            ffmpeg_path,
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-nostdin",
+            "-y",
+            "-rw_timeout",
+            str(int(max(1.0, timeout_seconds) * 1_000_000)),
+        ]
+        if header_blob:
+            command.extend(["-headers", header_blob])
+        command.extend([
+            "-i",
+            clean_url,
+            "-map",
+            "0:v:0",
+            "-map",
+            "0:a:0?",
+            "-c",
+            "copy",
+            "-f",
+            "mpegts",
+            sample_path,
+        ])
         process = subprocess.Popen(
             command,
             stdout=subprocess.DEVNULL,
@@ -128,10 +130,16 @@ def capture_stream_sample(
             "measurement_source": "ffmpeg_stream_copy",
         }, sample_path
     except Exception as exc:
-        try:
-            os.unlink(sample_path)
-        except OSError:
-            pass
+        if fd is not None:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        if sample_path:
+            try:
+                os.unlink(sample_path)
+            except OSError:
+                pass
         return {
             "status": "unknown",
             "tested_at": tested_at,

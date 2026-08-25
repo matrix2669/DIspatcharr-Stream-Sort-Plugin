@@ -878,17 +878,46 @@ def _select_capture_temp_directory(
     worker_count: int,
     *,
     shared_memory_root: str = _SHARED_MEMORY_CAPTURE_ROOT,
+    logger=None,
 ) -> str | None:
-    """Use shared memory only when a bounded capture pipeline has safe headroom."""
+    """Use shared memory only when it has safe headroom and is writable."""
     parent = os.path.dirname(shared_memory_root) or shared_memory_root
     required = _CAPTURE_HEADROOM_BYTES + max(1, int(worker_count)) * _CAPTURE_BYTES_PER_WORKER
+    probe_fd = None
+    probe_path = None
     try:
         stats = os.statvfs(parent)
         block_size = stats.f_frsize or stats.f_bsize
         if stats.f_bavail * block_size < required:
             return None
         os.makedirs(shared_memory_root, mode=0o700, exist_ok=True)
-    except OSError:
+        probe_fd, probe_path = tempfile.mkstemp(
+            prefix=".stream-sort-write-test-",
+            dir=shared_memory_root,
+        )
+        os.write(probe_fd, b"ok")
+        os.close(probe_fd)
+        probe_fd = None
+        os.unlink(probe_path)
+        probe_path = None
+    except OSError as exc:
+        if probe_fd is not None:
+            try:
+                os.close(probe_fd)
+            except OSError:
+                pass
+        if probe_path:
+            try:
+                os.unlink(probe_path)
+            except OSError:
+                pass
+        if logger is not None:
+            logger.warning(
+                "[Analyze Combined] shared-memory capture storage unavailable path=%s error=%s: %s; falling back to system temporary storage",
+                shared_memory_root,
+                type(exc).__name__,
+                exc,
+            )
         return None
     return shared_memory_root
 
@@ -1952,7 +1981,7 @@ def analyze_assigned_streams(
             ttl_jitter_percent=analysis_ttl_jitter_percent,
             now=now,
         )
-        if sid in media_changed_ids:
+        if sid in media_changed_ids and reason != "throughput_missing":
             reason = "media_changed"
         if reason:
             throughput_due.append((item, reason))
@@ -2070,10 +2099,12 @@ def analyze_assigned_streams(
             )
         canceled = analysis_cancel_requested()
 
+    combined_capture_retry_ids = set()
+    throughput_retry_ids = set()
     combined_items = [item_by_id[sid] for sid in combined_ids]
     if combined_items and not canceled:
         combined_started = time.monotonic()
-        capture_temp_directory = _select_capture_temp_directory(workers)
+        capture_temp_directory = _select_capture_temp_directory(workers, logger=logger)
         logger.info(
             "[Analyze Combined] capture temporary storage=%s workers=%s",
             capture_temp_directory or "system-default",
@@ -2169,13 +2200,17 @@ def analyze_assigned_streams(
                         "status": "unknown",
                         "tested_at": analyzer._utc_now_iso(),
                         "error_type": "stream_unreachable",
-                        "error": str(exc),
+                        "error": f"{type(exc).__name__}: {exc}",
                     }
                     sample_path = None
                     nominal = None
-                throughput_results[sid] = dict(throughput_result)
-                throughput_checked_ids.add(sid)
                 if sample_path:
+                    throughput_results[sid] = dict(throughput_result)
+                    if throughput_result.get("measured_mbps") is not None:
+                        throughput_checked_ids.add(sid)
+                        throughput_retry_ids.discard(sid)
+                    else:
+                        throughput_retry_ids.add(sid)
                     try:
                         local_future = local_executor.submit(
                             _analyze_local_capture,
@@ -2195,6 +2230,12 @@ def analyze_assigned_streams(
                         failed.update({"status": "dead", "error_type": "stream_unreachable", "error": str(exc)})
                         record_local_result(item, failed, checked=True)
                 else:
+                    combined_capture_retry_ids.add(sid)
+                    logger.warning(
+                        "[Analyze Combined] stream=%s capture failed error=%s; content and throughput remain incomplete",
+                        sid,
+                        throughput_result.get("error") or "Combined capture failed",
+                    )
                     failed = dict(effective_result(sid))
                     failed.update({
                         "status": "dead",
@@ -2224,17 +2265,69 @@ def analyze_assigned_streams(
                 finish_local_futures(done)
         canceled = analysis_cancel_requested()
 
+    def note_retry_result(sid, result):
+        telemetry = media_retry_telemetry[sid]
+        telemetry["retry_attempts"] += 1
+        telemetry["current_retry_attempts"] += 1
+        error_type = str(result.get("error_type") or "")
+        if error_type and error_type not in telemetry["failure_types"]:
+            telemetry["failure_types"].append(error_type)
+
+    def run_throughput_retry(item):
+        sid = int(item["id"])
+        stats = effective_result(sid).get("stats") or {}
+        _width, height = parse_resolution(stats)
+        fps = parse_fps(stats)
+        nominal = estimate_nominal_throughput_kbps(height, fps)
+        result = probe_stream(
+            str(item.get("url") or ""),
+            nominal_video_kbps=nominal,
+            duration_seconds=throughput_duration,
+            timeout_seconds=throughput_timeout,
+            user_agent=str(item.get("user_agent") or DEFAULT_USER_AGENT),
+        )
+        return result, nominal
+
     for retry_pass in range(1, retries + 1):
         if canceled:
             break
-        retry_ids = [
-            sid for sid in content_attempted_ids
+        combined_retry_ids = sorted(
+            sid for sid in combined_capture_retry_ids
             if str((content_results.get(sid) or {}).get("error_type") or "") in analyzer.RETRYABLE_ERROR_TYPES
-        ]
-        if not retry_ids:
+        )
+        content_retry_ids = sorted(
+            sid for sid in content_attempted_ids
+            if sid not in combined_capture_retry_ids
+            if str((content_results.get(sid) or {}).get("error_type") or "") in analyzer.RETRYABLE_ERROR_TYPES
+        )
+        throughput_pass_ids = sorted(throughput_retry_ids)
+        if not combined_retry_ids and not content_retry_ids and not throughput_pass_ids:
             break
         backoff = max(1.0, account_delay * 3.0)
-        logger.info("[Analyze Content Retry %d/%d] waiting %.1fs before retrying %d content checks", retry_pass, retries, backoff, len(retry_ids))
+        if combined_retry_ids:
+            logger.info(
+                "[Analyze Combined Retry %d/%d] waiting %.1fs before retrying %d combined checks",
+                retry_pass,
+                retries,
+                backoff,
+                len(combined_retry_ids),
+            )
+        if content_retry_ids:
+            logger.info(
+                "[Analyze Content Retry %d/%d] waiting %.1fs before retrying %d content checks",
+                retry_pass,
+                retries,
+                backoff,
+                len(content_retry_ids),
+            )
+        if throughput_pass_ids:
+            logger.info(
+                "[Analyze Throughput Retry %d/%d] waiting %.1fs before retrying %d throughput checks",
+                retry_pass,
+                retries,
+                backoff,
+                len(throughput_pass_ids),
+            )
         deadline = time.monotonic() + backoff
         while time.monotonic() < deadline:
             if analysis_cancel_requested():
@@ -2243,8 +2336,121 @@ def analyze_assigned_streams(
             time.sleep(min(0.25, max(0.0, deadline - time.monotonic())))
         if canceled:
             break
-        retry_started = time.monotonic()
-        retry_items = [item_by_id[sid] for sid in retry_ids]
+
+        if combined_retry_ids:
+            retry_started = time.monotonic()
+            retry_items = [item_by_id[sid] for sid in combined_retry_ids]
+            for completed, (item, future) in enumerate(
+                _fair_account_futures(
+                    retry_items,
+                    run_combined_capture,
+                    max_workers=workers,
+                    thread_name_prefix="stream-sort-combined-retry",
+                    capacity_manager=capacity_manager,
+                    max_per_account=1,
+                ),
+                start=1,
+            ):
+                sid = int(item["id"])
+                telemetry = media_retry_telemetry[sid]
+                if future is None:
+                    telemetry["retry_deferred"] += 1
+                    logger.info(
+                        "[Analyze Combined Retry %d/%d] stream=%s deferred because its M3U connection limit is occupied",
+                        retry_pass,
+                        retries,
+                        sid,
+                    )
+                    continue
+                try:
+                    throughput_result, sample_path, nominal = future.result()
+                except Exception as exc:
+                    throughput_result = {
+                        "status": "unknown",
+                        "tested_at": analyzer._utc_now_iso(),
+                        "error_type": "stream_unreachable",
+                        "error": f"{type(exc).__name__}: {exc}",
+                    }
+                    sample_path = None
+                    nominal = None
+
+                if sample_path:
+                    combined_capture_retry_ids.discard(sid)
+                    throughput_results[sid] = dict(throughput_result)
+                    if throughput_result.get("measured_mbps") is not None:
+                        throughput_checked_ids.add(sid)
+                        throughput_retry_ids.discard(sid)
+                    else:
+                        throughput_retry_ids.add(sid)
+                    result = _analyze_local_capture(
+                        item,
+                        effective_result(sid),
+                        sample_path,
+                        settings=settings,
+                        logger=logger,
+                    )
+                    content_results[sid] = dict(result)
+                    content_attempted_ids.add(sid)
+                    content_checked_ids.add(sid)
+                    note_retry_result(sid, result)
+                else:
+                    result = dict(effective_result(sid))
+                    result.update({
+                        "status": "dead",
+                        "error_type": str(throughput_result.get("error_type") or "stream_unreachable"),
+                        "error": str(throughput_result.get("error") or "Combined capture failed"),
+                    })
+                    content_results[sid] = result
+                    content_attempted_ids.add(sid)
+                    note_retry_result(sid, result)
+                    logger.warning(
+                        "[Analyze Combined Retry %d/%d] stream=%s capture failed error=%s; content and throughput remain incomplete",
+                        retry_pass,
+                        retries,
+                        sid,
+                        result.get("error"),
+                    )
+
+                elapsed = max(time.monotonic() - retry_started, 0.001)
+                eta = elapsed / completed * (len(retry_items) - completed) if completed < len(retry_items) else 0.0
+                _log_media_progress(
+                    logger,
+                    prefix=f"[Analyze Combined Retry {retry_pass}/{retries} Content]",
+                    completed=completed,
+                    phase_total=len(retry_items),
+                    item=item,
+                    reason=content_reason_by_id[sid],
+                    result=result,
+                    items=items,
+                    cache=cache,
+                    media_results=projected_results(),
+                    cached_media=total - len(content_candidate_ids),
+                    pending_media=len(retry_items) - completed,
+                    eta_seconds=eta,
+                )
+                logger.info(
+                    "[Analyze Combined Retry %d/%d] %d%% (%d/%d) stream=%s content=%s throughput=%s measured=%sMbps nominal=%skbps | ETA=%s",
+                    retry_pass,
+                    retries,
+                    int(round(completed / len(retry_items) * 100)),
+                    completed,
+                    len(retry_items),
+                    sid,
+                    "captured" if sample_path else "capture_failed",
+                    throughput_result.get("status") or "unknown",
+                    throughput_result.get("measured_mbps", "n/a"),
+                    nominal,
+                    analyzer._format_eta(eta),
+                )
+            canceled = analysis_cancel_requested()
+            if canceled:
+                break
+
+        if content_retry_ids:
+            retry_started = time.monotonic()
+            retry_items = [item_by_id[sid] for sid in content_retry_ids]
+        else:
+            retry_items = []
         for completed, (item, future) in enumerate(
             _fair_account_futures(
                 retry_items,
@@ -2269,11 +2475,7 @@ def analyze_assigned_streams(
                 result.update({"status": "dead", "error_type": "stream_unreachable", "error": str(exc)})
             content_results[sid] = result
             content_checked_ids.add(sid)
-            telemetry["retry_attempts"] += 1
-            telemetry["current_retry_attempts"] += 1
-            error_type = str(result.get("error_type") or "")
-            if error_type and error_type not in telemetry["failure_types"]:
-                telemetry["failure_types"].append(error_type)
+            note_retry_result(sid, result)
             elapsed = max(time.monotonic() - retry_started, 0.001)
             eta = elapsed / completed * (len(retry_items) - completed) if completed < len(retry_items) else 0.0
             _log_media_progress(
@@ -2291,6 +2493,59 @@ def analyze_assigned_streams(
                 pending_media=len(retry_items) - completed,
                 eta_seconds=eta,
             )
+
+        if throughput_pass_ids:
+            retry_started = time.monotonic()
+            retry_items = [item_by_id[sid] for sid in throughput_pass_ids]
+            for completed, (item, future) in enumerate(
+                _fair_account_futures(
+                    retry_items,
+                    run_throughput_retry,
+                    max_workers=workers,
+                    thread_name_prefix="stream-sort-throughput-retry",
+                    capacity_manager=capacity_manager,
+                    max_per_account=1,
+                ),
+                start=1,
+            ):
+                sid = int(item["id"])
+                if future is None:
+                    logger.info(
+                        "[Analyze Throughput Retry %d/%d] stream=%s deferred because its M3U connection limit is occupied",
+                        retry_pass,
+                        retries,
+                        sid,
+                    )
+                    continue
+                try:
+                    result, nominal = future.result()
+                except Exception as exc:
+                    result = {
+                        "status": "unknown",
+                        "tested_at": analyzer._utc_now_iso(),
+                        "error_type": "stream_unreachable",
+                        "error": f"{type(exc).__name__}: {exc}",
+                    }
+                    nominal = None
+                throughput_results[sid] = dict(result)
+                if result.get("measured_mbps") is not None:
+                    throughput_checked_ids.add(sid)
+                    throughput_retry_ids.discard(sid)
+                elapsed = max(time.monotonic() - retry_started, 0.001)
+                eta = elapsed / completed * (len(retry_items) - completed) if completed < len(retry_items) else 0.0
+                logger.info(
+                    "[Analyze Throughput Retry %d/%d] %d%% (%d/%d) stream=%s throughput=%s measured=%sMbps nominal=%skbps | ETA=%s",
+                    retry_pass,
+                    retries,
+                    int(round(completed / len(retry_items) * 100)),
+                    completed,
+                    len(retry_items),
+                    sid,
+                    result.get("status") or "unknown",
+                    result.get("measured_mbps", "n/a"),
+                    nominal,
+                    analyzer._format_eta(eta),
+                )
         canceled = analysis_cancel_requested()
 
     canceled = canceled or analysis_cancel_requested()
@@ -2335,12 +2590,15 @@ def analyze_assigned_streams(
 
     for sid, result in content_results.items():
         item = item_by_id[sid]
-        cache[str(sid)] = _merge_content_result(
+        merged = _merge_content_result(
             item,
             cache.get(str(sid)),
             result,
             analysis_reason=content_reason_by_id.get(sid),
         )
+        if sid in combined_capture_retry_ids:
+            merged.pop("throughput", None)
+        cache[str(sid)] = merged
 
     if throughput_due and not canceled:
         throughput_started = time.monotonic()
@@ -2431,7 +2689,7 @@ def analyze_assigned_streams(
     fully_cached = sum(
         1 for item in items
         if int(item["id"]) not in media_checked_ids
-        and int(item["id"]) not in content_checked_ids
+        and int(item["id"]) not in content_attempted_ids
         and int(item["id"]) not in throughput_checked_ids
         and int(item["id"]) not in capacity_deferred_ids
     )

@@ -138,3 +138,19 @@ def test_combined_capture_rejects_early_successful_exit(monkeypatch):
     assert sample_path is None
     assert result["status"] == "unknown"
     assert "expected at least" in result["error"]
+
+
+def test_combined_capture_reports_temporary_directory_permission_error(monkeypatch):
+    def denied(*_args, **_kwargs):
+        raise PermissionError(13, "Permission denied", "/dev/shm/stream-sorter")
+
+    monkeypatch.setattr("stream_sorter.throughput.tempfile.mkstemp", denied)
+    result, sample_path = capture_stream_sample(
+        "http://example.test/live.ts",
+        nominal_video_kbps=1000,
+        temp_directory="/dev/shm/stream-sorter",
+    )
+    assert sample_path is None
+    assert result["status"] == "unknown"
+    assert result["error_type"] == "stream_unreachable"
+    assert "PermissionError" in result["error"]

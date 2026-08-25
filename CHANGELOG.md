@@ -1,6 +1,21 @@
 # Changelog
 
+## 0.3.6-beta.9 - 2026-08-24
+
+- Capture combined content and throughput samples in a writable runtime directory, preferring `/dev/shm/stream-sorter` and falling back safely when it is unavailable.
+- Retry the complete combined capture when FFmpeg does not produce a sample, with per-stream failure logging on every retry pass.
+- Keep content and throughput incomplete when capture fails instead of recording false completion timestamps or throughput evidence.
+- Mark streams dead after exhausted combined retries and gate all subsequent checks with the configured dead-stream TTL.
+- Preserve `throughput_missing` as the reason for a fresh baseline instead of misreporting the first throughput check as `media_changed`.
+- Retain successfully completed analysis when a scan is stopped while leaving unconfirmed dead results immediately retryable.
+
 ## Unreleased
+
+### Fixed
+
+- Verify shared-memory capture storage with the Dispatcharr runtime identity and fall back to system temporary storage when `/dev/shm/stream-sorter` is not writable.
+- Preserve temporary-file permission and setup errors in combined-capture logs instead of collapsing them into unattributed failures.
+- Retry failed combined captures as combined content-and-throughput work, split retries only after one phase produced reusable evidence, and keep failed captures from satisfying throughput counts or TTLs.
 
 ## 0.3.6-beta.8 - 2026-08-24
 

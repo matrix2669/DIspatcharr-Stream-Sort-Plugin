@@ -439,3 +439,59 @@ Dispatcharr may resolve the same stream through multiple profiles under one M3U 
 
 - Operator clarification and post-implementation review decisions completed on 2026-08-24.
 - Supersedes ADR-011 only where playback attribution and nonhealthy throughput cadence are made more precise; all other ADR-011 thresholds remain provisional and active.
+
+---
+
+# ADR-013: Treat failed combined capture as incomplete work
+
+## Status
+
+Accepted
+
+## Date
+
+2026-08-24
+
+## Context
+
+The first clean combined scan selected `/dev/shm/stream-sorter` after checking capacity but not runtime-user writability. Dispatcharr's plugin worker ran as UID/GID `1000:1000`, while the existing directory was mode `0700` and owned by `root:root`. All 1,050 combined captures therefore failed before FFmpeg launched. The result handler counted each throughput attempt as checked and sent only content into the existing 6-second retry queue, producing no throughput measurements and misleading retry data.
+
+## Decision
+
+- Shared-memory capture selection must pass a real create/write/delete test as the current Dispatcharr runtime identity. Insufficient capacity or any access failure logs its exact exception and falls back to system temporary storage.
+- Temporary-file creation belongs inside the capture error boundary so path, permission, and filesystem failures are returned and logged as attributable capture errors.
+- A combined capture without a usable local sample has completed neither content nor throughput. Retry it through the 8-second combined path, at most once per provider at a time, using the same immediate retry budget as other health confirmation.
+- Do not increment `throughput_checked`, persist an active throughput result, or satisfy the throughput TTL for a failed combined capture.
+- After a valid combined capture, retain a usable throughput measurement while retrying a content failure through the 6-second content-only path. If content succeeds but throughput calculation remains incomplete, retain content and retry throughput only.
+- If every combined attempt fails, establish terminal dead health after the configured retries and put FFprobe, content, and throughput behind the exact Dead stream TTL. A capacity-deferred or canceled retry sequence remains retry-pending and immediately due instead.
+- Log individual combined and throughput retries plus the underlying exception so systemic local failures cannot appear to be provider-wide stream deaths.
+
+## Consequences
+
+- A root-owned shared-memory directory cannot cause an all-stream false failure; the plugin safely uses system temporary storage until ownership is corrected.
+- Retry statistics distinguish transport/capture recovery from content-quality recovery.
+- Throughput totals and TTLs represent completed measurements rather than attempted captures.
+- ADR-010's content-only retry optimization applies only after a valid combined capture produced reusable throughput evidence.
+
+## Provenance
+
+- Live `v0.3.6-beta.8` scan and runtime UID/GID write test completed on 2026-08-24.
+- Operator-approved retry and TTL corrections completed on 2026-08-24.
+
+## ADR-014: Combined capture failure and beta validation policy
+
+- Status: Accepted
+- Date: 2026-08-24
+
+### Decision
+
+- A fresh stream without prior throughput evidence is reported as `throughput_missing`. A new FFprobe observation does not relabel that initial check as `media_changed`.
+- A combined FFmpeg capture that produces no sample completes neither content validation nor throughput measurement. It enters the same three immediate retry passes used for retryable media failures.
+- If all combined retries fail, the terminal stream result is dead, incomplete throughput evidence is removed, and the exact configured dead-stream TTL controls future eligibility.
+- If a scan is stopped before retry confirmation completes, successful work is retained while unconfirmed dead results remain immediately eligible with no dead TTL.
+- Scheduled analysis remains serial by default. Parallel scheduled checks may be enabled temporarily during beta testing and are not a change to the production default or steady-state policy.
+- Provider-specific scheduling and zero-only report compaction are deferred until additional history demonstrates a need.
+
+### Rationale
+
+Failed capture attempts are not measurements and must not suppress the next valid probe. Accurate reason labels are also required for the historical reports used to tune TTLs. Temporary scheduled parallelism shortens beta feedback cycles without changing the safer production default.

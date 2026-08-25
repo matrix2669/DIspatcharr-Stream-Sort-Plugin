@@ -1,4 +1,5 @@
 import collections
+import itertools
 import sys
 import threading
 import types
@@ -616,6 +617,170 @@ def test_shared_memory_capture_directory_requires_worker_headroom(tmp_path, monk
 
     EnoughSpace.f_bavail = 1
     assert incremental._select_capture_temp_directory(12, shared_memory_root=str(root)) is None
+
+
+def test_shared_memory_capture_directory_falls_back_when_runtime_user_cannot_write(tmp_path, monkeypatch):
+    class EnoughSpace:
+        f_frsize = 1
+        f_bsize = 1
+        f_bavail = 4 * 1024 * 1024 * 1024
+
+    warnings = []
+    root = tmp_path / "stream-sorter"
+    root.mkdir()
+    monkeypatch.setattr(incremental.os, "statvfs", lambda _path: EnoughSpace())
+
+    def denied(*_args, **_kwargs):
+        raise PermissionError(13, "Permission denied", str(root))
+
+    monkeypatch.setattr(incremental.tempfile, "mkstemp", denied)
+    assert incremental._select_capture_temp_directory(
+        12,
+        shared_memory_root=str(root),
+        logger=SimpleNamespace(warning=lambda *args: warnings.append(args)),
+    ) is None
+    assert warnings
+    assert "falling back" in warnings[0][0]
+
+
+def _run_single_combined_scan(tmp_path, monkeypatch, capture_stream_sample):
+    class QuerySet(list):
+        def select_related(self, *_args):
+            return self
+
+        def order_by(self, *_args):
+            return self
+
+        def filter(self, **_kwargs):
+            return self
+
+    account = SimpleNamespace(id=10, name="Provider", get_user_agent_string=lambda: "test")
+    stream = SimpleNamespace(
+        id=42,
+        name="Stream 42",
+        url="http://example.test/42",
+        m3u_account=account,
+        m3u_account_id=account.id,
+        stream_stats={},
+        stream_stats_updated_at=None,
+    )
+    rows = QuerySet([SimpleNamespace(channel_id=1, stream=stream)])
+    models_module = types.ModuleType("apps.channels.models")
+    models_module.ChannelStream = SimpleNamespace(objects=rows)
+    monkeypatch.setitem(sys.modules, "apps", types.ModuleType("apps"))
+    monkeypatch.setitem(sys.modules, "apps.channels", types.ModuleType("apps.channels"))
+    monkeypatch.setitem(sys.modules, "apps.channels.models", models_module)
+    django_module = types.ModuleType("django")
+    django_utils_module = types.ModuleType("django.utils")
+    django_timezone_module = types.ModuleType("django.utils.timezone")
+    django_timezone_module.now = lambda: _now()
+    django_utils_module.timezone = django_timezone_module
+    monkeypatch.setitem(sys.modules, "django", django_module)
+    monkeypatch.setitem(sys.modules, "django.utils", django_utils_module)
+    monkeypatch.setitem(sys.modules, "django.utils.timezone", django_timezone_module)
+
+    now = datetime.now(timezone.utc).isoformat()
+    cache = {
+        "42": {
+            "status": "alive",
+            "url_hash": analyzer._stream_url_hash(stream.url),
+            "m3u_account_id": stream.m3u_account_id,
+            "health_checked_at": now,
+            "ffprobe_checked_at": now,
+            "metadata_updated_at": now,
+            "stats": {"resolution": "1920x1080", "source_fps": 30},
+        }
+    }
+    monkeypatch.setattr(incremental.analyzer, "load_analysis_cache", lambda _path: cache)
+    monkeypatch.setattr(incremental.analyzer, "save_analysis_cache", lambda *_args: None)
+    monkeypatch.setattr(incremental.analyzer, "_persist_dispatcharr_result", lambda *_args: None)
+    monkeypatch.setattr(incremental, "load_throughput_cache", lambda _path: {})
+    monkeypatch.setattr(incremental, "capture_stream_sample", capture_stream_sample)
+    monkeypatch.setattr(
+        incremental,
+        "_analyze_local_capture",
+        lambda _item, base, _path, **_kwargs: {
+            **dict(base),
+            "status": "alive",
+            "details": {"content": {"measured": True, "tested_at": now}},
+        },
+    )
+    monkeypatch.setattr(
+        incremental,
+        "probe_stream",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("unexpected throughput-only fallback")),
+    )
+    monkeypatch.setattr("stream_sorter.sorter.resolve_channel_scope", lambda _settings: (None, {}))
+
+    class UnlimitedCapacity:
+        def try_acquire(self, _item):
+            return True, None
+
+        def release(self, _reservation):
+            pass
+
+    monkeypatch.setattr(incremental, "build_capacity_manager", lambda _items, logger: UnlimitedCapacity())
+    ticks = itertools.count()
+    monkeypatch.setattr(incremental.time, "monotonic", lambda: float(next(ticks)))
+    messages = {"info": [], "warning": []}
+    logger = SimpleNamespace(
+        info=lambda *args, **_kwargs: messages["info"].append(args),
+        warning=lambda *args, **_kwargs: messages["warning"].append(args),
+    )
+    result = analyze_assigned_streams(
+        {"analysis_workers": 1, "playback_health_reuse": False},
+        logger=logger,
+        cache_path=str(tmp_path / "analysis.json"),
+    )
+    return result, cache, messages
+
+
+def test_failed_combined_capture_retries_both_and_preserves_no_false_throughput_check(tmp_path, monkeypatch):
+    calls = []
+
+    def capture(*_args, **_kwargs):
+        calls.append(1)
+        if len(calls) == 1:
+            return {
+                "status": "unknown",
+                "tested_at": _now().isoformat(),
+                "error_type": "stream_unreachable",
+                "error": "PermissionError: denied",
+            }, None
+        return {
+            "status": "healthy",
+            "tested_at": _now().isoformat(),
+            "measured_mbps": 12.0,
+        }, str(tmp_path / "capture.ts")
+
+    result, cache, messages = _run_single_combined_scan(tmp_path, monkeypatch, capture)
+    assert len(calls) == 2
+    assert result["content_checked"] == 1
+    assert result["throughput_checked"] == 1
+    assert cache["42"]["status"] == "alive"
+    assert cache["42"]["throughput"]["status"] == "healthy"
+    assert any("content and throughput remain incomplete" in args[0] for args in messages["warning"])
+
+
+def test_exhausted_combined_capture_retries_mark_dead_without_throughput_ttl(tmp_path, monkeypatch):
+    calls = []
+
+    def capture(*_args, **_kwargs):
+        calls.append(1)
+        return {
+            "status": "unknown",
+            "tested_at": _now().isoformat(),
+            "error_type": "stream_unreachable",
+            "error": "PermissionError: denied",
+        }, None
+
+    result, cache, _messages = _run_single_combined_scan(tmp_path, monkeypatch, capture)
+    assert len(calls) == 4
+    assert result["content_checked"] == 0
+    assert result["throughput_checked"] == 0
+    assert cache["42"]["status"] == "dead"
+    assert cache["42"]["retry_pending"] is False
+    assert "throughput" not in cache["42"]
 
 
 def test_local_combined_analysis_always_deletes_capture(tmp_path, monkeypatch):

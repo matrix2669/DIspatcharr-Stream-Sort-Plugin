@@ -43,6 +43,8 @@ Runtime state belongs under `/data`:
 - Count every active M3U profile that contributes capacity. Reserve and release the exact selected profile slot, and use Dispatcharr's native profile URL resolver so regex and credential rewriting remain authoritative.
 - Never run simultaneous retry checks against the same M3U provider. Different providers may retry concurrently.
 - Preserve capacity for active viewers. When no profile slot is available, defer the check without overwriting cached evidence.
+- Select `/dev/shm/stream-sorter` only after a real create/write/delete test succeeds as the Dispatcharr runtime UID/GID; otherwise log the failure and use system temporary storage. Never infer writability from a root `docker exec` check.
+- Retry a failed combined capture as combined work because it completed neither content nor throughput. Only split into content-only or throughput-only retries after a valid capture produced the other phase's reusable evidence.
 - Keep long-running analyzer work outside the request worker and enforce one cross-worker analysis job with the probe lock.
 - Container-side validation must add `/data/plugins` to `sys.path` and import `stream_sorter`, not `plugins.stream_sorter`.
 
