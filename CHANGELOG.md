@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.3.6-beta.10 - 2026-08-24
+
+### Fixed
+
+- Preserve each stream's pre-scan terminal health when recording the completed observation so multi-phase dead recovery produces accurate dead-to-alive and alive-to-dead reports.
+- Separate unique throughput attempts from completed numeric measurements and keep `throughput_checked` aligned with retained `measured_mbps` evidence.
+- Exclude attempted-but-unmeasured throughput work from fully cached counts without changing dead TTLs, retry budgets, provider capacity, or sorting behavior.
+
 ## 0.3.6-beta.9 - 2026-08-24
 
 - Capture combined content and throughput samples in a writable runtime directory, preferring `/dev/shm/stream-sorter` and falling back safely when it is unavailable.
@@ -8,14 +16,6 @@
 - Mark streams dead after exhausted combined retries and gate all subsequent checks with the configured dead-stream TTL.
 - Preserve `throughput_missing` as the reason for a fresh baseline instead of misreporting the first throughput check as `media_changed`.
 - Retain successfully completed analysis when a scan is stopped while leaving unconfirmed dead results immediately retryable.
-
-## Unreleased
-
-### Fixed
-
-- Verify shared-memory capture storage with the Dispatcharr runtime identity and fall back to system temporary storage when `/dev/shm/stream-sorter` is not writable.
-- Preserve temporary-file permission and setup errors in combined-capture logs instead of collapsing them into unattributed failures.
-- Retry failed combined captures as combined content-and-throughput work, split retries only after one phase produced reusable evidence, and keep failed captures from satisfying throughput counts or TTLs.
 
 ## 0.3.6-beta.8 - 2026-08-24
 

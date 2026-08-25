@@ -563,10 +563,13 @@ def _analysis_status() -> dict:
     elif job_status == "completed":
         result = value.get("result") or {}
         health_report_path = result.get("analysis_health_report_path")
+        throughput_checked = result.get("throughput_checked", 0)
+        throughput_attempted = result.get("throughput_attempted", throughput_checked)
         message = (
             f"Last Stream Sort analysis completed: {result.get('streams_analyzed', 0)} streams; "
             f"{result.get('media_checked', 0)} media checks; "
-            f"{result.get('throughput_checked', 0)} throughput checks; "
+            f"{throughput_checked} completed throughput measurements from "
+            f"{throughput_attempted} attempted streams; "
             f"{result.get('capacity_deferred', 0)} capacity-deferred checks; "
             f"{result.get('playback_health_refreshed', 0)} playback reachability reuses."
         )
@@ -1196,7 +1199,8 @@ def _background_analyze_job(
         _notify(
             "Stream Sort: analysis canceled after saving "
             f"{partial_result.get('media_checked', 0)} completed media checks and "
-            f"{partial_result.get('throughput_checked', 0)} completed throughput checks."
+            f"{partial_result.get('throughput_checked', 0)} completed throughput measurements from "
+            f"{partial_result.get('throughput_attempted', partial_result.get('throughput_checked', 0))} attempted streams."
         )
         _finish_schedule_job(
             schedule_generation,

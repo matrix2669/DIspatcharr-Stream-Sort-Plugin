@@ -171,12 +171,12 @@ All matching name rules are additive.
 
 ## Actions
 
-- **Analyze Streams** — incrementally refresh only health/content, metadata, or throughput components that require checking.
+- **Analyze Streams** — incrementally refresh only health/content, metadata, or throughput components that require checking. Completion status separates unique streams with an attempted throughput operation from streams that produced a usable numeric throughput measurement.
 - **Stop Current Scan** — stop launching new probes and safely drain already-running probes so Stream Sort releases only its own provider reservations. It does not clear Dispatcharr provider counters or reclaim viewer capacity.
 - **Apply Schedule** — save a standard five-field UTC cron schedule. Each run loads current saved UI settings and is atomically claimed once across workers.
 - **Check Schedule** — show current schedule configuration and final status of the latest scheduled job.
 - **Disable Schedule** — stop automatic scheduled analysis and clear any in-memory due-minute state.
-- **Health Report** — show problematic streams, directional health transitions, dead recovery, and time concentration in the UI.
+- **Health Report** — show problematic streams, completed scan-to-scan directional health transitions, dead recovery, and time concentration in the UI. Intermediate FFprobe/content/retry states do not count as transitions.
 - **Recommend TTLs** — compute read-only health/dead TTL and jitter recommendations from recent directional evidence, with confidence and sparse-data warnings.
 - **Reset Scan Statistics** — clear unified and legacy scan caches, scan status, health reports, and TTL recommendations while preserving runtime reliability and playback history.
 - **Reset All Statistics** — clear the same scan evidence plus all runtime reliability and playback history.
