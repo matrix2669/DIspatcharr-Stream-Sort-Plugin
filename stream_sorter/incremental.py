@@ -1383,11 +1383,16 @@ def _merge_media_result(
     *,
     analysis_reason: str | None = None,
     record_history: bool = True,
+    history_previous_status: str | None = None,
 ) -> dict[str, Any]:
     merged = dict(previous or {})
     previous_throughput = merged.get("throughput")
     previous_stats = merged.get("stats")
-    previous_status = str(merged.get("status") or "unknown").lower()
+    previous_status = str(
+        history_previous_status
+        if history_previous_status is not None
+        else merged.get("status") or "unknown"
+    ).lower()
     merged.update(dict(result))
     checked = result.get("tested_at") or analyzer._utc_now_iso()
     merged["health_checked_at"] = checked
@@ -1475,9 +1480,20 @@ def _content_skipped_result(result: Mapping[str, Any]) -> dict[str, Any]:
     return updated
 
 
-def _merge_content_result(item, previous, result, *, analysis_reason: str | None = None) -> dict[str, Any]:
+def _merge_content_result(
+    item,
+    previous,
+    result,
+    *,
+    analysis_reason: str | None = None,
+    history_previous_status: str | None = None,
+) -> dict[str, Any]:
     merged = dict(previous or {})
-    previous_status = str(merged.get("status") or "unknown").lower()
+    previous_status = str(
+        history_previous_status
+        if history_previous_status is not None
+        else merged.get("status") or "unknown"
+    ).lower()
     details = dict(result.get("details") or {})
     content = details.get("content") if isinstance(details.get("content"), Mapping) else {}
     checked = content.get("tested_at") or result.get("tested_at") or analyzer._utc_now_iso()
@@ -1532,6 +1548,17 @@ def _merge_throughput_result(item, entry, result, *, ttl_hours: float) -> dict[s
         throughput.pop("expires_at", None)
     merged["throughput"] = throughput
     return merged
+
+
+def _retained_throughput_measurement_ids(attempted_ids, cache: Mapping[str, Any]) -> set[int]:
+    retained = set()
+    for sid in attempted_ids:
+        entry = cache.get(str(sid)) or {}
+        throughput = entry.get("throughput") if isinstance(entry, Mapping) else None
+        measured = throughput.get("measured_mbps") if isinstance(throughput, Mapping) else None
+        if isinstance(measured, (int, float)) and not isinstance(measured, bool):
+            retained.add(int(sid))
+    return retained
 
 
 def _migrate_legacy_throughput(items, cache, *, ttl_hours: float) -> int:
@@ -1680,6 +1707,10 @@ def analyze_assigned_streams(
         analyzer.save_analysis_cache(cache, cache_path)
         logger.info("[Analyze] Refreshed basic metadata for %d streams from newer Dispatcharr stream_stats", dispatcharr_metadata_refreshed)
 
+    scan_start_status_by_id = {
+        int(item["id"]): str((cache.get(str(item["id"])) or {}).get("status") or "unknown").lower()
+        for item in items
+    }
     now = datetime.now(timezone.utc)
     media_due = []
     content_reason_by_id = {}
@@ -1760,6 +1791,7 @@ def analyze_assigned_streams(
             "streams_selected": 0,
             "media_checked": 0,
             "throughput_checked": 0,
+            "throughput_attempted": 0,
             "capacity_deferred": 0,
             "fully_cached": 0,
             "dispatcharr_metadata_refreshed": 0,
@@ -1990,6 +2022,7 @@ def analyze_assigned_streams(
     content_results = {}
     throughput_results = {}
     throughput_checked_ids = set()
+    throughput_attempted_ids = set()
     throughput_capacity_deferred_ids = set()
     content_checked_ids = set()
     content_attempted_ids = set()
@@ -2193,6 +2226,7 @@ def analyze_assigned_streams(
                     throughput_capacity_deferred_ids.add(sid)
                     logger.info("[Analyze Combined] stream=%s deferred because its M3U connection limit is occupied", sid)
                     continue
+                throughput_attempted_ids.add(sid)
                 try:
                     throughput_result, sample_path, nominal = future.result()
                 except Exception as exc:
@@ -2362,6 +2396,7 @@ def analyze_assigned_streams(
                         sid,
                     )
                     continue
+                throughput_attempted_ids.add(sid)
                 try:
                     throughput_result, sample_path, nominal = future.result()
                 except Exception as exc:
@@ -2517,6 +2552,7 @@ def analyze_assigned_streams(
                         sid,
                     )
                     continue
+                throughput_attempted_ids.add(sid)
                 try:
                     result, nominal = future.result()
                 except Exception as exc:
@@ -2586,6 +2622,7 @@ def analyze_assigned_streams(
             media_results[sid],
             analysis_reason=reason_by_id.get(sid),
             record_history=sid not in content_results,
+            history_previous_status=scan_start_status_by_id.get(sid, "unknown"),
         )
 
     for sid, result in content_results.items():
@@ -2595,6 +2632,7 @@ def analyze_assigned_streams(
             cache.get(str(sid)),
             result,
             analysis_reason=content_reason_by_id.get(sid),
+            history_previous_status=scan_start_status_by_id.get(sid, "unknown"),
         )
         if sid in combined_capture_retry_ids:
             merged.pop("throughput", None)
@@ -2649,6 +2687,8 @@ def analyze_assigned_streams(
                     analyzer._format_eta(eta),
                 )
                 continue
+            sid = int(item["id"])
+            throughput_attempted_ids.add(sid)
             try:
                 result, nominal = future.result()
             except Exception as exc:
@@ -2658,9 +2698,9 @@ def analyze_assigned_streams(
                     "error": f"{type(exc).__name__}: {exc}",
                 }
                 nominal = None
-            sid = int(item["id"])
             throughput_results[sid] = dict(result)
-            throughput_checked_ids.add(sid)
+            if result.get("measured_mbps") is not None:
+                throughput_checked_ids.add(sid)
             elapsed = max(time.monotonic() - throughput_started, 0.001)
             eta = elapsed / completed * (len(throughput_items) - completed) if completed < len(throughput_items) else 0.0
             counts = _throughput_counts(items, cache)
@@ -2684,13 +2724,14 @@ def analyze_assigned_streams(
             continue
         cache[str(sid)] = _merge_throughput_result(item, cache.get(str(sid)) or {}, result, ttl_hours=throughput_ttl_hours)
 
+    throughput_checked_ids = _retained_throughput_measurement_ids(throughput_attempted_ids, cache)
     media_checked_ids = set(media_results)
     capacity_deferred_ids = media_capacity_deferred_ids | content_capacity_deferred_ids | throughput_capacity_deferred_ids
     fully_cached = sum(
         1 for item in items
         if int(item["id"]) not in media_checked_ids
         and int(item["id"]) not in content_attempted_ids
-        and int(item["id"]) not in throughput_checked_ids
+        and int(item["id"]) not in throughput_attempted_ids
         and int(item["id"]) not in capacity_deferred_ids
     )
     canceled = bool(close_analysis_cancel_window() or canceled)
@@ -2701,8 +2742,8 @@ def analyze_assigned_streams(
     health_counts = _status_counts(items, cache)
     throughput_counts = _throughput_counts(items, cache)
     logger.info(
-        "[Analyze] Complete: streams=%d media_checked=%d content_checked=%d throughput_checked=%d capacity_deferred=%d fully_cached=%d playback_health_refreshed=%d dispatcharr_metadata_refreshed=%d | health %s | throughput %s",
-        total, len(media_checked_ids), len(content_checked_ids), len(throughput_checked_ids), len(capacity_deferred_ids), fully_cached, playback_health_refreshed, dispatcharr_metadata_refreshed,
+        "[Analyze] Complete: streams=%d media_checked=%d content_checked=%d throughput_attempted=%d throughput_checked=%d capacity_deferred=%d fully_cached=%d playback_health_refreshed=%d dispatcharr_metadata_refreshed=%d | health %s | throughput %s",
+        total, len(media_checked_ids), len(content_checked_ids), len(throughput_attempted_ids), len(throughput_checked_ids), len(capacity_deferred_ids), fully_cached, playback_health_refreshed, dispatcharr_metadata_refreshed,
         _overall_health_text(health_counts), _overall_throughput_text(throughput_counts),
     )
     report = _build_health_report(
@@ -2720,6 +2761,7 @@ def analyze_assigned_streams(
         "streams_selected": total,
         "media_checked": len(media_checked_ids),
         "content_checked": len(content_checked_ids),
+        "throughput_attempted": len(throughput_attempted_ids),
         "throughput_checked": len(throughput_checked_ids),
         "capacity_deferred": len(capacity_deferred_ids),
         "fully_cached": fully_cached,

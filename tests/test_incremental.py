@@ -148,11 +148,15 @@ def test_throughput_parallelism_is_limited_per_source_not_globally(tmp_path, mon
     monkeypatch.setattr(incremental.analyzer, "load_analysis_cache", lambda _path: cache)
     monkeypatch.setattr(incremental.analyzer, "save_analysis_cache", lambda *_args: None)
     monkeypatch.setattr(incremental, "load_throughput_cache", lambda _path: {})
-    monkeypatch.setattr(incremental, "probe_stream", lambda *_args, **_kwargs: {
-        "status": "healthy",
-        "tested_at": now,
-        "measured_mbps": 10,
-    })
+    monkeypatch.setattr(
+        incremental,
+        "probe_stream",
+        lambda url, *_args, **_kwargs: (
+            {"status": "unknown", "tested_at": now, "error": "no measurement"}
+            if str(url).endswith("/2")
+            else {"status": "healthy", "tested_at": now, "measured_mbps": 10}
+        ),
+    )
     monkeypatch.setattr("stream_sorter.sorter.resolve_channel_scope", lambda _settings: (None, {}))
 
     class UnlimitedCapacity:
@@ -193,7 +197,8 @@ def test_throughput_parallelism_is_limited_per_source_not_globally(tmp_path, mon
     )
 
     assert result["media_checked"] == 0
-    assert result["throughput_checked"] == 2
+    assert result["throughput_attempted"] == 2
+    assert result["throughput_checked"] == 1
     assert result["analysis_health_report_path"] == str(
         tmp_path / "dispatcharr_stream_sort_health_report.json"
     )
@@ -368,6 +373,69 @@ def test_health_report_includes_interval_guidance_from_history():
     assert report["observations"]["transition_counts"]["dead_to_alive"] == 1
     assert report["observations"]["check_interval_hours"]["p90"] is not None
     assert report["ttl_tuning_guidance"]["suggested_health_ttl_hours"] is not None
+
+
+def test_terminal_history_uses_scan_start_status_across_media_and_content_phases():
+    checked_at = _now().isoformat()
+
+    def terminal_entry(stream_id, final_status):
+        item = {
+            "id": stream_id,
+            "name": f"Stream {stream_id}",
+            "url": f"http://example.test/{stream_id}",
+            "account_id": 10,
+            "account_name": "Provider",
+        }
+        media = incremental._merge_media_result(
+            item,
+            {"status": "dead", "dead_checked_at": checked_at},
+            {"status": "alive", "tested_at": checked_at, "stats": {}, "details": {}},
+            analysis_reason="ffprobe_dead_ttl_expired",
+            record_history=False,
+            history_previous_status="dead",
+        )
+        content = {
+            "status": final_status,
+            "tested_at": checked_at,
+            "error_type": "frozen_video" if final_status == "dead" else None,
+            "error": "frozen" if final_status == "dead" else "",
+            "details": {"content": {"measured": True, "tested_at": checked_at}},
+        }
+        return item, incremental._merge_content_result(
+            item,
+            media,
+            content,
+            analysis_reason="dead_ttl_expired",
+            history_previous_status="dead",
+        )
+
+    alive_item, alive_entry = terminal_entry(1, "alive")
+    dead_item, dead_entry = terminal_entry(2, "dead")
+    assert alive_entry["health_check_history"][-1]["previous_status"] == "dead"
+    assert dead_entry["health_check_history"][-1]["previous_status"] == "dead"
+
+    report = _build_health_report(
+        [alive_item, dead_item],
+        {"1": alive_entry, "2": dead_entry},
+        now=_now(),
+        media_reason_counts={},
+        throughput_reason_counts={},
+        channels_selected=2,
+    )
+    transitions = report["observations"]["transition_counts"]
+    assert transitions["dead_to_alive"] == 1
+    assert transitions.get("alive_to_dead", 0) == 0
+
+
+def test_throughput_checked_uses_only_measurements_retained_after_terminal_health():
+    cache = {
+        "1": {"status": "alive", "throughput": {"status": "healthy", "measured_mbps": 12.5}},
+        "2": {"status": "alive", "throughput": {"status": "unknown", "error": "no measurement"}},
+        "3": {"status": "dead", "throughput": {"status": "unknown", "error": "invalidated by content"}},
+        "4": {"status": "alive", "throughput": {"status": "healthy", "measured_mbps": 8.0}},
+    }
+    retained = incremental._retained_throughput_measurement_ids({1, 2, 3}, cache)
+    assert retained == {1}
 
 
 def test_problematic_streams_require_more_than_75_percent_dead_across_full_scope():
@@ -756,6 +824,7 @@ def test_failed_combined_capture_retries_both_and_preserves_no_false_throughput_
     result, cache, messages = _run_single_combined_scan(tmp_path, monkeypatch, capture)
     assert len(calls) == 2
     assert result["content_checked"] == 1
+    assert result["throughput_attempted"] == 1
     assert result["throughput_checked"] == 1
     assert cache["42"]["status"] == "alive"
     assert cache["42"]["throughput"]["status"] == "healthy"
@@ -777,6 +846,7 @@ def test_exhausted_combined_capture_retries_mark_dead_without_throughput_ttl(tmp
     result, cache, _messages = _run_single_combined_scan(tmp_path, monkeypatch, capture)
     assert len(calls) == 4
     assert result["content_checked"] == 0
+    assert result["throughput_attempted"] == 1
     assert result["throughput_checked"] == 0
     assert cache["42"]["status"] == "dead"
     assert cache["42"]["retry_pending"] is False

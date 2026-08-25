@@ -95,6 +95,8 @@ Behavior affecting provider connections also requires controlled Dispatcharr int
 - TTL recommendations are read-only at `/data/dispatcharr_stream_sort_ttl_recommendations.json` and must reject missing, empty, or older-than-seven-day reports.
 - Do not write `Stream.is_stale` for analyzer health. Dispatcharr owns it as M3U refresh lifecycle state and does not use it to exclude playback candidates.
 - Only a completed analyzer scan may clear confirmed-dead state; runtime playback evidence cannot promote a confirmed-dead cache entry.
+- Preserve each stream's terminal status from scan start through every intermediate FFprobe, content, combined, and retry phase. The single terminal history row must compare against that snapshot rather than a phase-local status.
+- `throughput_attempted` counts unique streams for which a throughput provider operation started; `throughput_checked` counts unique streams that produced and retained a numeric measurement. Capacity deferrals count as neither, and retries do not inflate either unique-stream total.
 
 ## Future Agent Checklist
 

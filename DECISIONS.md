@@ -495,3 +495,40 @@ The first clean combined scan selected `/dev/shm/stream-sorter` after checking c
 ### Rationale
 
 Failed capture attempts are not measurements and must not suppress the next valid probe. Accurate reason labels are also required for the historical reports used to tune TTLs. Temporary scheduled parallelism shortens beta feedback cycles without changing the safer production default.
+
+---
+
+# ADR-015: Preserve scan-boundary health transitions and separate throughput attempts from measurements
+
+## Status
+
+Accepted
+
+## Date
+
+2026-08-24
+
+## Context
+
+A retained beta.9 TTL scan began with 46 confirmed-dead streams and ended with six alive and 40 dead. The terminal content rows compared against the intermediate FFprobe status, so the report omitted the six real dead-to-alive recoveries and could report unchanged dead streams as alive-to-dead transitions. The same scan attempted throughput for 63 streams but produced 46 numeric measurements; its completion counter reported all 63 as checked even though ADR-013 defines throughput totals as completed measurements.
+
+## Decision
+
+- Snapshot each selected stream's persisted terminal health after playback and metadata imports but before direct analyzer phases begin.
+- Write the scan's single terminal health-history row against that snapshot. Intermediate FFprobe, content, combined-capture, and retry statuses must not become the row's `previous_status`.
+- Count `throughput_attempted` as unique streams for which a throughput provider operation actually started during the scan. Exclude capacity deferrals and do not inflate the count for retries of the same stream.
+- Count `throughput_checked` as unique streams that produced and retained a numeric `measured_mbps` result during the scan. Unknown, failed, canceled, and terminal-dead results are not completed measurements.
+- Use attempted-stream membership, not completed-measurement membership, when deciding whether a stream was fully cached for the run.
+- Preserve the existing exact dead-TTL behavior for unknown and failed throughput evidence. Separating counters changes reporting only; it does not weaken retries, TTL gates, provider reservations, or terminal health behavior.
+- Do not migrate the beta.9 transition rows. Reset all statistics after the corrected beta is deployed so the new analysis window begins with internally consistent history.
+
+## Consequences
+
+- Directional transitions, dead-recovery durations, and future TTL recommendations reflect completed scan-to-scan state changes rather than internal phase changes.
+- Operators can distinguish provider work from usable throughput evidence without losing visibility into failed probes.
+- A clean post-deployment scan is required before using transition or throughput totals for tuning.
+
+## Provenance
+
+- Live beta.9 retained-history, cache, and log review on the `iptv` Dispatcharr host completed on 2026-08-24.
+- Operator accepted the recommended correction and clean-reset sequence on 2026-08-24.
