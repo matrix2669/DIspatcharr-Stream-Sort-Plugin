@@ -66,6 +66,12 @@ The repository uses the standalone workflow:
 
 The `dispatcharr-plugins:dev` registry channel points to Stream Sort's newest approved immutable tag: beta during active testing, otherwise the latest completed stable tag whether released or not. It is not a source branch in this repository. The released registry must not contain Stream Sort until the user explicitly approves a GitHub Release. Track every current branch in `BRANCHES.md`; remove an entry only when its remote branch is deleted and its durable result is already captured in `CHANGELOG.md` or `DECISIONS.md` as applicable.
 
+## Session Completion and Remote Continuity
+
+GitHub is the authoritative continuation source. Start by fetching `origin` and resume from the exact remote head of the branch that owns the change. A repository-change request authorizes checkpoint commits and pushes to an isolated feature or fix branch. Before ending or handing off a session, preserve unrelated work, update branch/TODO/decision/dependency/validation records, run the applicable gates, commit every in-scope committable change, push every local commit, and verify through a fresh remote query that the exact GitHub head matches the intended local checkpoint. Incomplete work is pushed as explicit WIP with failed or unavailable validation recorded; never commit provider data, credentials, runtime `/data` state, excluded artifacts, or unrelated changes merely to clean the worktree.
+
+The checkpoint does not authorize merging into `dev` or `main`, tagging, changing a registry channel, releasing, deploying, force-pushing, or deleting a branch. Report the work branch, `dev` integration, tag, registry, Release, and deployment states separately.
+
 ## Release Requirements
 
 Follow `RELEASE.md`. Every tag must agree across `VERSION`, `pyproject.toml`, `stream_sorter/plugin.json`, and `dev` registry metadata; manifest tests enforce the repository-local values. Release notes and artifacts are added only when a GitHub Release is explicitly approved. Never move a published tag or replace a published artifact; issue a new version for corrections.
