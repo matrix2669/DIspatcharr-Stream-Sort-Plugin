@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.3.6-beta.12 - 2026-08-26
+
+### Added
+
+- Append human-readable wall-clock runtime to analysis, analyze-and-sort, dry-run, and sort completion records.
+- Break aggregate dead health into invariant placeholder and other-dead counts, and log per-result health class plus FFprobe mode.
+
+### Changed
+
+- Confirm known placeholders with one one-second FFprobe at the exact dead TTL, without immediate retries or downstream content/throughput checks.
+- Require an inconclusive placeholder gate to pass the normal full FFprobe and immediate retry path, then require fresh content and throughput evidence after recovery.
+- Preserve historical content and throughput evidence while placeholder health suppresses its active use.
+- Relabel the Dispatcharr-required runtime reliability subscription as automatic-only and make manual invocation an explicit no-op because the current action schema cannot hide event subscriptions from the UI.
+
+### Removed
+
+- Remove **Maximum streams per analysis run** from settings and analysis behavior; existing saved values are ignored and channel group/profile filters remain the supported scope controls.
+
 ## 0.3.6-beta.11 - 2026-08-25
 
 ### Changed

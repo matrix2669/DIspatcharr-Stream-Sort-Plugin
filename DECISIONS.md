@@ -631,3 +631,47 @@ The policy reduces provider checks without allowing a single variable-bitrate or
 
 - Operator review of the August 25, 2026 scheduled-scan FFprobe, throughput, content, health-transition, and placeholder evidence.
 - Decision-closure Q&A in the active Stream Sort task on August 25, 2026.
+
+---
+
+# ADR-018: Terminal placeholder confirmation and honest operational surfaces
+
+## Status
+
+Accepted
+
+## Date
+
+2026-08-26
+
+## Context
+
+Retained beta.11 history showed that a known placeholder's one-second confirmation still entered all three generic retry passes and could carry scan-start content or throughput work forward. This multiplied provider attempts without improving classification. Separately, the per-run stream cap duplicated channel group/profile scope, completion records lacked comparable wall-clock duration and an explicit placeholder breakdown, and Dispatcharr displayed the event subscription used by runtime reliability as if it were a useful manual action.
+
+Dispatcharr's current plugin contract discovers event handlers only from action entries containing `events`, and its frontend renders every action entry. The action schema has no hidden or event-only property. Removing the runtime-reliability action would therefore disable automatic event delivery rather than merely hiding a button.
+
+## Decision
+
+- A one-second probe that confirms a previously known `placeholder_file` is a terminal completed observation with zero immediate retries. It resets the exact base dead-TTL recovery gate and keeps aggregate status `dead` with `health_class=placeholder`.
+- Suppress content and throughput due decisions and execution for placeholder health. Retain prior content and throughput evidence in the cache as historical evidence, but ignore it while aggregate health is placeholder-dead.
+- If the one-second result changes or is inconclusive, immediately run the configured full FFprobe. The result then follows the ordinary retry contract. Newly discovered placeholders and low-bitrate failures retain the full configured retry budget.
+- A full probe that recovers a known placeholder to alive forces fresh content and throughput decisions, regardless of their retained historical timestamps. Placeholder confirmation never creates `media_changed` work.
+- Log direct-probe mode as `placeholder_confirm_1s` or `full_ffprobe_5s`, and log `health_class=placeholder` separately from other dead health.
+- Keep aggregate dead authoritative and render its exact breakdown as `dead=N (placeholder=P other_dead=O)`, with a hard invariant that `P + O == N`.
+- Append monotonic wall-clock runtime to final analysis, analyze-and-sort, dry-run, and sort completion records without removing existing counters.
+- Remove `analysis_max_streams` from the manifest and analyzer. Existing saved values remain harmless orphaned settings and are ignored; channel group and profile filters are the supported scope controls.
+- Preserve the runtime reliability event action because it is the only supported Dispatcharr subscription mechanism. Relabel it as automatic-only, describe the platform limitation, and make manual invocation an explicit no-op. Revisit true hiding when Dispatcharr supports event-only or hidden action metadata.
+
+## Consequences
+
+- Known placeholders consume one provider attempt per dead-TTL confirmation instead of four and cannot trigger content or throughput provider work until recovery.
+- Placeholder recovery cannot reuse evidence collected before the placeholder period as proof of current content or delivery health.
+- Completion logs can be compared across TTL, worker, scheduling, and scope changes without reconstructing runtime from timestamps.
+- Operators no longer have an arbitrary partial-run control that can repeatedly favor the first ordered streams in a scope.
+- The automatic reliability subscription remains visible in current Dispatcharr releases, but its purpose and inert manual behavior are explicit and telemetry behavior is unchanged.
+
+## Provenance
+
+- GitHub issues #12, #14, #15, and #20 and their acceptance criteria, reviewed on 2026-08-26.
+- Operator decision to prioritize fewer provider checks while retaining periodic placeholder recovery detection.
+- Dispatcharr primary loader, serializer, frontend, and event-registration tests inspected on 2026-08-26.

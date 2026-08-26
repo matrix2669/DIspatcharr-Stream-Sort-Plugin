@@ -7,6 +7,8 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+
 from stream_sorter import analyzer, incremental
 from stream_sorter.incremental import (
     _fair_account_futures,
@@ -116,6 +118,49 @@ def test_placeholder_rollups_do_not_increment_general_health_or_retry_counters()
     assert "completed_checks" not in bucket
     assert "dead_checks" not in bucket
     assert "retry_attempts" not in bucket
+
+
+def test_health_summary_breaks_placeholders_out_of_authoritative_dead_total():
+    counts = collections.Counter({"alive": 1320, "dead": 77})
+    assert incremental._overall_health_text(counts, placeholder_count=28) == (
+        "alive=1320 dead=77 (placeholder=28 other_dead=49) skipped=0 unknown=0"
+    )
+    with pytest.raises(ValueError, match="aggregate dead count"):
+        incremental._overall_health_text(counts, placeholder_count=78)
+
+
+def test_unique_item_selection_has_no_legacy_per_run_cap():
+    streams = [
+        SimpleNamespace(
+            id=sid,
+            name=f"Stream {sid}",
+            url=f"http://example.test/{sid}",
+            m3u_account=None,
+            m3u_account_id=None,
+            stream_stats={},
+            stream_stats_updated_at=None,
+        )
+        for sid in (1, 2)
+    ]
+    rows = [SimpleNamespace(stream=streams[0]), SimpleNamespace(stream=streams[0]), SimpleNamespace(stream=streams[1])]
+    items = incremental._unique_items_from_rows(rows, {1: [], 2: []})
+    assert [item["id"] for item in items] == [1, 2]
+
+
+def test_placeholder_merge_preserves_historical_throughput_evidence():
+    item = {"id": 42, "name": "Placeholder", "url": "http://example.test/42", "account_id": 7}
+    previous = {
+        "status": "alive",
+        "throughput": {"status": "healthy", "checked_at": _now().isoformat(), "measured_mbps": 8.0},
+    }
+    result = {
+        "status": "dead",
+        "error_type": "placeholder_file",
+        "tested_at": _now().isoformat(),
+        "details": {"probe_mode": "placeholder_confirm_1s"},
+    }
+    merged = incremental._merge_media_result(item, previous, result)
+    assert merged["throughput"] == previous["throughput"]
 
 
 def test_terminal_content_dead_preserves_and_advances_existing_dead_streak():
@@ -1000,6 +1045,205 @@ def _run_single_combined_scan(tmp_path, monkeypatch, capture_stream_sample):
         cache_path=str(tmp_path / "analysis.json"),
     )
     return result, cache, messages
+
+
+def _run_single_ffprobe_scan(tmp_path, monkeypatch, *, previous_entry, analyze_stream, capture_stream_sample=None):
+    class QuerySet(list):
+        def select_related(self, *_args):
+            return self
+
+        def order_by(self, *_args):
+            return self
+
+        def filter(self, **_kwargs):
+            return self
+
+    account = SimpleNamespace(id=10, name="Provider", get_user_agent_string=lambda: "test")
+    stream = SimpleNamespace(
+        id=42,
+        name="Stream 42",
+        url="http://example.test/42",
+        m3u_account=account,
+        m3u_account_id=account.id,
+        stream_stats={},
+        stream_stats_updated_at=None,
+    )
+    rows = QuerySet([SimpleNamespace(channel_id=1, stream=stream)])
+    models_module = types.ModuleType("apps.channels.models")
+    models_module.ChannelStream = SimpleNamespace(objects=rows)
+    monkeypatch.setitem(sys.modules, "apps", types.ModuleType("apps"))
+    monkeypatch.setitem(sys.modules, "apps.channels", types.ModuleType("apps.channels"))
+    monkeypatch.setitem(sys.modules, "apps.channels.models", models_module)
+    django_module = types.ModuleType("django")
+    django_utils_module = types.ModuleType("django.utils")
+    django_timezone_module = types.ModuleType("django.utils.timezone")
+    django_timezone_module.now = lambda: _now()
+    django_utils_module.timezone = django_timezone_module
+    monkeypatch.setitem(sys.modules, "django", django_module)
+    monkeypatch.setitem(sys.modules, "django.utils", django_utils_module)
+    monkeypatch.setitem(sys.modules, "django.utils.timezone", django_timezone_module)
+
+    cache = {"42": dict(previous_entry)} if previous_entry is not None else {}
+    monkeypatch.setattr(incremental.analyzer, "load_analysis_cache", lambda _path: cache)
+    monkeypatch.setattr(incremental.analyzer, "save_analysis_cache", lambda *_args: None)
+    monkeypatch.setattr(incremental.analyzer, "_persist_dispatcharr_result", lambda *_args: None)
+    monkeypatch.setattr(incremental.analyzer, "analyze_stream", analyze_stream)
+    monkeypatch.setattr(incremental, "load_throughput_cache", lambda _path: {})
+    monkeypatch.setattr("stream_sorter.sorter.resolve_channel_scope", lambda _settings: (None, {}))
+
+    if capture_stream_sample is None:
+        capture_stream_sample = lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("placeholder must not enter content/throughput capture")
+        )
+    monkeypatch.setattr(incremental, "capture_stream_sample", capture_stream_sample)
+    monkeypatch.setattr(
+        incremental,
+        "probe_stream",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("unexpected throughput-only probe")),
+    )
+    monkeypatch.setattr(
+        incremental,
+        "_analyze_local_capture",
+        lambda _item, base, _path, **_kwargs: {
+            **dict(base),
+            "status": "alive",
+            "error_type": None,
+            "details": {"content": {"measured": True, "tested_at": _now().isoformat()}},
+        },
+    )
+
+    class UnlimitedCapacity:
+        def try_acquire(self, _item):
+            return True, None
+
+        def release(self, _reservation):
+            pass
+
+    monkeypatch.setattr(incremental, "build_capacity_manager", lambda _items, logger: UnlimitedCapacity())
+    messages = {"info": [], "warning": []}
+    logger = SimpleNamespace(
+        info=lambda *args, **_kwargs: messages["info"].append(args),
+        warning=lambda *args, **_kwargs: messages["warning"].append(args),
+    )
+    result = analyze_assigned_streams(
+        {
+            "analysis_workers": 1,
+            "analysis_retries": 3,
+            "analysis_duration_seconds": 5,
+            "dead_content_ttl_hours": 1,
+            "playback_health_reuse": False,
+        },
+        logger=logger,
+        cache_path=str(tmp_path / "analysis.json"),
+    )
+    return result, cache, messages
+
+
+def test_known_placeholder_confirmation_is_terminal_without_retries_or_downstream_work(tmp_path, monkeypatch):
+    calls = []
+
+    def analyze(*_args, settings, **_kwargs):
+        calls.append(settings["analysis_duration_seconds"])
+        return {
+            "status": "dead",
+            "error_type": "placeholder_file",
+            "tested_at": _now().isoformat(),
+            "stats": {"resolution": "1920x1080", "video_bitrate": 80},
+            "details": {"container_duration_seconds": 30},
+        }
+
+    previous = {
+        "status": "dead",
+        "error_type": "placeholder_file",
+        "url_hash": analyzer._stream_url_hash("http://example.test/42"),
+        "m3u_account_id": 10,
+        "dead_checked_at": "2020-01-01T00:00:00+00:00",
+        "content_checked_at": "2020-01-01T00:00:00+00:00",
+        "throughput": {"status": "healthy", "checked_at": "2020-01-01T00:00:00+00:00", "measured_mbps": 8.0},
+    }
+    result, cache, messages = _run_single_ffprobe_scan(
+        tmp_path, monkeypatch, previous_entry=previous, analyze_stream=analyze
+    )
+    assert calls == [1]
+    assert result["content_checked"] == 0
+    assert result["throughput_attempted"] == 0
+    assert cache["42"]["retry_telemetry"]["retry_attempts"] == 0
+    assert cache["42"]["retry_telemetry"]["retries_exhausted"] is False
+    assert cache["42"]["retry_pending"] is False
+    assert cache["42"]["throughput"] == previous["throughput"]
+    progress = next(args for args in messages["info"] if "[Analyze Media]" in args[0] and "stream=%s" in args[0])
+    assert "health_class=%s" in progress[0]
+    assert "probe_mode=%s" in progress[0]
+    assert "placeholder" in progress
+    assert "placeholder_confirm_1s" in progress
+
+
+@pytest.mark.parametrize("error_type", ["placeholder_file", "low_bitrate"])
+def test_new_placeholder_and_low_bitrate_results_keep_full_retry_budget(tmp_path, monkeypatch, error_type):
+    calls = []
+
+    def analyze(*_args, settings, **_kwargs):
+        calls.append(settings["analysis_duration_seconds"])
+        return {
+            "status": "dead",
+            "error_type": error_type,
+            "tested_at": _now().isoformat(),
+            "stats": {"resolution": "1920x1080", "video_bitrate": 80},
+            "details": {},
+        }
+
+    _result, cache, _messages = _run_single_ffprobe_scan(
+        tmp_path, monkeypatch, previous_entry=None, analyze_stream=analyze
+    )
+    assert calls == [5, 5, 5, 5]
+    assert cache["42"]["retry_telemetry"]["retry_attempts"] == 3
+    assert cache["42"]["retry_telemetry"]["retries_exhausted"] is True
+
+
+def test_placeholder_recovery_requires_full_ffprobe_and_fresh_content_throughput(tmp_path, monkeypatch):
+    calls = []
+
+    def analyze(*_args, settings, **_kwargs):
+        duration = settings["analysis_duration_seconds"]
+        calls.append(duration)
+        return {
+            "status": "alive",
+            "error_type": None,
+            "tested_at": _now().isoformat(),
+            "stats": {"resolution": "1920x1080", "source_fps": 30, "video_bitrate": 4000},
+            "details": {"has_audio": True},
+        }
+
+    sample = tmp_path / "recovered.ts"
+    sample.write_bytes(b"sample")
+
+    def capture(*_args, **_kwargs):
+        return {"status": "healthy", "tested_at": _now().isoformat(), "measured_mbps": 12.0}, str(sample)
+
+    previous = {
+        "status": "dead",
+        "error_type": "placeholder_file",
+        "url_hash": analyzer._stream_url_hash("http://example.test/42"),
+        "m3u_account_id": 10,
+        "dead_checked_at": "2020-01-01T00:00:00+00:00",
+        "content_checked_at": _now().isoformat(),
+        "throughput": {"status": "healthy", "checked_at": _now().isoformat(), "measured_mbps": 8.0},
+    }
+    result, cache, _messages = _run_single_ffprobe_scan(
+        tmp_path,
+        monkeypatch,
+        previous_entry=previous,
+        analyze_stream=analyze,
+        capture_stream_sample=capture,
+    )
+    assert calls == [1, 5]
+    assert result["content_checked"] == 1
+    assert result["throughput_attempted"] == 1
+    assert result["throughput_checked"] == 1
+    assert cache["42"]["status"] == "alive"
+    assert cache["42"]["throughput"]["measured_mbps"] == 12.0
+    assert result["total_runtime"]
+    assert "placeholder=0 other_dead=0" in result["health_summary"]
 
 
 def test_failed_combined_capture_retries_both_and_preserves_no_false_throughput_check(tmp_path, monkeypatch):

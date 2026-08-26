@@ -1,6 +1,6 @@
 {
   "name": "Dispatcharr Stream Sort",
-  "version": "0.3.6-beta.11",
+  "version": "0.3.6-beta.12",
   "description": "Analyzes stream health, quality, delivery performance, and runtime reliability telemetry with M3U connection-capacity reservations, reuses fresh Dispatcharr playback metadata, then scores and reorders streams already assigned to channels.",
   "author": "matrix2669",
   "help_url": "https://github.com/matrix2669/DIspatcharr-Stream-Sort-Plugin",
@@ -32,12 +32,11 @@
     {"id":"analysis_connection_timeout_seconds","label":"Analysis connection timeout (seconds)","type":"number","default":10},
     {"id":"analysis_probe_timeout_seconds","label":"Analysis probe timeout (seconds)","type":"number","default":20},
     {"id":"analysis_duration_seconds","label":"FFprobe sample duration (seconds)","type":"number","default":5,"help_text":"Packet sample used for bitrate and metadata analysis."},
-    {"id":"analysis_retries","label":"Retries for transient failures","type":"number","default":3,"help_text":"Retries timeouts, connection-refused, network-unreachable and server-error media results after the first pass. Retry passes use at most one simultaneous recheck per M3U source."},
+    {"id":"analysis_retries","label":"Retries for provisional failures","type":"number","default":3,"help_text":"Retries transient transport failures, invalid media, low bitrate, newly detected or inconclusive placeholders, and content failures after the first pass. A one-second recheck that confirms a previously known placeholder is terminal without retries. Retry passes use at most one simultaneous recheck per M3U source."},
     {"id":"analysis_per_account_delay_seconds","label":"Per-source analysis start delay (seconds)","type":"number","default":1,"help_text":"Minimum delay between starting media checks against the same M3U account."},
-    {"id":"analysis_max_streams","label":"Maximum streams per analysis run","type":"number","default":0,"help_text":"0 means all unique streams attached to channels inside the selected scope. Useful for controlled dev-test runs."},
     {"id":"analysis_ffprobe_path","label":"FFprobe path","type":"string","default":"/usr/local/bin/ffprobe"},
     {"id":"analysis_ffmpeg_path","label":"FFmpeg path","type":"string","default":"/usr/local/bin/ffmpeg"},
-    {"id":"placeholder_file_detection","label":"Detect fixed-duration placeholder files","type":"boolean","default":true,"help_text":"A continuous live stream normally has no fixed container duration. This check adds no extra provider connection."},
+    {"id":"placeholder_file_detection","label":"Detect fixed-duration placeholder files","type":"boolean","default":true,"help_text":"A continuous live stream normally has no fixed container duration. Newly detected or inconclusive placeholders use normal full-probe retries. A known placeholder is rechecked with a one-second gate at its Dead stream TTL; confirmation is terminal and skips content and throughput work."},
     {"id":"black_screen_detection","label":"Detect black video","type":"boolean","default":true},
     {"id":"frozen_video_detection","label":"Detect frozen video","type":"boolean","default":true},
     {"id":"silent_audio_detection","label":"Detect silent audio","type":"boolean","default":true,"help_text":"Only applies when an audio track exists."},
@@ -68,6 +67,6 @@
     {"id":"apply_schedule","label":"Save Schedule","description":"Enable or refresh the cron schedule. Every run loads the current saved UI analysis settings; changing a TTL, filter, or worker value does not require reapplying the schedule.","button_label":"Apply Schedule","button_variant":"outline","button_color":"blue"},
     {"id":"schedule_status","label":"Check Schedule","description":"Show schedule configuration and the final status of the latest scheduled analysis, including running, completed, failed, or skipped-busy.","button_label":"Check Schedule","button_variant":"outline","button_color":"gray"},
     {"id":"remove_schedule","label":"Disable Schedule","description":"Stop scheduled automatic analysis.","button_label":"Disable Schedule","button_variant":"outline","button_color":"gray","confirm":{"required":true,"title":"Disable schedule?","message":"Scheduled analysis runs will stop after this change."}},
-    {"id":"record_runtime_event","label":"Runtime Reliability Collector","description":"Automatic event-driven telemetry collector. Manual runs do not create synthetic reliability data.","button_label":"Event-driven","button_variant":"outline","button_color":"gray","events":["channel_start","channel_stop","channel_buffering","channel_reconnect","channel_error","channel_failover","stream_switch"]}
+    {"id":"record_runtime_event","label":"Runtime Reliability (automatic)","description":"Required Dispatcharr event subscription. Current Dispatcharr versions display every subscribed action; clicking this row is an informational no-op and never creates synthetic telemetry.","button_label":"Automatic only","button_variant":"subtle","button_color":"gray","events":["channel_start","channel_stop","channel_buffering","channel_reconnect","channel_error","channel_failover","stream_switch"]}
   ]
 }

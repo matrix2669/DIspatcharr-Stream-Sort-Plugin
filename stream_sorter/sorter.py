@@ -17,6 +17,7 @@ from .scoring import (
     parse_source_rules,
     rank_candidates,
 )
+from .analyzer import _format_eta
 from .throughput import DEFAULT_CACHE_PATH, DEFAULT_USER_AGENT, load_cache, probe_stream, save_cache
 from .reliability import RELIABILITY_PATH, load_reliability_cache
 
@@ -329,6 +330,7 @@ def sort_channels(
     from django.db import transaction
     from apps.channels.models import ChannelStream
 
+    run_started = time.monotonic()
     cfg = _settings(settings)
     channel_ids, filter_summary = resolve_channel_scope(settings)
     cache = load_cache(cache_path)
@@ -388,6 +390,7 @@ def sort_channels(
         with transaction.atomic():
             ChannelStream.objects.bulk_update(rows_to_update, ["order"])
 
+    runtime_seconds = max(0.0, time.monotonic() - run_started)
     payload = {
         "generated_at": now.isoformat(),
         "mode": "apply" if apply else "dry_run",
@@ -396,12 +399,14 @@ def sort_channels(
         "channels_changed": changed_channels,
         "rows_changed": changed_rows,
         "channels_skipped": skipped_channels,
+        "total_runtime_seconds": round(runtime_seconds, 3),
+        "total_runtime": _format_eta(runtime_seconds),
         "channels": channel_reports,
     }
     _write_json_atomic(payload, report_path)
 
     logger.info(
-        "Stream Sort %s: filter=%s selected=%s evaluated=%s changed_channels=%s changed_rows=%s report=%s",
+        "Stream Sort %s: filter=%s selected=%s evaluated=%s changed_channels=%s changed_rows=%s report=%s runtime=%s",
         "apply" if apply else "dry-run",
         filter_summary["match_mode"],
         filter_summary["selected_channel_count"],
@@ -409,6 +414,7 @@ def sort_channels(
         changed_channels,
         changed_rows,
         report_path,
+        payload["total_runtime"],
     )
     return payload
 

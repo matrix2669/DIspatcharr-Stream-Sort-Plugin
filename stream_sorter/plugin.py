@@ -6,6 +6,7 @@ import os
 import re
 import tempfile
 import threading
+import time
 import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Mapping
@@ -15,7 +16,7 @@ try:
 except ImportError:  # pragma: no cover - Dispatcharr runs on Linux
     fcntl = None
 
-from .analyzer import ANALYSIS_CACHE_PATH, probe_assigned_streams
+from .analyzer import ANALYSIS_CACHE_PATH, _format_eta, probe_assigned_streams
 from .execution_control import (
     AnalysisAlreadyRunning,
     AnalysisCancelled,
@@ -1145,6 +1146,7 @@ def _background_analyze_job(
 ) -> None:
     from django.db import close_old_connections
 
+    job_started = time.monotonic()
     close_old_connections()
     try:
         _update_status(job_id, phase="preparing")
@@ -1163,20 +1165,29 @@ def _background_analyze_job(
                 "channels_changed": sort_result["channels_changed"],
                 "rows_changed": sort_result["rows_changed"],
             }
+            runtime_seconds = max(0.0, time.monotonic() - job_started)
+            result["total_runtime_seconds"] = round(runtime_seconds, 3)
+            result["total_runtime"] = _format_eta(runtime_seconds)
             LOGGER.info(
-                "[Analyze + Sort] complete analyzed=%s changed_channels=%s",
+                "[Analyze + Sort] complete analyzed=%s changed_channels=%s health %s runtime=%s",
                 result["streams_analyzed"],
                 sort_result["channels_changed"],
+                result["health_summary"],
+                result["total_runtime"],
             )
             _notify(
                 f"✅ Stream Sort: analyzed {result['streams_analyzed']} streams; "
                 f"sorted {sort_result['channels_changed']} changed channels."
             )
         else:
+            runtime_seconds = max(0.0, time.monotonic() - job_started)
+            result["total_runtime_seconds"] = round(runtime_seconds, 3)
+            result["total_runtime"] = _format_eta(runtime_seconds)
             LOGGER.info(
-                "[Analyze] background job complete analyzed=%s status_counts=%s",
+                "[Analyze] background job complete analyzed=%s health %s runtime=%s",
                 result["streams_analyzed"],
-                result["status_counts"],
+                result["health_summary"],
+                result["total_runtime"],
             )
             _notify(
                 f"✅ Stream Sort: analysis complete for {result['streams_analyzed']} streams "
@@ -1193,7 +1204,10 @@ def _background_analyze_job(
             schedule_generation,
             job_id,
             status="completed",
-            message=f"Scheduled analysis completed for {result['streams_analyzed']} streams.",
+            message=(
+                f"Scheduled analysis completed for {result['streams_analyzed']} streams "
+                f"in {result['total_runtime']}."
+            ),
         )
     except AnalysisCancelled as exc:
         LOGGER.info("[Analyze] background job canceled")
@@ -1534,8 +1548,19 @@ class Plugin:
 
         try:
             if action == "record_runtime_event":
+                event_name = (params or {}).get("event")
+                if not event_name:
+                    return {
+                        "status": "ok",
+                        "message": (
+                            "Runtime reliability collection is automatic. "
+                            "No manual event was recorded."
+                        ),
+                        "recorded": False,
+                        "counted": False,
+                    }
                 return record_runtime_event(
-                    (params or {}).get("event"),
+                    event_name,
                     (params or {}).get("payload") or {},
                     logger=logger,
                     path=RELIABILITY_PATH,

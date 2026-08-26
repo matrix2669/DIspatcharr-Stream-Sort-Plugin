@@ -12,6 +12,7 @@ Before deleting a branch, record user-visible results in `CHANGELOG.md` and dura
 | `dev` | long-lived | active | `main` | `main` | Integrates and validates the next beta and stable release. |
 | `fix/v0.3.6-beta.6-analysis-control` | short-lived | active | `dev` | `dev` | Prevent overlapping analysis entry points, add safe cancellation, and publish immutable beta.6. |
 | `fix/v0.3.6-beta.10-telemetry-integrity` | short-lived | active | `dev` | `dev` | Preserve scan-boundary health transitions and distinguish attempted throughput probes from completed measurements. |
+| `fix/v0.3.6-beta.12-issues-12-14-15-20` | short-lived | active | `dev` | `dev` | Resolve beta.12 placeholder efficiency, operational logging, obsolete settings, and automatic reliability-action clarity. |
 | `feature/session-completion-remote-checkpoint` | governance | integrated; retained | `dev` at `3097708` | `dev` | Reconcile the mandatory session-end GitHub checkpoint rule without changing analyzer behavior or distribution. |
 
 ## Branch Records
@@ -45,6 +46,7 @@ Before cleanup, the legacy `dev-test`, checkpoint, and duplicate `noop-check` br
 - `fix/v0.3.6-beta.4-review-corrections`: active corrective branch from `dev`; fixes all beta.3 review findings, expands validation, and targets immutable `v0.3.6-beta.4` before integration back to `dev`.
 - `fix/v0.3.6-beta.6-analysis-control`: active corrective branch from `dev`; preserves viewer-aware capacity while serializing direct/UI/scheduled scans, adds cooperative checkpoint-and-stop behavior, and targets immutable `v0.3.6-beta.6`. Validation: 107 automated tests, Python compilation, diff checks, and workspace standards reconciliation pass; exact archive installation and live Dispatcharr reservation/cancellation checks remain publication gates.
 - `fix/v0.3.6-beta.10-telemetry-integrity`: active corrective branch from `dev`; fixes beta.9 terminal transition attribution and throughput completion accounting, adds regression coverage, and targets immutable `v0.3.6-beta.10`. Excludes TTL, retry-budget, scheduling, provider-capacity, scoring, and stream-order changes. Validation and live clean-scan evidence remain publication gates.
+- `fix/v0.3.6-beta.12-issues-12-14-15-20`: active corrective branch from `dev`; makes known-placeholder confirmation terminal without downstream work, removes the obsolete analysis-run cap, adds runtime and dead-breakdown logs, and documents Dispatcharr's required visible event-subscription action. Targets immutable `v0.3.6-beta.12`; validation, integration into `dev`, tag, registry publication, and deployment remain separate approval gates.
 
 ## Session-continuity reconciliation
 

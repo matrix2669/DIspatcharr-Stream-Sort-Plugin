@@ -27,6 +27,9 @@ def test_plugin_manifest_is_valid_and_matches_version():
         "record_runtime_event",
     }
     reliability_action = next(a for a in manifest["actions"] if a["id"] == "record_runtime_event")
+    assert reliability_action["label"] == "Runtime Reliability (automatic)"
+    assert reliability_action["button_label"] == "Automatic only"
+    assert "informational no-op" in reliability_action["description"]
     assert set(reliability_action["events"]) == {
         "channel_start",
         "channel_stop",
@@ -37,6 +40,8 @@ def test_plugin_manifest_is_valid_and_matches_version():
         "stream_switch",
     }
     field_ids = {field["id"] for field in manifest["fields"]}
+    assert "analysis_max_streams" not in field_ids
+    assert "analysis_max_streams" not in (root / "stream_sorter" / "incremental.py").read_text()
     assert "stream_data_ttl_hours" in field_ids
     assert "health_content_ttl_hours" not in field_ids
     assert "dead_content_ttl_hours" in field_ids
