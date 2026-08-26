@@ -66,6 +66,16 @@ The repository uses the standalone workflow:
 
 The `dispatcharr-plugins:dev` registry channel points to Stream Sort's newest approved immutable tag: beta during active testing, otherwise the latest completed stable tag whether released or not. It is not a source branch in this repository. The released registry must not contain Stream Sort until the user explicitly approves a GitHub Release. Track every current branch in `BRANCHES.md`; remove an entry only when its remote branch is deleted and its durable result is already captured in `CHANGELOG.md` or `DECISIONS.md` as applicable.
 
+## Work Tracking Pilot
+
+GitHub Issues are authoritative for independently actionable work: the outcome, acceptance criteria, relationships, discussion, current status, and blockers. The private user-level [Workspace Roadmap](https://github.com/users/matrix2669/projects/1) provides the cross-repository planning view. `TODO.md` is a durable migration index only and must not duplicate live Issue status.
+
+Use parent Issues and sub-issues for an initiative with independently completable parts. Use explicit blocked-by relationships when order matters. Leave priority unset until the user deliberately triages it; use the Project's Delivery field to distinguish `dev`, `dev-test`, `main`, `upstream`, and `future` without implying deployment.
+
+Branches own remote implementation checkpoints and `BRANCHES.md` owns branch intent and validation state. Pull requests own review of integration into the documented target branch; opening or updating a pull request does not authorize merging, release, registry changes, or deployment. Link the owning Issue, branch record, Project item, and pull request so another session can resume from GitHub without reconstructing state from chat.
+
+Keep durable authority in its established file: architectural and product decisions in `DECISIONS.md`, external contracts in `DEPENDENCIES.md`, branch continuity in `BRANCHES.md`, and shipped results in `CHANGELOG.md`. Close or update the Issue when its acceptance criteria change or complete rather than maintaining a parallel checklist in repository documentation.
+
 ## Session Completion and Remote Continuity
 
 GitHub is the authoritative continuation source. Start by fetching `origin` and resume from the exact remote head of the branch that owns the change. A repository-change request authorizes checkpoint commits and pushes to an isolated feature or fix branch. Before ending or handing off a session, preserve unrelated work, update branch/TODO/decision/dependency/validation records, run the applicable gates, commit every in-scope committable change, push every local commit, and verify through a fresh remote query that the exact GitHub head matches the intended local checkpoint. Incomplete work is pushed as explicit WIP with failed or unavailable validation recorded; never commit provider data, credentials, runtime `/data` state, excluded artifacts, or unrelated changes merely to clean the worktree.

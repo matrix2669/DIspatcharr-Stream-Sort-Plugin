@@ -1,58 +1,30 @@
-# Stream Sort TODO
+# Stream Sort Work Tracking
 
-- [ ] Add a Dispatcharr-supported playback exclusion mechanism if core exposes one; keep current dead-stream handling report-only and non-destructive.
-- [ ] Simplify the settings UI and scoring, possibly using select boxes with values from -5 to +5.
-- [ ] Add multi-line input boxes for prefix rules.
-- [ ] Consider an optional scheduler pause while streams are actively playing.
-- [ ] Add a button to stop the current scan.
-- [ ] Evaluate provider-aware TTL spreading only if stream-level concentration reports show specific accounts are being hammered.
-- [ ] Remove the Runtime Reliability Collector from the Actions page in the UI.
-- [ ] Remove **Maximum streams per analysis run**; Group and Profile filters make it unnecessary.
+Actionable work is tracked in [GitHub Issues](https://github.com/matrix2669/DIspatcharr-Stream-Sort-Plugin/issues) and the private [Workspace Roadmap](https://github.com/users/matrix2669/projects/1). GitHub owns each item's current title, status, acceptance criteria, relationships, discussion, and blockers; this file is only a durable migration index and does not duplicate live status.
 
-## Draft: Event Channel Stream Monitor supplement
+## Pilot
 
-Status: Draft and deferred until Stream Sort's base analysis, retry, TTL, reporting, scheduling, and sorting behavior has accumulated clean operational evidence.
+- [#10: Pilot GitHub Issues and Project work tracking for Stream Sort](https://github.com/matrix2669/DIspatcharr-Stream-Sort-Plugin/issues/10)
 
-### Goal
+## Migrated work
 
-- Determine whether streams that are expected to be offline between scheduled events materially distort Stream Sort's dead-stream reports and TTL recommendations.
-- If the evidence supports it, create a separate supplemental plugin that monitors event channels and asks Stream Sort to analyze and sort only those channels before their events.
-- Keep EPG interpretation, event-name matching, and event scheduling outside Stream Sort so Stream Sort remains responsible only for standard scoped analysis and sorting.
+- [#17: Add supported playback exclusion when Dispatcharr exposes a core contract](https://github.com/matrix2669/DIspatcharr-Stream-Sort-Plugin/issues/17)
+- [#7: Simplify Stream Sort settings and scoring controls](https://github.com/matrix2669/DIspatcharr-Stream-Sort-Plugin/issues/7)
+- [#5: Verify and improve multiline prefix-rule editing](https://github.com/matrix2669/DIspatcharr-Stream-Sort-Plugin/issues/5)
+- [#16: Evaluate pausing scheduled scans during active playback](https://github.com/matrix2669/DIspatcharr-Stream-Sort-Plugin/issues/16)
+- [#6: Evaluate provider-aware TTL spreading from concentration evidence](https://github.com/matrix2669/DIspatcharr-Stream-Sort-Plugin/issues/6)
+- [#14: Remove the Runtime Reliability Collector from the Actions UI](https://github.com/matrix2669/DIspatcharr-Stream-Sort-Plugin/issues/14)
+- [#12: Remove Maximum streams per analysis run](https://github.com/matrix2669/DIspatcharr-Stream-Sort-Plugin/issues/12)
+- [#15: Add total runtime and dead-count breakdown to completion logs](https://github.com/matrix2669/DIspatcharr-Stream-Sort-Plugin/issues/15)
 
-### Proposed ownership boundary
+The former Stop Current Scan TODO was verified as implemented, documented, and covered by tests on the current `dev` baseline, so migration did not create an open issue for already-finished work.
 
-- The Event Channel Stream Monitor owns event-channel configuration, EPG lookup and interpretation, optional stream/channel-name matching, pre-event timing, duplicate-event handling, and trigger history.
-- Stream Sort owns FFprobe and FFmpeg checks, retries, provider capacity, TTL evidence, health and throughput history, scoring, and `ChannelStream.order` changes.
-- The supplemental plugin does not perform media probes, mutate Stream Sort settings, import private Stream Sort implementation functions, or create, delete, match, rename, regroup, or reassign channels, streams, or EPG data.
-- Event channels should be excluded from the ordinary hourly Stream Sort schedule after the monitor becomes responsible for them, preventing expected event inactivity from distorting general dead-stream statistics.
+## Event Channel Stream Monitor initiative
 
-### Proposed workflow
+- [#11: Initiative: Evaluate an Event Channel Stream Monitor](https://github.com/matrix2669/DIspatcharr-Stream-Sort-Plugin/issues/11)
+  - [#18: Add passive channel-attachment attribution to health reports](https://github.com/matrix2669/DIspatcharr-Stream-Sort-Plugin/issues/18)
+  - [#13: Implement the durable queued external scoped-request contract](https://github.com/matrix2669/DIspatcharr-Stream-Sort-Plugin/issues/13)
+  - [#9: Measure event-channel impact on dead-stream reporting](https://github.com/matrix2669/DIspatcharr-Stream-Sort-Plugin/issues/9)
+  - [#8: Define Event Channel Monitor timing and policy defaults](https://github.com/matrix2669/DIspatcharr-Stream-Sort-Plugin/issues/8)
 
-- Allow operators to define event-channel scope through explicit channels or groups; use EPG scheduling as the primary timing signal and optional name patterns only as a configurable fallback or discovery aid.
-- Monitor upcoming events and submit a scoped Stream Sort analyze-and-sort request early enough to complete initial probes and immediate retries before the broadcast starts.
-- Submit channel IDs through Stream Sort's supported external contract without changing Stream Sort's saved UI filters or schedule.
-- Default supplemental scheduled work to serial checks unless later evidence supports parallel execution.
-- Leave the latest Stream Sort result cached between events; the next pre-event request establishes fresh health and order without teaching Stream Sort an event-specific health state.
-- Record the event identity, affected channels, schedule source, planned and actual trigger times, Stream Sort request identity, queue outcome, completion outcome, and any missed-event reason.
-
-### Stream Sort prerequisites
-
-- Preserve a supported external entry point for scoped analysis with optional sorting, as defined by ADR-016.
-- Record every current channel attachment for each stream in health reporting so current dead-stream results can be correlated with event channels and a stream attached to multiple channels is represented accurately.
-- Return durable request state that lets the supplemental plugin distinguish queued, running, completed, rejected, expired, canceled, and failed work.
-
-### Queue and safety expectations
-
-- Queue an external request behind an active Stream Sort scan instead of returning busy solely because the execution lease is held.
-- Enforce a configurable finite maximum queue depth; return a clear queue-full/busy result only after that limit is reached.
-- Execute every queued request through Stream Sort's existing execution lease, cancellation, provider-capacity, viewer-protection, retry, checkpoint, and sorting safeguards.
-- Do not let queue admission reserve provider capacity before the request starts.
-- Define request deduplication, ordering, expiration/deadline behavior, restart persistence, cancellation ownership, and the exact default queue depth before implementation.
-
-### Evidence and open decisions
-
-- After the current clean scan, join terminal-dead stream IDs to current Dispatcharr channel assignments and inspect channel names, groups, and current or upcoming EPG data to estimate the event-channel share.
-- Add passive channel attribution before relying on historical event-channel conclusions; a post-scan database join describes current assignments but cannot reconstruct past attachment changes.
-- Determine the event lead time, post-event window, missing/stale EPG behavior, name-pattern precedence, rescheduled/canceled event behavior, and retry cadence from observed scan duration and event data.
-- Determine whether one pre-event request is sufficient or whether evidence supports an earlier preparation pass plus a near-event confirmation pass without undermining the fewer-provider-checks goal.
-- Revisit implementation only after Stream Sort's base functionality is operating cleanly and event-channel correlation shows enough impact to justify the supplemental plugin.
+Durable architecture and product choices remain in `DECISIONS.md`, external contracts in `DEPENDENCIES.md`, branch continuity in `BRANCHES.md`, and shipped results in `CHANGELOG.md`.
