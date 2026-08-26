@@ -1,9 +1,9 @@
 from __future__ import annotations
 
 import collections
-import hashlib
 import json
 import os
+import statistics
 import time
 import tempfile
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
@@ -19,7 +19,12 @@ from .execution_control import (
     close_analysis_cancel_window,
     exclusive_analysis_execution,
 )
-from .scoring import estimate_nominal_throughput_kbps, parse_fps, parse_resolution
+from .scoring import (
+    estimate_nominal_throughput_kbps,
+    parse_fps,
+    parse_resolution,
+    throughput_ttl_with_jitter,
+)
 from .reliability import RELIABILITY_PATH, load_reliability_cache
 from .throughput import (
     DEFAULT_USER_AGENT,
@@ -34,11 +39,23 @@ ANALYSIS_HEALTH_REPORT_PATH = "/data/dispatcharr_stream_sort_health_report.json"
 MEDIA_CHECK_HISTORY_RETENTION_DAYS = 90
 MEDIA_CHECK_HISTORY_MAX_ROWS = 10000
 MEDIA_CHECK_ROLLUP_RETENTION_DAYS = 365
+FFPROBE_STATS_HISTORY_MAX_ROWS = 7
 HEALTH_REPORT_TIMEZONE = ZoneInfo("America/New_York")
 MEDIA_BITRATE_RELATIVE_TOLERANCE = 0.30
-MEDIA_BITRATE_ABSOLUTE_TOLERANCE_KBPS = 500.0
 SUSTAINED_PLAYBACK_HEALTHY_RATIO = 1.10
 SUSTAINED_PLAYBACK_MINIMUM_RATIO = 1.00
+
+
+def _normalize_throughput_check_reason(
+    reason: str | None,
+    *,
+    media_changed: bool,
+) -> str | None:
+    if reason in {"missing", "throughput_missing"}:
+        return "throughput_missing"
+    if media_changed:
+        return "media_changed"
+    return reason
 
 
 def _parse_datetime(value: Any) -> datetime | None:
@@ -66,13 +83,27 @@ def _age_hours(value: Any, now: datetime) -> float | None:
 
 
 def _ttl_with_jitter(ttl_hours: float, *, url_hash: str, jitter_percent: float) -> float:
-    if ttl_hours <= 0 or jitter_percent <= 0:
-        return ttl_hours
-    jitter_ratio = jitter_percent / 100.0
-    digest = int(hashlib.md5(str(url_hash or "").encode("utf-8")).hexdigest()[:8], 16)
-    variance = (digest / float(0xFFFFFFFF)) * 2.0 - 1.0
-    adjusted = ttl_hours * (1.0 + (variance * jitter_ratio))
-    return max(0.0, adjusted)
+    return throughput_ttl_with_jitter(
+        ttl_hours,
+        identity=url_hash,
+        jitter_percent=jitter_percent,
+    )
+
+
+def _effective_dead_ttl_hours(entry: Mapping[str, Any] | None, base_ttl_hours: float) -> float:
+    if base_ttl_hours <= 0 or not entry:
+        return base_ttl_hours
+    if str(entry.get("error_type") or "") == "placeholder_file":
+        return base_ttl_hours
+    try:
+        streak = max(1, int(entry.get("consecutive_dead_results") or 1))
+    except (TypeError, ValueError):
+        streak = 1
+    if streak <= 2:
+        return base_ttl_hours
+    if streak <= 5:
+        return base_ttl_hours * 4.0
+    return base_ttl_hours * 12.0
 
 
 def _percentile(values: list[float], quantile: float) -> float | None:
@@ -144,7 +175,8 @@ def health_check_reason(
             age = _age_hours(checked_at, now)
             if age is None:
                 return "missing_timestamp"
-            if dead_ttl_hours > 0 and age < dead_ttl_hours:
+            effective_dead_ttl = _effective_dead_ttl_hours(entry, dead_ttl_hours)
+            if effective_dead_ttl > 0 and age < effective_dead_ttl:
                 return "status_dead_ttl"
         return f"status_{status or 'unknown'}"
     if ttl_hours <= 0:
@@ -247,7 +279,8 @@ def ffprobe_check_reason(
         age = _age_hours(checked_at, now)
         if entry.get("retry_pending"):
             return "dead_retry_pending"
-        if age is not None and dead_ttl_hours > 0 and age < dead_ttl_hours:
+        effective_dead_ttl = _effective_dead_ttl_hours(entry, dead_ttl_hours)
+        if age is not None and effective_dead_ttl > 0 and age < effective_dead_ttl:
             return None
         return "dead_ttl_expired"
     if status != "alive":
@@ -290,7 +323,8 @@ def content_check_reason(
         age = _age_hours(checked_at, now)
         if entry.get("retry_pending"):
             return "dead_retry_pending"
-        if age is not None and dead_ttl_hours is not None and dead_ttl_hours > 0 and age < dead_ttl_hours:
+        effective_dead_ttl = _effective_dead_ttl_hours(entry, dead_ttl_hours or 0.0)
+        if age is not None and effective_dead_ttl > 0 and age < effective_dead_ttl:
             return None
         return "dead_ttl_expired"
     if status != "alive":
@@ -313,6 +347,8 @@ def throughput_check_reason(
     url_hash: str,
     ttl_hours: float,
     dead_ttl_hours: float | None = None,
+    degraded_ttl_hours: float | None = None,
+    unknown_ttl_hours: float | None = None,
     provider_id: Any = None,
     ttl_jitter_percent: float = 0.0,
     now: datetime,
@@ -333,8 +369,16 @@ def throughput_check_reason(
     if status != "healthy":
         checked_at = throughput.get("checked_at") or throughput.get("tested_at")
         age = _age_hours(checked_at, now)
-        effective_dead_ttl = ttl_hours if dead_ttl_hours is None else dead_ttl_hours
-        if age is not None and effective_dead_ttl > 0 and age < effective_dead_ttl:
+        fallback_ttl = ttl_hours if dead_ttl_hours is None else dead_ttl_hours
+        status_ttl = unknown_ttl_hours if status == "unknown" else degraded_ttl_hours
+        if status_ttl is None:
+            status_ttl = fallback_ttl
+        effective_status_ttl = _ttl_with_jitter(
+            status_ttl,
+            url_hash=url_hash,
+            jitter_percent=ttl_jitter_percent,
+        )
+        if age is not None and effective_status_ttl > 0 and age < effective_status_ttl:
             return None
         return f"status_{status or 'unknown'}"
     if ttl_hours <= 0:
@@ -376,16 +420,79 @@ def _is_significant_bitrate_change(
     new_bitrate: float | None,
     *,
     relative_tolerance: float | None = None,
-    absolute_tolerance_kbps: float | None = None,
 ) -> bool:
     if new_bitrate is None and previous_bitrate is None:
         return False
     if previous_bitrate is None or new_bitrate is None:
         return False
     relative = MEDIA_BITRATE_RELATIVE_TOLERANCE if relative_tolerance is None else max(0.0, relative_tolerance)
-    absolute = MEDIA_BITRATE_ABSOLUTE_TOLERANCE_KBPS if absolute_tolerance_kbps is None else max(0.0, absolute_tolerance_kbps)
-    tolerance = max(absolute, previous_bitrate * relative)
-    return abs(new_bitrate - previous_bitrate) > tolerance
+    if previous_bitrate <= 0:
+        return new_bitrate > 0
+    return abs(new_bitrate - previous_bitrate) / previous_bitrate > relative
+
+
+def _fps_family(value: Any) -> float | None:
+    try:
+        fps = float(value)
+    except (TypeError, ValueError):
+        return None
+    for canonical, aliases in (
+        (24.0, (23.976, 24.0)),
+        (25.0, (25.0,)),
+        (30.0, (29.97, 30.0)),
+        (50.0, (50.0,)),
+        (60.0, (59.94, 60.0)),
+    ):
+        if any(abs(fps - alias) <= 0.15 for alias in aliases):
+            return canonical
+    return round(fps, 1)
+
+
+def _history_stats(media_history: Any) -> list[Mapping[str, Any]]:
+    rows = []
+    for row in media_history or []:
+        stats = row.get("stats") if isinstance(row, Mapping) else None
+        if isinstance(stats, Mapping) and stats:
+            rows.append(stats)
+    return rows[-FFPROBE_STATS_HISTORY_MAX_ROWS:]
+
+
+def _persistent_fps_change(history: list[Mapping[str, Any]], new_stats: Mapping[str, Any]) -> bool:
+    if len(history) < 2:
+        return False
+    baseline_families = [_fps_family(parse_fps(row)) for row in history[:-1]]
+    baseline_families = [value for value in baseline_families if value is not None]
+    previous_family = _fps_family(parse_fps(history[-1]))
+    new_family = _fps_family(parse_fps(new_stats))
+    if not baseline_families or previous_family is None or new_family is None:
+        return False
+    baseline_family = collections.Counter(baseline_families).most_common(1)[0][0]
+    return previous_family == new_family and new_family != baseline_family
+
+
+def _persistent_bitrate_change(
+    history: list[Mapping[str, Any]],
+    new_stats: Mapping[str, Any],
+    *,
+    relative_tolerance: float,
+) -> bool:
+    if len(history) < 4:
+        return False
+    baseline_values = [_extract_video_bitrate(row) for row in history[:-1]]
+    baseline_values = [value for value in baseline_values if value is not None]
+    previous_bitrate = _extract_video_bitrate(history[-1])
+    new_bitrate = _extract_video_bitrate(new_stats)
+    if not baseline_values or previous_bitrate is None or new_bitrate is None:
+        return False
+    baseline = float(statistics.median(baseline_values))
+    deviations = [abs(value - baseline) for value in baseline_values]
+    robust_standard_deviation = float(statistics.median(deviations)) * 1.4826
+    minimum_delta = max(baseline * max(0.0, relative_tolerance), robust_standard_deviation)
+    if abs(previous_bitrate - baseline) <= minimum_delta:
+        return False
+    if abs(new_bitrate - baseline) <= minimum_delta:
+        return False
+    return (previous_bitrate - baseline) * (new_bitrate - baseline) > 0
 
 
 def _media_stats_changed_for_throughput(
@@ -393,19 +500,23 @@ def _media_stats_changed_for_throughput(
     new_stats: Mapping[str, Any] | None,
     *,
     media_bitrate_relative_tolerance: float = MEDIA_BITRATE_RELATIVE_TOLERANCE,
-    media_bitrate_absolute_tolerance_kbps: float = MEDIA_BITRATE_ABSOLUTE_TOLERANCE_KBPS,
+    media_history: Any = None,
 ) -> bool:
     if not previous_stats:
-        return bool(new_stats)
+        return False
     if not new_stats:
         return False
-    if _stats_signature(previous_stats) != _stats_signature(new_stats):
+    previous_width, previous_height = parse_resolution(previous_stats)
+    new_width, new_height = parse_resolution(new_stats)
+    if previous_width and previous_height and new_width and new_height and (previous_width, previous_height) != (new_width, new_height):
         return True
-    return _is_significant_bitrate_change(
-        _extract_video_bitrate(previous_stats),
-        _extract_video_bitrate(new_stats),
+    history = _history_stats(media_history)
+    if not history:
+        history = [previous_stats]
+    return _persistent_fps_change(history, new_stats) or _persistent_bitrate_change(
+        history,
+        new_stats,
         relative_tolerance=media_bitrate_relative_tolerance,
-        absolute_tolerance_kbps=media_bitrate_absolute_tolerance_kbps,
     )
 
 
@@ -541,6 +652,7 @@ def _append_health_history(
     retry = result.get("retry_telemetry")
     retry = dict(retry) if isinstance(retry, Mapping) else {}
     terminal = not bool(retry.get("retry_pending"))
+    placeholder = str(result.get("error_type") or "") == "placeholder_file"
     row = {
         "checked_at": tested_at,
         "previous_status": previous_status,
@@ -567,19 +679,24 @@ def _append_health_history(
     rollups = dict(rollups) if isinstance(rollups, Mapping) else {}
     day = observed_at.date().isoformat()
     bucket = dict(rollups.get(day) or {})
-    terminal_key = "completed_checks" if terminal else "provisional_checks"
+    prefix = "placeholder_" if placeholder else ""
+    terminal_key = f"{prefix}completed_checks" if terminal else f"{prefix}provisional_checks"
     bucket[terminal_key] = int(bucket.get(terminal_key) or 0) + 1
-    if terminal and new_status in {"alive", "dead"}:
+    if terminal and not placeholder and new_status in {"alive", "dead"}:
         key = f"{new_status}_checks"
         bucket[key] = int(bucket.get(key) or 0) + 1
-    if terminal and previous_status in {"alive", "dead"} and previous_status != new_status:
+    if terminal and not placeholder and previous_status in {"alive", "dead"} and previous_status != new_status:
         key = f"{previous_status}_to_{new_status}"
         bucket[key] = int(bucket.get(key) or 0) + 1
-    bucket["retry_attempts"] = int(bucket.get("retry_attempts") or 0) + int(retry.get("retry_attempts") or 0)
-    bucket["retry_assisted_recoveries"] = int(bucket.get("retry_assisted_recoveries") or 0) + int(
+    retry_prefix = "placeholder_" if placeholder else ""
+    retry_attempts_key = f"{retry_prefix}retry_attempts"
+    retry_recoveries_key = f"{retry_prefix}retry_assisted_recoveries"
+    retry_exhaustions_key = f"{retry_prefix}retry_exhaustions"
+    bucket[retry_attempts_key] = int(bucket.get(retry_attempts_key) or 0) + int(retry.get("retry_attempts") or 0)
+    bucket[retry_recoveries_key] = int(bucket.get(retry_recoveries_key) or 0) + int(
         bool(retry.get("recovered_after_retries"))
     )
-    bucket["retry_exhaustions"] = int(bucket.get("retry_exhaustions") or 0) + int(
+    bucket[retry_exhaustions_key] = int(bucket.get(retry_exhaustions_key) or 0) + int(
         bool(retry.get("retries_exhausted"))
     )
     rollups[day] = bucket
@@ -618,6 +735,12 @@ def _build_health_report(
     daily_rollup_dates = set()
     total_changes = 0
     total_dead_checks = 0
+    placeholder_checks = 0
+    placeholder_stream_ids: set[int] = set()
+    placeholder_retry_attempts = 0
+    placeholder_retry_assisted_recoveries = 0
+    placeholder_retry_exhaustions = 0
+    placeholder_retry_deferred = 0
     stream_reports = []
 
     for item in items:
@@ -627,6 +750,7 @@ def _build_health_report(
         history = entry.get("health_check_history") or []
         timeline: list[tuple[datetime, str, str]] = []
         valid_history = []
+        raw_terminal_history = []
         dead = 0
         stream_retry_attempts = 0
         stream_retry_recoveries = 0
@@ -639,15 +763,27 @@ def _build_health_report(
             retry = row.get("retry") if isinstance(row.get("retry"), Mapping) else {}
             attempts = int(retry.get("retry_attempts") or 0)
             deferred = int(retry.get("retry_deferred") or 0)
-            stream_retry_attempts += attempts
-            stream_retry_deferred += deferred
-            stream_retry_recoveries += int(bool(retry.get("recovered_after_retries")))
-            stream_retry_exhaustions += int(bool(retry.get("retries_exhausted")))
+            placeholder_row = str(row.get("error_type") or "") == "placeholder_file"
+            if placeholder_row:
+                placeholder_retry_attempts += attempts
+                placeholder_retry_deferred += deferred
+                placeholder_retry_assisted_recoveries += int(bool(retry.get("recovered_after_retries")))
+                placeholder_retry_exhaustions += int(bool(retry.get("retries_exhausted")))
+            else:
+                stream_retry_attempts += attempts
+                stream_retry_deferred += deferred
+                stream_retry_recoveries += int(bool(retry.get("recovered_after_retries")))
+                stream_retry_exhaustions += int(bool(retry.get("retries_exhausted")))
             if (
                 row_status not in {"alive", "dead"}
                 or checked_at is None
                 or not bool(row.get("terminal", True))
             ):
+                continue
+            raw_terminal_history.append(row)
+            if str(row.get("error_type") or "") == "placeholder_file":
+                placeholder_checks += 1
+                placeholder_stream_ids.add(int(item["id"]))
                 continue
             valid_history.append(row)
             recorded_previous = str(row.get("previous_status") or "").lower()
@@ -671,8 +807,12 @@ def _build_health_report(
                 check_intervals_hours.append(
                     (checked_at - timeline[index - 1][0]).total_seconds() / 3600.0
                 )
-            previous_status = recorded_previous or prior_status
-            if previous_status and previous_status != row_status:
+            previous_status = (
+                recorded_previous
+                if recorded_previous in {"alive", "dead"}
+                else prior_status
+            )
+            if previous_status in {"alive", "dead"} and previous_status != row_status:
                 changes += 1
                 total_changes += 1
                 transition_counts[f"{previous_status}_to_{row_status}"] += 1
@@ -694,7 +834,7 @@ def _build_health_report(
                         )
                     dead_started_at = None
                     alive_started_at = checked_at
-            elif not previous_status:
+            elif index == 0:
                 if row_status == "dead":
                     dead_started_at = checked_at
                 elif row_status == "alive":
@@ -707,6 +847,10 @@ def _build_health_report(
             )
 
         last_record = valid_history[-1] if valid_history else {}
+        raw_last_record = raw_terminal_history[-1] if raw_terminal_history else {}
+        reported_status = str(raw_last_record.get("status") or last_record.get("status") or status).lower()
+        reported_error_type = str(raw_last_record.get("error_type") or entry.get("error_type") or "")
+        is_placeholder = reported_status == "dead" and reported_error_type == "placeholder_file"
         history_len = len(timeline)
         stream_history_span_hours = (
             (timeline[-1][0] - timeline[0][0]).total_seconds() / 3600.0
@@ -721,8 +865,19 @@ def _build_health_report(
             {
                 "stream_id": stream_id,
                 "name": str(item.get("name") or ""),
-                "last_status": str(last_record.get("status") or status).lower(),
-                "last_reason": str(last_record.get("reason") or "none"),
+                "m3u_account_id": item.get("account_id"),
+                "source_name": str(item.get("account_name") or ""),
+                "channels": [
+                    dict(channel)
+                    for channel in (item.get("channels") or [])
+                    if isinstance(channel, Mapping)
+                ],
+                "last_status": reported_status,
+                "last_reason": str(raw_last_record.get("reason") or last_record.get("reason") or "none"),
+                "last_error_type": reported_error_type,
+                "health_class": "placeholder" if is_placeholder else reported_status,
+                "is_placeholder": is_placeholder,
+                "raw_history_len": len(raw_terminal_history),
                 "history_len": history_len,
                 "status_changes": changes,
                 "dead_checks": dead,
@@ -755,7 +910,8 @@ def _build_health_report(
     dead_recovery_p90 = _percentile(dead_recovery_hours, 0.9)
     alive_episode_p25 = _percentile(alive_episode_hours, 0.25)
     alive_episode_p50 = _percentile(alive_episode_hours, 0.5)
-    total_history_rows = sum(len((cache.get(str(item["id"])) or {}).get("health_check_history") or []) for item in items)
+    raw_total_history_rows = sum(len((cache.get(str(item["id"])) or {}).get("health_check_history") or []) for item in items)
+    total_history_rows = sum(row["history_len"] for row in stream_reports)
 
     hourly = []
     for hour in range(24):
@@ -778,12 +934,18 @@ def _build_health_report(
     )[:20]
     problematic_streams = [
         row for row in stream_reports
-        if row["history_len"] >= 20
+        if not row["is_placeholder"]
+        and row["history_len"] >= 20
         and row["history_span_hours"] >= 168.0
         and row["dead_check_ratio"] > 0.75
     ]
     problematic_streams.sort(
         key=lambda row: (row["dead_check_ratio"], row["dead_checks"], row["history_len"]),
+        reverse=True,
+    )
+    current_dead_streams = [row for row in stream_reports if row["last_status"] == "dead"]
+    current_dead_streams.sort(
+        key=lambda row: (row["dead_check_ratio"], row["dead_checks"], row["name"]),
         reverse=True,
     )
     busiest_minute = max(minute_check_counts.values(), default=0)
@@ -797,6 +959,7 @@ def _build_health_report(
         "status_counts": {status: count for status, count in summary.items()},
         "observations": {
             "history_rows": total_history_rows,
+            "raw_history_rows": raw_total_history_rows,
             "history_span_hours": round(history_span_hours, 4),
             "status_changes": total_changes,
             "dead_checks": total_dead_checks,
@@ -845,7 +1008,18 @@ def _build_health_report(
         "status_patterns": {
             "unstable_streams": unstable_top,
             "problematic_streams": problematic_streams,
+            "current_dead_streams": current_dead_streams,
             "hourly_dead_ratio": hourly,
+            "placeholders": {
+                "checks": placeholder_checks,
+                "streams": len(placeholder_stream_ids),
+                "current_streams": [row for row in current_dead_streams if row["is_placeholder"]],
+                "excluded_from_general_health_analysis": True,
+                "retry_attempts": placeholder_retry_attempts,
+                "retry_assisted_recoveries": placeholder_retry_assisted_recoveries,
+                "retry_exhaustions": placeholder_retry_exhaustions,
+                "retry_capacity_deferrals": placeholder_retry_deferred,
+            },
         },
         "retry_reliability": {
             "retry_attempts": retry_attempts,
@@ -1079,12 +1253,32 @@ def _item_from_stream(stream) -> dict[str, Any]:
     }
 
 
+def _channel_attachments_by_stream(rows) -> dict[int, list[dict[str, Any]]]:
+    attachments: dict[int, dict[int, dict[str, Any]]] = {}
+    for row in rows:
+        stream = getattr(row, "stream", None)
+        stream_id = getattr(stream, "id", None)
+        channel_id = getattr(row, "channel_id", None)
+        if stream_id is None or channel_id is None:
+            continue
+        channel = getattr(row, "channel", None)
+        per_stream = attachments.setdefault(int(stream_id), {})
+        per_stream[int(channel_id)] = {
+            "channel_id": int(channel_id),
+            "channel_name": str(getattr(channel, "name", "") or ""),
+            "channel_number": getattr(channel, "channel_number", None),
+        }
+    return {
+        stream_id: list(per_stream.values())
+        for stream_id, per_stream in attachments.items()
+    }
+
+
 def _merge_dispatcharr_metadata(
     item: Mapping[str, Any],
     previous: Mapping[str, Any],
     *,
     media_bitrate_relative_tolerance: float = MEDIA_BITRATE_RELATIVE_TOLERANCE,
-    media_bitrate_absolute_tolerance_kbps: float = MEDIA_BITRATE_ABSOLUTE_TOLERANCE_KBPS,
 ) -> tuple[dict[str, Any], bool, bool]:
     merged = dict(previous)
     current_hash = analyzer._stream_url_hash(str(item.get("url") or ""))
@@ -1115,7 +1309,6 @@ def _merge_dispatcharr_metadata(
         previous_stats,
         stats,
         media_bitrate_relative_tolerance=media_bitrate_relative_tolerance,
-        media_bitrate_absolute_tolerance_kbps=media_bitrate_absolute_tolerance_kbps,
     )
     return merged, True, changed
 
@@ -1125,7 +1318,6 @@ def _sync_dispatcharr_metadata(
     cache,
     *,
     media_bitrate_relative_tolerance: float = MEDIA_BITRATE_RELATIVE_TOLERANCE,
-    media_bitrate_absolute_tolerance_kbps: float = MEDIA_BITRATE_ABSOLUTE_TOLERANCE_KBPS,
 ) -> tuple[int, set[int]]:
     refreshed = 0
     changed_ids: set[int] = set()
@@ -1138,7 +1330,6 @@ def _sync_dispatcharr_metadata(
             item,
             previous,
             media_bitrate_relative_tolerance=media_bitrate_relative_tolerance,
-            media_bitrate_absolute_tolerance_kbps=media_bitrate_absolute_tolerance_kbps,
         )
         if not did_refresh:
             continue
@@ -1360,7 +1551,7 @@ def _sync_runtime_playback_evidence(
                     "source": row.get("source"),
                     "reason": row.get("reason"),
                 }
-                entry = _merge_throughput_result(item, entry, result, ttl_hours=0.0)
+                entry = _merge_throughput_result(item, entry, result)
 
         cutoff = datetime.now(timezone.utc) - timedelta(days=MEDIA_CHECK_HISTORY_RETENTION_DAYS)
         entry["playback_throughput_history"] = [
@@ -1393,6 +1584,8 @@ def _merge_media_result(
         if history_previous_status is not None
         else merged.get("status") or "unknown"
     ).lower()
+    previous_url_hash = str(merged.get("url_hash") or "")
+    previous_provider = merged.get("m3u_account_id")
     merged.update(dict(result))
     checked = result.get("tested_at") or analyzer._utc_now_iso()
     merged["health_checked_at"] = checked
@@ -1413,13 +1606,39 @@ def _merge_media_result(
     status = str(result.get("status") or "unknown").lower()
     if status == "dead":
         merged["dead_checked_at"] = checked
+        if not result.get("retry_pending"):
+            try:
+                prior_streak = int(merged.get("consecutive_dead_results") or 0)
+            except (TypeError, ValueError):
+                prior_streak = 0
+            merged["consecutive_dead_results"] = prior_streak + 1 if previous_status == "dead" else 1
     elif status == "alive":
         merged.pop("dead_checked_at", None)
+        if record_history:
+            merged.pop("consecutive_dead_results", None)
     result_stats = result.get("stats")
     if isinstance(result_stats, Mapping) and result_stats:
         merged["stats"] = dict(result_stats)
         merged["metadata_updated_at"] = checked
         merged["metadata_source"] = "stream_sort_analyzer"
+        history = list(merged.get("ffprobe_stats_history") or [])
+        same_identity = (
+            previous_url_hash == merged["url_hash"]
+            and (
+                previous_provider in (None, "")
+                or item.get("account_id") in (None, "")
+                or _provider_matches(previous_provider, item.get("account_id"))
+            )
+        )
+        if not same_identity:
+            history = []
+        if not history and isinstance(previous_stats, Mapping) and previous_stats:
+            history.append({
+                "checked_at": (previous or {}).get("ffprobe_checked_at") or (previous or {}).get("metadata_updated_at"),
+                "stats": dict(previous_stats),
+            })
+        history.append({"checked_at": checked, "stats": dict(result_stats)})
+        merged["ffprobe_stats_history"] = history[-FFPROBE_STATS_HISTORY_MAX_ROWS:]
     elif status == "skipped" and isinstance(previous_stats, Mapping) and previous_stats:
         merged["stats"] = dict(previous_stats)
     if status == "dead":
@@ -1515,6 +1734,12 @@ def _merge_content_result(
     merged["url_hash"] = analyzer._stream_url_hash(str(item.get("url") or ""))
     if str(result.get("status") or "unknown").lower() == "dead":
         merged["dead_checked_at"] = checked
+        if not result.get("retry_pending"):
+            try:
+                prior_streak = int(merged.get("consecutive_dead_results") or 0)
+            except (TypeError, ValueError):
+                prior_streak = 0
+            merged["consecutive_dead_results"] = prior_streak + 1 if previous_status == "dead" else 1
         merged["throughput"] = {
             "status": "unknown",
             "tested_at": checked,
@@ -1522,6 +1747,9 @@ def _merge_content_result(
             "url_hash": merged["url_hash"],
             "error": "throughput invalidated because content analysis marked the stream dead",
         }
+    elif str(result.get("status") or "unknown").lower() == "alive":
+        merged.pop("dead_checked_at", None)
+        merged.pop("consecutive_dead_results", None)
     _append_health_history(
         merged,
         reason=f"content_{analysis_reason or 'unknown'}",
@@ -1533,7 +1761,7 @@ def _merge_content_result(
     return merged
 
 
-def _merge_throughput_result(item, entry, result, *, ttl_hours: float) -> dict[str, Any]:
+def _merge_throughput_result(item, entry, result) -> dict[str, Any]:
     merged = dict(entry)
     throughput = dict(result)
     checked_at = throughput.get("tested_at") or analyzer._utc_now_iso()
@@ -1541,11 +1769,7 @@ def _merge_throughput_result(item, entry, result, *, ttl_hours: float) -> dict[s
     throughput["url_hash"] = analyzer._stream_url_hash(str(item.get("url") or ""))
     throughput["m3u_account_id"] = item.get("account_id")
     throughput["m3u_account_name"] = item.get("account_name")
-    checked_dt = _parse_datetime(checked_at)
-    if checked_dt is not None and ttl_hours > 0:
-        throughput["expires_at"] = (checked_dt + timedelta(hours=ttl_hours)).isoformat()
-    else:
-        throughput.pop("expires_at", None)
+    throughput.pop("expires_at", None)
     merged["throughput"] = throughput
     return merged
 
@@ -1561,7 +1785,7 @@ def _retained_throughput_measurement_ids(attempted_ids, cache: Mapping[str, Any]
     return retained
 
 
-def _migrate_legacy_throughput(items, cache, *, ttl_hours: float) -> int:
+def _migrate_legacy_throughput(items, cache) -> int:
     legacy = load_throughput_cache(LEGACY_CACHE_PATH)
     migrated = 0
     for item in items:
@@ -1575,7 +1799,7 @@ def _migrate_legacy_throughput(items, cache, *, ttl_hours: float) -> int:
         result = legacy.get(key)
         if not isinstance(result, Mapping):
             continue
-        cache[key] = _merge_throughput_result(item, entry, result, ttl_hours=ttl_hours)
+        cache[key] = _merge_throughput_result(item, entry, result)
         migrated += 1
     return migrated
 
@@ -1644,23 +1868,22 @@ def analyze_assigned_streams(
             analyzer._as_float(settings.get("media_bitrate_relative_tolerance_percent"), 30.0) / 100.0,
         ),
     )
-    media_bitrate_absolute_tolerance_kbps = max(
-        0.0,
-        analyzer._as_float(settings.get("media_bitrate_absolute_tolerance_kbps"), 500.0),
-    )
     playback_health_reuse = analyzer._as_bool(settings.get("playback_health_reuse"), True)
     playback_health_min_seconds = max(60.0, analyzer._as_float(settings.get("playback_health_min_seconds"), 300.0))
     playback_health_clean_min_seconds = max(30.0, analyzer._as_float(settings.get("playback_health_clean_min_seconds"), 60.0))
-    throughput_ttl_hours = max(0.0, analyzer._as_float(settings.get("healthy_throughput_ttl_hours"), 6.0))
+    throughput_ttl_hours = max(0.0, analyzer._as_float(settings.get("healthy_throughput_ttl_hours"), 24.0))
+    degraded_throughput_ttl_hours = max(0.0, analyzer._as_float(settings.get("degraded_throughput_ttl_hours"), 12.0))
+    unknown_throughput_ttl_hours = max(0.0, analyzer._as_float(settings.get("unknown_throughput_ttl_hours"), 4.0))
     analysis_ttl_jitter_percent = max(0.0, min(100.0, analyzer._as_float(settings.get("analysis_ttl_jitter_percent"), 30.0)))
     throughput_duration = max(1.0, analyzer._as_float(settings.get("probe_duration_seconds"), 8.0))
     throughput_timeout = max(throughput_duration + 2.0, analyzer._as_float(settings.get("probe_timeout_seconds"), 10.0))
     throughput_account_delay = max(0.0, analyzer._as_float(settings.get("probe_per_account_delay_seconds"), 1.0))
 
-    queryset = ChannelStream.objects.select_related("stream", "stream__m3u_account").order_by("channel_id", "order", "id")
+    queryset = ChannelStream.objects.select_related("channel", "stream", "stream__m3u_account").order_by("channel_id", "order", "id")
     if channel_ids is not None:
         queryset = queryset.filter(channel_id__in=channel_ids)
     rows = list(queryset)
+    channel_attachments = _channel_attachments_by_stream(rows)
 
     items = []
     seen = set()
@@ -1669,7 +1892,9 @@ def analyze_assigned_streams(
         if stream.id in seen:
             continue
         seen.add(stream.id)
-        items.append(_item_from_stream(stream))
+        item = _item_from_stream(stream)
+        item["channels"] = channel_attachments.get(int(stream.id), [])
+        items.append(item)
         if max_streams and len(items) >= max_streams:
             break
 
@@ -1692,7 +1917,7 @@ def analyze_assigned_streams(
                 playback_health_refreshed,
             )
 
-    migrated = _migrate_legacy_throughput(items, cache, ttl_hours=throughput_ttl_hours)
+    migrated = _migrate_legacy_throughput(items, cache)
     if migrated:
         analyzer.save_analysis_cache(cache, cache_path)
         logger.info("[Analyze] Migrated %d matching legacy throughput measurements into the unified cache", migrated)
@@ -1701,7 +1926,6 @@ def analyze_assigned_streams(
         items,
         cache,
         media_bitrate_relative_tolerance=media_bitrate_relative_tolerance,
-        media_bitrate_absolute_tolerance_kbps=media_bitrate_absolute_tolerance_kbps,
     )
     if dispatcharr_metadata_refreshed:
         analyzer.save_analysis_cache(cache, cache_path)
@@ -1758,6 +1982,8 @@ def analyze_assigned_streams(
                 url_hash=analyzer._stream_url_hash(str(item.get("url") or "")),
                 ttl_hours=throughput_ttl_hours,
                 dead_ttl_hours=dead_ttl_hours,
+                degraded_ttl_hours=degraded_throughput_ttl_hours,
+                unknown_ttl_hours=unknown_throughput_ttl_hours,
                 provider_id=item.get("account_id"),
                 ttl_jitter_percent=analysis_ttl_jitter_percent,
                 now=now,
@@ -1770,9 +1996,9 @@ def analyze_assigned_streams(
             initial_fully_cached += 1
 
     logger.info(
-        "[Analyze] Starting: streams=%d ffprobe_due=%d content_due=%d throughput_due=%d fully_cached=%d playback_evidence_refreshed=%d dispatcharr_metadata_refreshed=%d ffprobe_ttl=%.1fh dead_ttl=%.1fh content_ttl=%.1fh healthy_throughput_ttl=%.1fh ttl_jitter=%.1f%% workers=%d",
+        "[Analyze] Starting: streams=%d ffprobe_due=%d content_due=%d throughput_due=%d fully_cached=%d playback_evidence_refreshed=%d dispatcharr_metadata_refreshed=%d ffprobe_ttl=%.1fh dead_ttl=%.1fh content_ttl=%.1fh healthy_throughput_ttl=%.1fh degraded_throughput_ttl=%.1fh unknown_throughput_ttl=%.1fh ttl_jitter=%.1f%% workers=%d",
         total, len(media_due), len(content_reason_by_id), initial_throughput_due, initial_fully_cached, playback_health_refreshed, dispatcharr_metadata_refreshed,
-        ffprobe_ttl_hours, dead_ttl_hours, content_ttl_hours, throughput_ttl_hours, analysis_ttl_jitter_percent, workers,
+        ffprobe_ttl_hours, dead_ttl_hours, content_ttl_hours, throughput_ttl_hours, degraded_throughput_ttl_hours, unknown_throughput_ttl_hours, analysis_ttl_jitter_percent, workers,
     )
     if not items:
         _save_json(
@@ -1814,6 +2040,10 @@ def analyze_assigned_streams(
         int(item["id"]): (cache.get(str(item["id"])) or {}).get("stats")
         for item, _ in media_due
     }
+    previous_media_history = {
+        int(item["id"]): list((cache.get(str(item["id"])) or {}).get("ffprobe_stats_history") or [])
+        for item, _ in media_due
+    }
     reason_by_id = {int(item["id"]): reason for item, reason in media_due}
     limiter = analyzer._PerAccountStartLimiter(account_delay)
     media_started = time.monotonic()
@@ -1821,15 +2051,37 @@ def analyze_assigned_streams(
     def run_media(item):
         analyzer._RATE_LIMIT_GUARD.wait_if_throttled()
         limiter.wait(item.get("account_id"))
+        previous_entry = cache.get(str(item["id"])) or {}
+        known_placeholder = str(previous_entry.get("error_type") or "") == "placeholder_file"
+        probe_settings = dict(settings)
+        if known_placeholder:
+            probe_settings["analysis_duration_seconds"] = 1
         result = analyzer.analyze_stream(
             str(item.get("url") or ""),
             stream_id=item.get("id"),
             stream_name=str(item.get("name") or ""),
-            settings=settings,
+            settings=probe_settings,
             user_agent=str(item.get("user_agent") or DEFAULT_USER_AGENT),
             logger=logger,
             include_content=False,
         )
+        if known_placeholder and str(result.get("error_type") or "") != "placeholder_file":
+            result = analyzer.analyze_stream(
+                str(item.get("url") or ""),
+                stream_id=item.get("id"),
+                stream_name=str(item.get("name") or ""),
+                settings=settings,
+                user_agent=str(item.get("user_agent") or DEFAULT_USER_AGENT),
+                logger=logger,
+                include_content=False,
+            )
+            details = dict(result.get("details") or {})
+            details["placeholder_recheck"] = "one_second_gate_not_placeholder_full_ffprobe_required"
+            result["details"] = details
+        elif known_placeholder:
+            details = dict(result.get("details") or {})
+            details["placeholder_recheck"] = "one_second_gate_confirmed_placeholder"
+            result["details"] = details
         if result.get("error_type") == "rate_limited":
             analyzer._RATE_LIMIT_GUARD.record_hit(logger)
         return result
@@ -1991,7 +2243,7 @@ def analyze_assigned_streams(
             previous_media_stats.get(sid),
             result.get("stats"),
             media_bitrate_relative_tolerance=media_bitrate_relative_tolerance,
-            media_bitrate_absolute_tolerance_kbps=media_bitrate_absolute_tolerance_kbps,
+            media_history=previous_media_history.get(sid),
         )
     }
     media_changed_ids.update(dispatcharr_metadata_changed_ids)
@@ -2009,12 +2261,16 @@ def analyze_assigned_streams(
             url_hash=analyzer._stream_url_hash(str(item.get("url") or "")),
             ttl_hours=throughput_ttl_hours,
             dead_ttl_hours=dead_ttl_hours,
+            degraded_ttl_hours=degraded_throughput_ttl_hours,
+            unknown_ttl_hours=unknown_throughput_ttl_hours,
             provider_id=item.get("account_id"),
             ttl_jitter_percent=analysis_ttl_jitter_percent,
             now=now,
         )
-        if sid in media_changed_ids and reason != "throughput_missing":
-            reason = "media_changed"
+        reason = _normalize_throughput_check_reason(
+            reason,
+            media_changed=sid in media_changed_ids,
+        )
         if reason:
             throughput_due.append((item, reason))
     throughput_reason_counts = collections.Counter(reason for _, reason in throughput_due)
@@ -2722,7 +2978,7 @@ def analyze_assigned_streams(
         terminal = content_results.get(sid) or media_results.get(sid) or {}
         if str(terminal.get("status") or "unknown").lower() == "dead":
             continue
-        cache[str(sid)] = _merge_throughput_result(item, cache.get(str(sid)) or {}, result, ttl_hours=throughput_ttl_hours)
+        cache[str(sid)] = _merge_throughput_result(item, cache.get(str(sid)) or {}, result)
 
     throughput_checked_ids = _retained_throughput_measurement_ids(throughput_attempted_ids, cache)
     media_checked_ids = set(media_results)

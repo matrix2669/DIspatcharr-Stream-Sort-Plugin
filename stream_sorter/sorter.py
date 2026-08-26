@@ -206,8 +206,17 @@ def _settings(settings: Mapping[str, Any]) -> dict[str, Any]:
     return {
         "source_rules": parse_source_rules(settings.get("source_scores", "")),
         "name_rules": parse_name_rules(settings.get("name_score_rules", "")),
-        "throughput_cache_ttl_minutes": max(
-            0.0, _as_float(settings.get("throughput_cache_ttl_minutes"), 30.0)
+        "healthy_throughput_ttl_hours": max(
+            0.0, _as_float(settings.get("healthy_throughput_ttl_hours"), 24.0)
+        ),
+        "degraded_throughput_ttl_hours": max(
+            0.0, _as_float(settings.get("degraded_throughput_ttl_hours"), 12.0)
+        ),
+        "unknown_throughput_ttl_hours": max(
+            0.0, _as_float(settings.get("unknown_throughput_ttl_hours"), 4.0)
+        ),
+        "throughput_ttl_jitter_percent": max(
+            0.0, min(100.0, _as_float(settings.get("analysis_ttl_jitter_percent"), 30.0))
         ),
         "include_single_stream_channels": _as_bool(
             settings.get("include_single_stream_channels"), False
@@ -342,7 +351,10 @@ def sort_channels(
             candidates,
             source_rules=cfg["source_rules"],
             name_rules=cfg["name_rules"],
-            throughput_cache_ttl_minutes=cfg["throughput_cache_ttl_minutes"],
+            healthy_throughput_ttl_hours=cfg["healthy_throughput_ttl_hours"],
+            degraded_throughput_ttl_hours=cfg["degraded_throughput_ttl_hours"],
+            unknown_throughput_ttl_hours=cfg["unknown_throughput_ttl_hours"],
+            throughput_ttl_jitter_percent=cfg["throughput_ttl_jitter_percent"],
             reliability_scoring_enabled=cfg["reliability_scoring_enabled"],
             now=now,
         )

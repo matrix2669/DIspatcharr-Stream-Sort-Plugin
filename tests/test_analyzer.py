@@ -45,6 +45,7 @@ def _settings(**overrides):
         "frozen_video_detection": False,
         "silent_audio_detection": False,
         "placeholder_file_detection": True,
+        "minimum_video_bitrate_kbps": 500,
         "analysis_duration_seconds": 5,
         "analysis_connection_timeout_seconds": 10,
         "analysis_probe_timeout_seconds": 20,
@@ -138,6 +139,28 @@ def test_fixed_duration_placeholder_is_dead(monkeypatch):
     assert result["stats"]["resolution"] == "1920x1080"
 
 
+def test_video_below_minimum_bitrate_is_dead_and_retryable(monkeypatch):
+    payload = _probe_payload()
+    payload["streams"][0]["bit_rate"] = "400000"
+    for packet in payload["packets"]:
+        packet["size"] = "1600"
+
+    def fake_run(*args, **kwargs):
+        return subprocess.CompletedProcess(args[0], 0, stdout=json.dumps(payload), stderr="")
+
+    monkeypatch.setattr(analyzer.subprocess, "run", fake_run)
+    result = analyzer.analyze_stream(
+        "http://example.test/low-bitrate.ts",
+        stream_id=13,
+        stream_name="Low bitrate",
+        settings=_settings(),
+    )
+
+    assert result["status"] == "dead"
+    assert result["error_type"] == "low_bitrate"
+    assert result["error_type"] in analyzer.RETRYABLE_ERROR_TYPES
+
+
 def test_http_429_is_skipped_not_dead(monkeypatch):
     def fake_run(*args, **kwargs):
         return subprocess.CompletedProcess(args[0], 1, stdout="", stderr="HTTP error 429 Too Many Requests")
@@ -185,6 +208,7 @@ def test_black_frozen_and_silent_parsers():
 
 def test_content_health_failures_are_retryable():
     assert {
+        "invalid_stream",
         "placeholder_file",
         "black_screen",
         "frozen_video",

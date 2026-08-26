@@ -154,7 +154,7 @@ This preserves recovery from transient transport/auth/login misses while prevent
 - `dead_content_ttl_hours` is the primary control for how long known-dead streams are deferred between full scans.
 - The initial operating value for `dead_content_ttl_hours` is one hour. Dead TTL remains user-configurable and is not jittered.
 - Operational tuning focuses on keeping provider checks lower while still allowing quick revalidation when needed.
-- `media_bitrate_relative_tolerance_percent` and `media_bitrate_absolute_tolerance_kbps` control when metadata changes trigger `media_changed` throughput rechecks (default 30% and 500 kbps). A bitrate-only change must meet or exceed both thresholds; a 500 kbps difference alone does not trigger a recheck when it is less than 30 percent. This makes `media_changed` behavior tunable without code changes while still ignoring normal ffprobe bitrate jitter.
+- Superseded by ADR-017: 500 Kbps is a minimum video-bitrate health floor, not a change-delta tolerance. Percentage-based media changes use confirmed rolling direct-FFprobe evidence.
 
 ## Provenance
 
@@ -196,7 +196,7 @@ Users asked to keep control over settings, but still want data-driven recommenda
 
 - Recommendation output needs to include confidence/rationale fields, not just scalar TTL suggestions.
 - We should retain health trend artifacts over time so downstream decisions (including potentially removing low-quality streams) can use historical patterns.
-- `media_bitrate_relative_tolerance_percent` and `media_bitrate_absolute_tolerance_kbps` are now first-class analyzer settings so users can tune `media_changed` sensitivity and measure recheck behavior with the recommendation report.
+- Superseded by ADR-017: the relative media-change tolerance remains configurable, while the former absolute-delta input becomes the minimum video-bitrate floor.
 
 ## Provenance
 
@@ -408,7 +408,7 @@ Dispatcharr may resolve the same stream through multiple profiles under one M3U 
 - Preserve observations without a matching provider ID for historical reporting, but do not use them to satisfy content or throughput TTLs.
 - Persist the provider account with active content and throughput evidence. A provider reassignment invalidates that evidence immediately; profile or credential changes under the same provider do not.
 - Treat remote FFmpeg content timeouts, exceptions, and nonzero exits as provisional retryable failures. Only a completed initial check plus the configured immediate retries can establish terminal dead content.
-- Use the exact Dead stream TTL without jitter for marginal, insufficient, and unknown throughput evidence. Healthy throughput continues to use the configured jittered Throughput TTL.
+- Superseded by ADR-017: healthy, marginal/insufficient, and unknown throughput evidence use independent jittered TTLs; the dead TTL is reserved for terminal health.
 - After retries establish that the latest completed phase is dead, put FFprobe, content, and throughput behind one exact dead-TTL recovery gate. A canceled retry sequence remains retry-pending with an effective TTL of zero.
 - A content-dead result invalidates active throughput evidence even when the shared capture delivered bytes successfully. The measurement may remain historical but cannot satisfy the active throughput TTL.
 - Only direct FFprobe completion resets `ffprobe_checked_at`. Separated content checks must not update the generic legacy timestamp used as an FFprobe fallback.
@@ -487,6 +487,7 @@ The first clean combined scan selected `/dev/shm/stream-sorter` after checking c
 
 - A fresh stream without prior throughput evidence is reported as `throughput_missing`. A new FFprobe observation does not relabel that initial check as `media_changed`.
 - A combined FFmpeg capture that produces no sample completes neither content validation nor throughput measurement. It enters the same three immediate retry passes used for retryable media failures.
+- Every direct analyzer classification that establishes dead health, including `invalid_stream`, enters the same three immediate retry passes before becoming terminal dead.
 - If all combined retries fail, the terminal stream result is dead, incomplete throughput evidence is removed, and the exact configured dead-stream TTL controls future eligibility.
 - If a scan is stopped before retry confirmation completes, successful work is retained while unconfirmed dead results remain immediately eligible with no dead TTL.
 - Scheduled analysis remains serial by default. Parallel scheduled checks may be enabled temporarily during beta testing and are not a change to the production default or steady-state policy.
@@ -516,10 +517,12 @@ A retained beta.9 TTL scan began with 46 confirmed-dead streams and ended with s
 
 - Snapshot each selected stream's persisted terminal health after playback and metadata imports but before direct analyzer phases begin.
 - Write the scan's single terminal health-history row against that snapshot. Intermediate FFprobe, content, combined-capture, and retry statuses must not become the row's `previous_status`.
+- Treat the first terminal `unknown -> alive/dead` observation as the stream's reporting baseline, not a health transition. Initialize the corresponding alive/dead episode at that observation so later duration statistics remain valid.
 - Count `throughput_attempted` as unique streams for which a throughput provider operation actually started during the scan. Exclude capacity deferrals and do not inflate the count for retries of the same stream.
 - Count `throughput_checked` as unique streams that produced and retained a numeric `measured_mbps` result during the scan. Unknown, failed, canceled, and terminal-dead results are not completed measurements.
 - Use attempted-stream membership, not completed-measurement membership, when deciding whether a stream was fully cached for the run.
 - Preserve the existing exact dead-TTL behavior for unknown and failed throughput evidence. Separating counters changes reporting only; it does not weaken retries, TTL gates, provider reservations, or terminal health behavior.
+- Include provider identity and every current channel attachment in each stream-level health-report row so one stream shared by multiple channels remains attributable without URL or credential data.
 - Do not migrate the beta.9 transition rows. Reset all statistics after the corrected beta is deployed so the new analysis window begins with internally consistent history.
 
 ## Consequences
@@ -531,4 +534,100 @@ A retained beta.9 TTL scan began with 46 confirmed-dead streams and ended with s
 ## Provenance
 
 - Live beta.9 retained-history, cache, and log review on the `iptv` Dispatcharr host completed on 2026-08-24.
+
+# ADR-016: Preserve externally requested scoped checks with bounded queueing
+
+- Status: Accepted; queue limits and lifecycle details remain implementation-blocking open parameters
+- Date: 2026-08-24
+- Provenance: operator architecture decision made while deferring event-channel orchestration until the base Stream Sort workflow is operating cleanly
+
+## Context
+
+Future supplemental plugins may need Stream Sort to analyze and optionally sort an explicit channel scope. The first identified use case is a possible Event Channel Stream Monitor that would interpret EPG data or configured name patterns and request checks before scheduled broadcasts. Event classification and scheduling do not belong in Stream Sort, but an external caller must not bypass Stream Sort's execution lease, provider-capacity protections, retry semantics, checkpointing, or sorting boundaries.
+
+Returning busy whenever a scan is active can discard time-sensitive work that should safely run after the active scan. An unbounded queue, direct imports of private plugin functions, or temporary mutation of saved UI settings would introduce different safety and ownership problems.
+
+## Decision
+
+- Preserve and document a supported external contract through which another plugin can request standard Stream Sort analysis for explicit channel IDs and can explicitly request sorting after analysis.
+- Keep EPG interpretation, event-name matching, event-channel discovery, and trigger scheduling outside Stream Sort. External origin changes when work is requested, not how Stream Sort classifies or probes a stream.
+- Do not require an external caller to rewrite Stream Sort's saved channel filters, scheduler configuration, or other UI settings. The request scope is isolated to that request.
+- Admit a valid external request to a Stream Sort-owned queue when another scan holds the execution lease. Process the request after earlier accepted work completes rather than returning busy solely because a scan is active.
+- Bound the queue with a finite configurable maximum depth. Once the limit is reached, reject additional work with an explicit queue-full/busy result without modifying the running job or previously accepted requests.
+- Run dequeued work through the same analyzer execution lease, cooperative cancellation, provider reservation, active-viewer protection, immediate retry, checkpoint, and optional sort safeguards used by normal Stream Sort actions.
+- Validate the requested channel IDs at execution time. A missing or no-longer-permitted channel is reported without expanding the request to Stream Sort's globally saved scope.
+- Preserve Stream Sort's mutation boundary: external work may update analysis evidence and, only when sorting was requested, `ChannelStream.order` within the validated request scope.
+- Expose durable request states sufficient for a caller to distinguish at least queued, running, completed, rejected, expired, canceled, and failed work. Queue admission itself must not reserve provider capacity.
+- Treat the exact default and allowed range for maximum queue depth, queue ordering, equivalent-request coalescing, request deadlines, restart persistence, and cancellation authorization as open decisions. Close these parameters through focused Q&A and record them before implementation or commit of the queue contract.
+
+## Rationale
+
+A narrow external contract allows supplemental automation without embedding unrelated EPG and event policy in Stream Sort. Stream Sort remains the single owner of provider-safe analysis and sorting, while bounded queueing preserves valid work during ordinary overlap without allowing unlimited backlog or provider pressure.
+
+## Consequences
+
+- External callers can request channel-scoped work without depending on private Python APIs or changing operator settings.
+- Accepted requests can outlive the scan that was active at submission, so deadline, deduplication, persistence, and cancellation behavior must be settled before implementation.
+- Queue metrics and request provenance will be necessary to diagnose stale work, excessive demand, and queue saturation.
+- Supplemental plugins remain independently deployable and own their domain-specific classification and scheduling decisions.
+- Stream Sort must retain compatibility with the external contract once published or supersede it through a versioned decision and migration path.
+
+## Alternatives considered
+
+- Return busy for every overlapping request: rejected as the normal behavior because it can lose time-sensitive work that can safely run next.
+- Use an unbounded queue: rejected because repeated or faulty callers could create stale backlog and excessive provider work.
+- Let another plugin call private Stream Sort functions directly: rejected because it bypasses a stable integration boundary and couples deployments to internal implementation details.
+- Temporarily rewrite Stream Sort's saved UI scope: rejected because concurrent users and scheduled scans could observe or retain unintended settings.
+- Add EPG and event-name logic to Stream Sort: rejected because it complicates the standard analyze-and-sort scope and combines unrelated ownership.
+
+## Review triggers
+
+- Before implementing or committing the external queue contract, close every open queue parameter listed above and perform the required contradiction review.
+- Revisit the contract if Dispatcharr adds a native cross-plugin job API, persistent task queue, scoped action schema, or cancellation mechanism that should become authoritative.
+- Revisit the supplemental Event Channel Stream Monitor only after channel-attributed scan evidence shows that expected event inactivity materially affects general health reporting or provider-check volume.
 - Operator accepted the recommended correction and clean-reset sequence on 2026-08-24.
+
+---
+
+# ADR-017: Stabilize media-change evidence and separate health and throughput cooldowns
+
+## Status
+
+Accepted
+
+## Date
+
+2026-08-25
+
+## Context
+
+Short direct-FFprobe samples showed substantial one-scan bitrate and FPS variation. Those observations caused `media_changed` throughput checks even when delivery classification remained stable. At the same time, healthy throughput remained stable enough to reduce provider checks, degraded throughput reused the one-hour dead TTL, persistent dead streams were repeatedly checked, and intentional fixed-duration event placeholders dominated dead-transition analysis.
+
+## Decision
+
+- Treat 500 Kbps as the default minimum direct-FFprobe video bitrate, not a media-change delta. A measured bitrate below the floor is provisional `low_bitrate` dead health and receives the configured immediate retry sequence. It becomes terminal dead only after retries remain below the floor. Missing bitrate is not a floor violation.
+- Retain the latest seven completed direct-FFprobe statistic observations per stream and provider. Resolution changes trigger `media_changed` immediately. Percentage-based bitrate changes require two consecutive observations outside both the configured 30 percent threshold and a robust median-absolute-deviation envelope; normalized FPS-family changes require two consecutive observations outside the established family. Dispatcharr-imported statistics do not enter this direct-FFprobe baseline.
+- Start the trial with jittered throughput TTL defaults of 24 hours for healthy, 12 hours for marginal or insufficient, and 4 hours for unknown. Terminal health uses dead TTL policy instead of throughput TTL policy.
+- Apply the configured exact dead TTL to the first two consecutive terminal-dead results, four times the base TTL to results three through five, and twelve times the base TTL thereafter. Any completed alive result resets the streak. Dead TTL remains unjittered.
+- Do not apply adaptive dead backoff to `placeholder_file`. A known placeholder uses a one-second FFprobe gate at the exact base dead TTL. A still-finite file remains placeholder without a full sample; a possible recovery must pass the normal FFprobe analysis before health can become alive. Placeholder is a health classification rather than a top-level stream status: aggregate status remains `dead`, `error_type` remains `placeholder_file`, and reports expose `health_class=placeholder`.
+- Aggregate stream health is dead when any completed due health component is terminally dead after retries. An alive FFprobe result cannot clear a terminal content failure; only an aggregate completed alive result resets the consecutive-dead streak.
+- Retain placeholder observations in raw reports and current-dead listings, but segment their health, retry, and daily-rollup counters from general dead ratios, transitions, problematic-stream qualification, and TTL recommendations. Report placeholder streams and checks separately.
+- Keep the unified cache as the authoritative compact current state for component timestamps, aggregate health, provider identity, dead streaks, retry state, throughput status, and rolling media history. Do not persist derived throughput `expires_at`; analysis and sorting both calculate eligibility from `checked_at`, throughput status, stable per-stream jitter, and current TTL settings. Historical logs are evidence rather than active-state reconstruction.
+- Omit evidence-based throughput TTL recommendations until sufficient status-duration history exists. Expose 24/12/4 hours only as provisional trial defaults and current settings.
+
+## Rationale
+
+The policy reduces provider checks without allowing a single variable-bitrate or frame-rate sample to accelerate a much longer throughput TTL. The bitrate floor remains a health safety boundary with the same retry protection as other provisional failures. Separate throughput cooldowns prevent reachable degraded streams from being conflated with dead streams. Adaptive dead backoff reduces repeated checks against persistent failures, while the exact placeholder TTL preserves the ability to notice event streams becoming live until an event-aware companion can request external analysis.
+
+## Consequences and review triggers
+
+- Existing caches build their rolling baseline over subsequent direct FFprobe scans; no historical result is invented during migration.
+- Existing saved `media_bitrate_absolute_tolerance_kbps` values are no longer exposed as a change-delta control. The replacement setting is `minimum_video_bitrate_kbps`, default 500.
+- Review the 500 Kbps floor, seven-observation window, two-observation confirmation, throughput TTLs, and dead multipliers after at least seven days of representative scheduled history.
+- Revisit placeholder cooldown only after an event-aware external caller can bypass normal TTL eligibility safely.
+- Recommendation output remains read-only and must make placeholder exclusion and adaptive dead behavior explicit.
+
+## Provenance
+
+- Operator review of the August 25, 2026 scheduled-scan FFprobe, throughput, content, health-transition, and placeholder evidence.
+- Decision-closure Q&A in the active Stream Sort task on August 25, 2026.

@@ -51,6 +51,116 @@ def _scheduled_accounts(items, workers):
     return starts
 
 
+def test_placeholder_is_dead_health_with_separate_report_classification():
+    now = _now()
+    item = {"id": 42, "name": "Event placeholder", "account_id": 7, "account_name": "Provider", "channels": []}
+    cache = {
+        "42": {
+            "status": "dead",
+            "error_type": "placeholder_file",
+            "health_check_history": [
+                {
+                    "checked_at": (now - timedelta(hours=2)).isoformat(),
+                    "previous_status": "unknown",
+                    "status": "alive",
+                    "error_type": "",
+                    "terminal": True,
+                },
+                {
+                    "checked_at": (now - timedelta(hours=1)).isoformat(),
+                    "previous_status": "alive",
+                    "status": "dead",
+                    "error_type": "placeholder_file",
+                    "terminal": True,
+                },
+            ],
+        }
+    }
+
+    report = _build_health_report(
+        [item],
+        cache,
+        now=now,
+        media_reason_counts={},
+        throughput_reason_counts={},
+        channels_selected=0,
+    )
+
+    placeholder = report["status_patterns"]["placeholders"]["current_streams"][0]
+    assert report["status_counts"]["dead"] == 1
+    assert placeholder["last_status"] == "dead"
+    assert placeholder["health_class"] == "placeholder"
+    assert report["observations"]["history_rows"] == 1
+    assert report["observations"]["raw_history_rows"] == 2
+
+
+def test_placeholder_rollups_do_not_increment_general_health_or_retry_counters():
+    entry = {}
+    incremental._append_health_history(
+        entry,
+        reason="ffprobe_dead_ttl_expired",
+        previous_status="dead",
+        new_status="dead",
+        tested_at=_now().isoformat(),
+        result={
+            "status": "dead",
+            "error_type": "placeholder_file",
+            "retry_telemetry": {"retry_attempts": 3, "retries_exhausted": True},
+        },
+    )
+
+    bucket = entry["health_daily_rollups"][_now().date().isoformat()]
+    assert bucket["placeholder_completed_checks"] == 1
+    assert bucket["placeholder_retry_attempts"] == 3
+    assert bucket["placeholder_retry_exhaustions"] == 1
+    assert "completed_checks" not in bucket
+    assert "dead_checks" not in bucket
+    assert "retry_attempts" not in bucket
+
+
+def test_terminal_content_dead_preserves_and_advances_existing_dead_streak():
+    now = _now().isoformat()
+    item = {"id": 42, "name": "Example", "url": "http://example.test/live", "account_id": 7, "account_name": "Provider"}
+    previous = {
+        "status": "dead",
+        "error_type": "black_screen",
+        "consecutive_dead_results": 4,
+        "url_hash": analyzer._stream_url_hash(item["url"]),
+    }
+    media_alive = {
+        "tested_at": now,
+        "status": "alive",
+        "error_type": None,
+        "error": "",
+        "stats": {"resolution": "1920x1080", "video_bitrate": 4000},
+        "details": {},
+    }
+    intermediate = incremental._merge_media_result(
+        item,
+        previous,
+        media_alive,
+        record_history=False,
+        history_previous_status="dead",
+    )
+    content_dead = {
+        "tested_at": now,
+        "status": "dead",
+        "error_type": "black_screen",
+        "error": "Stream decodes to a black screen",
+        "details": {"content": {"measured": True, "tested_at": now}},
+    }
+    terminal = incremental._merge_content_result(
+        item,
+        intermediate,
+        content_dead,
+        history_previous_status="dead",
+    )
+
+    assert intermediate["consecutive_dead_results"] == 4
+    assert terminal["status"] == "dead"
+    assert terminal["consecutive_dead_results"] == 5
+
+
 def test_parallel_tests_use_distinct_m3u_sources_before_reusing_one():
     items = [
         {"id": 1, "account_id": 10},
@@ -440,7 +550,22 @@ def test_throughput_checked_uses_only_measurements_retained_after_terminal_healt
 
 def test_problematic_streams_require_more_than_75_percent_dead_across_full_scope():
     now = _now()
-    items = [{"id": index, "name": f"Stream {index}"} for index in range(1, 26)]
+    items = [
+        {
+            "id": index,
+            "name": f"Stream {index}",
+            "account_id": 10,
+            "account_name": "Provider",
+            "channels": [
+                {
+                    "channel_id": index,
+                    "channel_name": f"Channel {index}",
+                    "channel_number": index,
+                }
+            ],
+        }
+        for index in range(1, 26)
+    ]
     cache = {}
     for item in items:
         statuses = (["dead"] * 15) + (["alive"] * 5)
@@ -468,6 +593,78 @@ def test_problematic_streams_require_more_than_75_percent_dead_across_full_scope
     )
     assert report["top_metrics"]["dead_dominant_streams"] == [25]
     assert report["status_patterns"]["problematic_streams"][0]["stream_id"] == 25
+    assert report["status_patterns"]["problematic_streams"][0]["source_name"] == "Provider"
+    assert report["status_patterns"]["problematic_streams"][0]["channels"] == [
+        {"channel_id": 25, "channel_name": "Channel 25", "channel_number": 25}
+    ]
+
+
+def test_health_report_preserves_all_channel_attachments_for_current_dead_stream():
+    now = _now()
+    stream = SimpleNamespace(id=42)
+    rows = [
+        SimpleNamespace(
+            channel_id=100,
+            channel=SimpleNamespace(id=100, name="Event One", channel_number=501),
+            stream=stream,
+        ),
+        SimpleNamespace(
+            channel_id=200,
+            channel=SimpleNamespace(id=200, name="Event Two", channel_number=502),
+            stream=stream,
+        ),
+    ]
+    channels = incremental._channel_attachments_by_stream(rows)[42]
+    item = {
+        "id": 42,
+        "name": "Shared Event Stream",
+        "account_id": 10,
+        "account_name": "Provider",
+        "channels": channels,
+    }
+    report = _build_health_report(
+        [item],
+        {
+            "42": {
+                "status": "dead",
+                "health_check_history": [
+                    {
+                        "checked_at": now.isoformat(),
+                        "previous_status": "unknown",
+                        "status": "dead",
+                        "reason": "health_missing",
+                        "terminal": True,
+                    }
+                ],
+            }
+        },
+        now=now,
+        media_reason_counts={"health_missing": 1},
+        throughput_reason_counts={},
+        channels_selected=2,
+    )
+    dead = report["status_patterns"]["current_dead_streams"]
+    assert len(dead) == 1
+    assert dead[0]["stream_id"] == 42
+    assert dead[0]["status_changes"] == 0
+    assert dead[0]["source_name"] == "Provider"
+    assert dead[0]["channels"] == [
+        {"channel_id": 100, "channel_name": "Event One", "channel_number": 501},
+        {"channel_id": 200, "channel_name": "Event Two", "channel_number": 502},
+    ]
+    assert report["observations"]["status_changes"] == 0
+    assert report["observations"]["transition_counts"] == {}
+
+
+def test_initial_throughput_missing_reason_is_not_relabelled_by_media_refresh():
+    assert incremental._normalize_throughput_check_reason(
+        "missing",
+        media_changed=True,
+    ) == "throughput_missing"
+    assert incremental._normalize_throughput_check_reason(
+        None,
+        media_changed=True,
+    ) == "media_changed"
 
 
 def test_persist_dispatcharr_result_does_not_write_provider_stale_state(monkeypatch):
@@ -524,25 +721,27 @@ def test_fresh_healthy_throughput_is_cached():
     assert throughput_check_reason(entry, url_hash="abc", ttl_hours=6, now=now) is None
 
 
-def test_nonhealthy_throughput_uses_exact_dead_ttl():
+def test_nonhealthy_throughput_uses_status_specific_jittered_ttls():
     now = _now()
-    for status in ("marginal", "insufficient", "unknown"):
+    for status, status_ttl in (("marginal", 12), ("insufficient", 12), ("unknown", 4)):
         entry = {"throughput": {"status": status, "url_hash": "abc", "checked_at": now.isoformat()}}
         assert throughput_check_reason(
             entry,
             url_hash="abc",
-            ttl_hours=6,
-            dead_ttl_hours=1,
-            ttl_jitter_percent=30,
+            ttl_hours=24,
+            degraded_ttl_hours=12,
+            unknown_ttl_hours=4,
+            ttl_jitter_percent=0,
             now=now,
         ) is None
         assert throughput_check_reason(
             entry,
             url_hash="abc",
-            ttl_hours=6,
-            dead_ttl_hours=1,
-            ttl_jitter_percent=30,
-            now=now + timedelta(hours=1),
+            ttl_hours=24,
+            degraded_ttl_hours=12,
+            unknown_ttl_hours=4,
+            ttl_jitter_percent=0,
+            now=now + timedelta(hours=status_ttl),
         ) == f"status_{status}"
 
 
@@ -938,13 +1137,15 @@ def test_media_stats_changed_for_throughput_uses_signature_and_bitrate_tolerance
     previous = {"resolution": "1920x1080", "source_fps": 60, "video_bitrate": 5000}
     noisy_change = {"resolution": "1920x1080", "source_fps": 60, "video_bitrate": 5600}
     clear_change = {"resolution": "1920x1080", "source_fps": 60, "video_bitrate": 7000}
-    fps_change = {"resolution": "1920x1080", "source_fps": 59.9, "video_bitrate": 5600}
+    fps_change = {"resolution": "1920x1080", "source_fps": 30, "video_bitrate": 5600}
+    bitrate_history = [{"stats": previous}, {"stats": previous}, {"stats": previous}, {"stats": clear_change}]
+    fps_history = [{"stats": previous}, {"stats": previous}, {"stats": previous}, {"stats": fps_change}]
 
-    assert not _media_stats_changed_for_throughput(previous, noisy_change)
-    assert _media_stats_changed_for_throughput(previous, clear_change)
-    assert _media_stats_changed_for_throughput(previous, fps_change)
+    assert not _media_stats_changed_for_throughput(previous, noisy_change, media_history=bitrate_history)
+    assert _media_stats_changed_for_throughput(previous, clear_change, media_history=bitrate_history)
+    assert _media_stats_changed_for_throughput(previous, fps_change, media_history=fps_history)
     assert not _media_stats_changed_for_throughput(previous, {})
-    assert _media_stats_changed_for_throughput({}, previous)
+    assert not _media_stats_changed_for_throughput({}, previous)
 
 
 def test_media_change_thresholds_are_configurable():
@@ -954,13 +1155,13 @@ def test_media_change_thresholds_are_configurable():
         previous,
         minor_change,
         media_bitrate_relative_tolerance=0.05,
-        media_bitrate_absolute_tolerance_kbps=1000.0,
+        media_history=[{"stats": previous}, {"stats": previous}, {"stats": previous}, {"stats": previous}],
     )
     assert _media_stats_changed_for_throughput(
         previous,
         minor_change,
         media_bitrate_relative_tolerance=0.05,
-        media_bitrate_absolute_tolerance_kbps=100.0,
+        media_history=[{"stats": previous}, {"stats": previous}, {"stats": previous}, {"stats": minor_change}],
     )
 
 
@@ -981,7 +1182,6 @@ def test_dispatcharr_metadata_uses_configured_bitrate_change_thresholds():
     refreshed, changed = incremental._sync_dispatcharr_metadata(
         [item], cache,
         media_bitrate_relative_tolerance=0.30,
-        media_bitrate_absolute_tolerance_kbps=500,
     )
     assert refreshed == 1
     assert changed == set()
@@ -991,10 +1191,9 @@ def test_dispatcharr_metadata_uses_configured_bitrate_change_thresholds():
     refreshed, changed = incremental._sync_dispatcharr_metadata(
         [item], cache,
         media_bitrate_relative_tolerance=0.30,
-        media_bitrate_absolute_tolerance_kbps=500,
     )
     assert refreshed == 1
-    assert changed == {42}
+    assert changed == set()
 
 
 def test_skipped_media_result_preserves_previous_metadata():
@@ -1014,9 +1213,9 @@ def test_matching_legacy_throughput_is_migrated(monkeypatch):
     item = {"id": 42, "url": url, "account_id": 3, "account_name": "Provider"}
     cache = {"42": {"status": "alive", "url_hash": url_hash, "stats": {"height": 1080}}}
     monkeypatch.setattr(incremental, "load_throughput_cache", lambda _path: {"42": {"status": "healthy", "measured_mbps": 12.3, "tested_at": _now().isoformat()}})
-    assert incremental._migrate_legacy_throughput([item], cache, ttl_hours=6) == 1
+    assert incremental._migrate_legacy_throughput([item], cache) == 1
     assert cache["42"]["throughput"]["status"] == "healthy"
-    assert "expires_at" in cache["42"]["throughput"]
+    assert "expires_at" not in cache["42"]["throughput"]
 
 
 def test_clean_runtime_playback_reuses_reachability_and_defers_content_check():

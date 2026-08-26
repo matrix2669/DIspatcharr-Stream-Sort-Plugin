@@ -22,9 +22,9 @@ def test_cache_round_trip(tmp_path: Path):
     assert json.loads(path.read_text()) == payload
 
 
-def test_unified_cache_extracts_nested_throughput_and_ignores_legacy_ttl_timestamp(tmp_path: Path):
+def test_unified_cache_extracts_nested_throughput_with_freshness_timestamp(tmp_path: Path):
     path = tmp_path / "analysis.json"
-    expires = datetime.now(timezone.utc) + timedelta(hours=2)
+    checked_at = datetime.now(timezone.utc).isoformat()
     path.write_text(
         json.dumps(
             {
@@ -34,8 +34,7 @@ def test_unified_cache_extracts_nested_throughput_and_ignores_legacy_ttl_timesta
                     "throughput": {
                         "status": "healthy",
                         "measured_mbps": 12.3,
-                        "tested_at": datetime.now(timezone.utc).isoformat(),
-                        "expires_at": expires.isoformat(),
+                        "checked_at": checked_at,
                     },
                 }
             }
@@ -44,10 +43,10 @@ def test_unified_cache_extracts_nested_throughput_and_ignores_legacy_ttl_timesta
     loaded = load_cache(str(path))
     assert loaded["42"]["status"] == "healthy"
     assert loaded["42"]["measured_mbps"] == 12.3
-    assert "tested_at" not in loaded["42"]
+    assert loaded["42"]["checked_at"] == checked_at
 
 
-def test_unified_cache_marks_expired_throughput_unknown(tmp_path: Path):
+def test_unified_cache_does_not_apply_stored_expiration(tmp_path: Path):
     path = tmp_path / "analysis.json"
     expired = datetime.now(timezone.utc) - timedelta(seconds=1)
     path.write_text(
@@ -64,7 +63,9 @@ def test_unified_cache_marks_expired_throughput_unknown(tmp_path: Path):
             }
         )
     )
-    assert load_cache(str(path))["42"]["status"] == "unknown"
+    loaded = load_cache(str(path))["42"]
+    assert loaded["status"] == "healthy"
+    assert "expires_at" not in loaded
 
 
 def test_corrupt_cache_returns_empty(tmp_path: Path):

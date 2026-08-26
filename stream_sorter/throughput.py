@@ -178,24 +178,12 @@ def _write_json_atomic(data: dict[str, Any], path: str) -> None:
         raise
 
 
-def _expired(value: Any) -> bool:
-    if not value:
-        return False
-    try:
-        expires = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
-    except (TypeError, ValueError):
-        return False
-    if expires.tzinfo is None:
-        expires = expires.replace(tzinfo=timezone.utc)
-    return datetime.now(timezone.utc) >= expires.astimezone(timezone.utc)
-
-
 def load_cache(path: str = DEFAULT_CACHE_PATH) -> dict[str, dict[str, Any]]:
     """Load throughput entries from the unified analysis cache.
 
-    The old standalone throughput file is read as a migration fallback. Nested
-    entries carry their own expiration time, so an old stored 30-minute plugin
-    setting cannot expire a still-valid 6-hour throughput measurement.
+    The old standalone throughput file is read as a migration fallback.
+    Freshness is evaluated by scoring from checked_at, status-specific current
+    TTL settings, and stable stream jitter rather than stored expiration data.
     """
     data = _read_json(path)
     nested: dict[str, dict[str, Any]] = {}
@@ -206,13 +194,7 @@ def load_cache(path: str = DEFAULT_CACHE_PATH) -> dict[str, dict[str, Any]]:
         throughput = value.get("throughput")
         if isinstance(throughput, dict):
             entry = dict(throughput)
-            if _expired(entry.get("expires_at")):
-                entry["status"] = "unknown"
-                entry["error"] = "cached throughput measurement expired"
-            # Freshness for unified entries is owned by expires_at. Removing
-            # tested_at from this copy prevents the legacy scorer TTL from
-            # applying a second, contradictory expiration policy.
-            entry.pop("tested_at", None)
+            entry.pop("expires_at", None)
             nested[str(key)] = entry
         elif "status" in value and (
             "measured_mbps" in value or "bytes" in value or "nominal_video_kbps" in value

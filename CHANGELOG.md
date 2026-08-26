@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.3.6-beta.11 - 2026-08-25
+
+### Changed
+
+- Treat video below the configurable 500 Kbps floor as retryable provisional dead health.
+- Confirm percentage-based bitrate and FPS changes across a seven-result direct-FFprobe history while keeping resolution changes immediate.
+- Use jittered 24-hour healthy, 12-hour degraded, and 4-hour unknown throughput TTLs.
+- Back off consecutive non-placeholder dead results while keeping placeholders on the exact base TTL and rechecking them through a one-second FFprobe gate.
+- Segment placeholder observations from general health and TTL analysis without removing them from raw reporting.
+- Keep placeholders in aggregate dead health while exposing a distinct report classification, and preserve adaptive dead streaks across intermediate alive FFprobe results when content remains terminally dead.
+- Use video-packet bitrate for the minimum floor, apply a robust median-absolute-deviation envelope to rolling bitrate changes, and require every non-placeholder one-second result to pass the normal FFprobe path.
+- Separate placeholder retry and daily-rollup counters, remove derived throughput expiration metadata, and defer evidence-based throughput TTL recommendations until sufficient history exists.
+- Make sorting and analysis share current status-specific throughput freshness instead of relying on stored expiration timestamps or the legacy 30-minute scorer TTL.
+
 ## 0.3.6-beta.10 - 2026-08-24
 
 ### Fixed

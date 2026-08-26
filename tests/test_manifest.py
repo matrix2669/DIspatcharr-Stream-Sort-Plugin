@@ -41,7 +41,9 @@ def test_plugin_manifest_is_valid_and_matches_version():
     assert "health_content_ttl_hours" not in field_ids
     assert "dead_content_ttl_hours" in field_ids
     assert "media_bitrate_relative_tolerance_percent" in field_ids
-    assert "media_bitrate_absolute_tolerance_kbps" in field_ids
+    assert "media_bitrate_absolute_tolerance_kbps" not in field_ids
+    minimum_bitrate = next(field for field in manifest["fields"] if field["id"] == "minimum_video_bitrate_kbps")
+    assert minimum_bitrate["default"] == 500
     assert "analysis_ttl_jitter_percent" in field_ids
     jitter_field = next(field for field in manifest["fields"] if field["id"] == "analysis_ttl_jitter_percent")
     assert jitter_field["default"] == 30
@@ -50,6 +52,9 @@ def test_plugin_manifest_is_valid_and_matches_version():
     assert "playback_health_ttl_hours" not in field_ids
     assert "content_validation_ttl_hours" in field_ids
     assert "healthy_throughput_ttl_hours" in field_ids
+    assert next(field for field in manifest["fields"] if field["id"] == "healthy_throughput_ttl_hours")["default"] == 24
+    assert next(field for field in manifest["fields"] if field["id"] == "degraded_throughput_ttl_hours")["default"] == 12
+    assert next(field for field in manifest["fields"] if field["id"] == "unknown_throughput_ttl_hours")["default"] == 4
     assert "reset_statistics_include_history" not in field_ids
     assert "probe_per_account_delay_seconds" in field_ids
     assert "probe_rate_per_minute" not in field_ids

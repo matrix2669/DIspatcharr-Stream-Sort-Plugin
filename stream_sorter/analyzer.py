@@ -24,7 +24,9 @@ RETRYABLE_ERROR_TYPES = {
     'network_unreachable',
     'stream_unreachable',
     'server_error',
+    'invalid_stream',
     'invalid_video_dimensions',
+    'low_bitrate',
     'placeholder_file',
     'black_screen',
     'frozen_video',
@@ -396,21 +398,20 @@ def analyze_stream(raw_url: str, *, stream_id: Any, stream_name: str, settings: 
     width = _as_int(video_stream.get('width'), 0)
     height = _as_int(video_stream.get('height'), 0)
     fps = _parse_rate(video_stream.get('r_frame_rate') or video_stream.get('avg_frame_rate'))
-    video_bitrate: float | None = None
-    for raw_bitrate in (video_stream.get('bit_rate'), (probe_data.get('format') or {}).get('bit_rate')):
-        try:
-            if raw_bitrate not in (None, '', 'N/A'):
-                video_bitrate = float(raw_bitrate) / 1000.0
-                break
-        except (TypeError, ValueError):
-            pass
+    declared_video_bitrate: float | None = None
+    try:
+        raw_video_bitrate = video_stream.get('bit_rate')
+        if raw_video_bitrate not in (None, '', 'N/A'):
+            declared_video_bitrate = float(raw_video_bitrate) / 1000.0
+    except (TypeError, ValueError):
+        declared_video_bitrate = None
     packets = probe_data.get('packets') or []
     video_index = video_stream.get('index')
     video_packets = [packet for packet in packets if packet.get('stream_index') == video_index]
     if not video_packets:
         video_packets = packets
     calculated_bitrate = None
-    if video_bitrate is None and len(video_packets) >= MIN_PACKETS_FOR_BITRATE_CALC:
+    if len(video_packets) >= MIN_PACKETS_FOR_BITRATE_CALC:
         total_size = 0
         total_duration = 0.0
         for packet in video_packets:
@@ -421,7 +422,7 @@ def analyze_stream(raw_url: str, *, stream_id: Any, stream_name: str, settings: 
                 continue
         if total_duration > 0:
             calculated_bitrate = total_size * 8.0 / (total_duration * 1000.0)
-            video_bitrate = calculated_bitrate
+    video_bitrate = calculated_bitrate if calculated_bitrate is not None else declared_video_bitrate
     if video_bitrate is not None:
         video_bitrate = float(int(round(video_bitrate)))
     audio_codec = None
@@ -473,6 +474,17 @@ def analyze_stream(raw_url: str, *, stream_id: Any, stream_name: str, settings: 
             details['container_bitrate_kbps'] = container_bitrate
         if _as_bool(settings.get('placeholder_file_detection'), True):
             return {**base, 'status': 'dead', 'error_type': 'placeholder_file', 'error': f'Fixed-duration file ({container_duration:.1f}s) instead of a continuous live stream', 'stats': stats, 'details': details}
+    minimum_video_bitrate = max(0.0, _as_float(settings.get('minimum_video_bitrate_kbps'), 500.0))
+    if minimum_video_bitrate > 0 and video_bitrate is not None and video_bitrate < minimum_video_bitrate:
+        details['minimum_video_bitrate_kbps'] = minimum_video_bitrate
+        return {
+            **base,
+            'status': 'dead',
+            'error_type': 'low_bitrate',
+            'error': f'Video bitrate {video_bitrate:.0f} kbps is below the {minimum_video_bitrate:.0f} kbps minimum',
+            'stats': stats,
+            'details': details,
+        }
     details['has_audio'] = audio_stream is not None
     result = {**base, 'status': 'alive', 'error_type': None, 'error': '', 'stats': stats, 'details': details}
     if not include_content:

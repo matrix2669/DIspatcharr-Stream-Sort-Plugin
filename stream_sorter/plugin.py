@@ -663,6 +663,9 @@ def _recommend_ttls(settings: dict, *, report: dict) -> dict:
 
     health_current = _safe_float(settings.get("stream_data_ttl_hours"), 12.0)
     dead_current = _safe_float(settings.get("dead_content_ttl_hours"), 1.0)
+    healthy_throughput_current = _safe_float(settings.get("healthy_throughput_ttl_hours"), 24.0)
+    degraded_throughput_current = _safe_float(settings.get("degraded_throughput_ttl_hours"), 12.0)
+    unknown_throughput_current = _safe_float(settings.get("unknown_throughput_ttl_hours"), 4.0)
     jitter_current = _safe_float(settings.get("analysis_ttl_jitter_percent"), 30.0)
 
     selected_streams = int(report.get("selected_streams") or 0)
@@ -690,9 +693,6 @@ def _recommend_ttls(settings: dict, *, report: dict) -> dict:
         dead_base = dead_recoveries.get("p90")
     suggested_dead = _clamp_float(_safe_float(dead_base, None), 0.25, 24.0)
 
-    if dead_ratio >= 0.30 and suggested_dead is not None:
-        suggested_dead = _clamp_float(min(suggested_dead, dead_current * 0.6), 0.25, 24.0)
-
     if minute_concentration >= 0.20:
         suggested_jitter = 25.0
     elif minute_concentration >= 0.10:
@@ -712,7 +712,7 @@ def _recommend_ttls(settings: dict, *, report: dict) -> dict:
     if selected_streams == 0:
         notes.append("No streams were included in the current report; recommendations are placeholders.")
     if dead_ratio >= 0.25:
-        notes.append("Higher dead-check ratio suggests keeping dead TTL shorter for faster recovery on unstable URLs.")
+        notes.append("Higher dead-check ratios are handled by consecutive-dead adaptive backoff; placeholder observations are excluded from general health tuning.")
     if status_change_ratio >= 0.20:
         notes.append("Frequent status transitions suggest moderate jitter to avoid synchronized rechecks.")
     if recovery_samples < 5:
@@ -721,6 +721,7 @@ def _recommend_ttls(settings: dict, *, report: dict) -> dict:
         notes.append("Fewer than five completed alive episodes were observed; the reachability TTL recommendation is provisional.")
     if history_span_hours < 72:
         notes.append("Collect at least 72 hours of history before treating TTL recommendations as stable.")
+    notes.append("Throughput TTL recommendations are omitted until sufficient status-duration evidence has been collected; 24h/12h/4h remain provisional trial defaults.")
 
     confidence = "low"
     if history_span_hours >= 336 and recovery_samples >= 20 and alive_episode_samples >= 20:
@@ -743,9 +744,18 @@ def _recommend_ttls(settings: dict, *, report: dict) -> dict:
         "current_ttls": {
             "stream_data_ttl_hours": health_current,
             "dead_content_ttl_hours": dead_current,
+            "healthy_throughput_ttl_hours": healthy_throughput_current,
+            "degraded_throughput_ttl_hours": degraded_throughput_current,
+            "unknown_throughput_ttl_hours": unknown_throughput_current,
             "analysis_ttl_jitter_percent": jitter_current,
         },
         "recommended_ttls": recommendations,
+        "throughput_trial_defaults": {
+            "healthy_throughput_ttl_hours": 24.0,
+            "degraded_throughput_ttl_hours": 12.0,
+            "unknown_throughput_ttl_hours": 4.0,
+            "recommendation_status": "insufficient_evidence",
+        },
         "observation_summary": {
             "history_span_hours": history_span_hours,
             "status_changes": observations.get("status_changes"),
