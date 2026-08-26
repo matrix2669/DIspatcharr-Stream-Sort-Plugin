@@ -49,6 +49,7 @@ Before cleanup, the legacy `dev-test`, checkpoint, and duplicate `noop-check` br
 ## GitHub work-tracking pilot
 
 - `docs/github-work-tracking-pilot`: active documentation branch from `dev` at `aef46b85c6c3327ba7af6aa704cb7e9aad1b44ee`, targeting `dev` only after the pilot is reviewed and separately approved for integration.
+- Baseline synchronization: merged `dev` at `12ec5fd746a35baccd70895458b4c490f46efc3f` so the already-integrated session-checkpoint ledger cleanup is shared without changing pilot scope.
 - Purpose: migrate actionable `TODO.md` work into repository Issues and demonstrate a user-level Workspace Project without changing Stream Sort behavior.
 - Initial continuity checkpoint: commit `8830143` preserves the previously local-only completion-runtime logging requirements exactly before restructuring the TODO; Issue #15 now owns that outcome and its acceptance criteria.
 - Scope: `AGENT.md`, `BRANCHES.md`, `DECISIONS.md`, and `TODO.md`; Stream Sort Issues #5-#18; private user Project [Workspace Roadmap](https://github.com/users/matrix2669/projects/1); and draft pull request [#19](https://github.com/matrix2669/DIspatcharr-Stream-Sort-Plugin/pull/19) targeting `dev` for integration review.
