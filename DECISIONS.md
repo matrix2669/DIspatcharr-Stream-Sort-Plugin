@@ -631,3 +631,47 @@ The policy reduces provider checks without allowing a single variable-bitrate or
 
 - Operator review of the August 25, 2026 scheduled-scan FFprobe, throughput, content, health-transition, and placeholder evidence.
 - Decision-closure Q&A in the active Stream Sort task on August 25, 2026.
+
+---
+
+# ADR-018: Pilot GitHub Issues and a cross-repository Project for actionable work
+
+## Status
+
+Provisional
+
+## Date
+
+2026-08-26
+
+## Context
+
+`TODO.md` combined small changes, investigations, implementation-blocking decisions, a multi-part future initiative, and already-completed work in one unchecked list. It did not provide acceptance criteria, dependencies, discussion history, a cross-repository view, or a reliable current status. Session continuity now requires every local change checkpoint to be present on GitHub, so actionable work should also be understandable and resumable there without treating a pull request as deployment approval.
+
+## Decision
+
+- Pilot repository Issues as the authority for independently actionable Stream Sort outcomes, acceptance criteria, relationships, discussion, current status, and blockers.
+- Pilot a private user-level `Workspace Roadmap` Project as the cross-repository planning view. Use its Delivery field to distinguish `dev`, `dev-test`, `main`, `upstream`, and `future`; do not infer release or deployment from that field.
+- Use a parent Issue with sub-issues for the Event Channel Stream Monitor initiative. Record explicit blocked-by relationships for implementation ordering.
+- Keep `TODO.md` as a durable migration index that points to GitHub without duplicating live Issue status.
+- Keep durable architecture and product choices in `DECISIONS.md`, external contracts in `DEPENDENCIES.md`, branch continuity and validation in `BRANCHES.md`, and shipped results in `CHANGELOG.md`.
+- Use a feature or documentation branch for remote continuity checkpoints and a pull request for integration review into the documented target branch. Neither a pushed branch nor a pull request authorizes merge, tag, registry change, Release, or deployment.
+- Leave Project priority unset until the operator deliberately triages it rather than inventing urgency during migration.
+- Retire an obsolete TODO without opening a new Issue when the current code, documentation, and tests prove the work is already complete; record the migration result in the owning branch documentation.
+
+## Rationale
+
+Issues make individual outcomes reviewable and resumable, sub-issues and dependencies expose sequencing, and a user-level Project can combine work from every governed repository. Repository documents still own durable technical authority, while branches and pull requests retain their narrower continuity and integration-review roles.
+
+## Consequences
+
+- A future session can begin from GitHub and see what exists, why it exists, what blocks it, which delivery lane it targets, and which branch or pull request carries implementation.
+- Issue and Project status must be updated as part of work checkpoints; a second live checklist in `TODO.md` would create conflicting authority.
+- The Project remains private during the pilot even though repository Issues and pull requests inherit repository visibility.
+- The pilot changes tracking and guidance only; it does not change Stream Sort runtime behavior or approve integration into `dev`.
+
+## Review triggers
+
+- Review the pilot's usefulness and friction before accepting this ADR or applying the model to other governed repositories.
+- Decide whether the Project should remain private and which views, fields, automation, templates, or labels are worth standardizing.
+- Supersede or reject this ADR if GitHub tracking creates duplicate authority, obscures repository decisions, or cannot support cross-computer continuation reliably.

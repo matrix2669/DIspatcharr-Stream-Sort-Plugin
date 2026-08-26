@@ -13,7 +13,7 @@ Before deleting a branch, record user-visible results in `CHANGELOG.md` and dura
 | `fix/v0.3.6-beta.6-analysis-control` | short-lived | active | `dev` | `dev` | Prevent overlapping analysis entry points, add safe cancellation, and publish immutable beta.6. |
 | `fix/v0.3.6-beta.10-telemetry-integrity` | short-lived | active | `dev` | `dev` | Preserve scan-boundary health transitions and distinguish attempted throughput probes from completed measurements. |
 | `feature/session-completion-remote-checkpoint` | governance | integrated; retained | `dev` at `3097708` | `dev` | Reconcile the mandatory session-end GitHub checkpoint rule without changing analyzer behavior or distribution. |
-| `docs/github-work-tracking-pilot` | documentation | active; source checkpointed | `dev` at `aef46b8` | `dev` | Pilot GitHub Issues, sub-issues, and a cross-repository Project as the actionable Stream Sort work tracker. |
+| `docs/github-work-tracking-pilot` | documentation | active; pilot ready for review | `dev` at `aef46b8` | `dev` | Pilot GitHub Issues, sub-issues, a cross-repository Project, and a draft PR as the actionable Stream Sort work-tracking flow. |
 
 ## Branch Records
 
@@ -55,7 +55,9 @@ Before cleanup, the legacy `dev-test`, checkpoint, and duplicate `noop-check` br
 
 - `docs/github-work-tracking-pilot`: active documentation branch from `dev` at `aef46b85c6c3327ba7af6aa704cb7e9aad1b44ee`, targeting `dev` only after the pilot is reviewed and separately approved for integration.
 - Purpose: migrate actionable `TODO.md` work into repository Issues and demonstrate a user-level Workspace Project without changing Stream Sort behavior.
-- Initial continuity checkpoint: preserve the previously local-only completion-runtime logging requirements exactly before restructuring the TODO.
-- Scope: `AGENT.md`, `BRANCHES.md`, `DECISIONS.md`, and `TODO.md`, plus Stream Sort Issues and the `Workspace Roadmap` Project.
-- Exclusions: analyzer/runtime behavior, settings, telemetry, TTL policy, scheduling behavior, capacity, scoring, stream ordering, version, tags, registry metadata, Release, deployment, pull requests, integration, or branch deletion.
-- Validation state: documentation and external tracking changes are in progress; no runtime files are in scope.
+- Initial continuity checkpoint: commit `8830143` preserves the previously local-only completion-runtime logging requirements exactly before restructuring the TODO; Issue #15 now owns that outcome and its acceptance criteria.
+- Scope: `AGENT.md`, `BRANCHES.md`, `DECISIONS.md`, and `TODO.md`; Stream Sort Issues #5-#18; private user Project [Workspace Roadmap](https://github.com/users/matrix2669/projects/1); and a draft pull request targeting `dev` for integration review.
+- Relationships: Issue #10 owns the pilot. Issue #11 owns the deferred Event Channel Stream Monitor initiative, with #18, #13, #9, and #8 as sub-issues; #9 is blocked by #18, while #8 is blocked by #9 and #13.
+- Migration finding: Stop Current Scan is already implemented, documented, and tested on the `dev` baseline, so the stale TODO entry was retired without creating an open Issue.
+- Exclusions: analyzer/runtime behavior, settings, telemetry, TTL policy, scheduling behavior, capacity, scoring, stream ordering, version, tags, registry metadata, Release, deployment, integration, merge, or branch deletion.
+- Validation: all 138 tests, Python compilation, workspace standards reconciliation, governed-project validation, exact changed-path review, and `git diff --check` pass. Exact remote branch and draft-PR state are verified at the final pilot checkpoint.
