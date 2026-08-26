@@ -12,7 +12,7 @@ Before deleting a branch, record user-visible results in `CHANGELOG.md` and dura
 | `dev` | long-lived | active | `main` | `main` | Integrates and validates the next beta and stable release. |
 | `fix/v0.3.6-beta.6-analysis-control` | short-lived | active | `dev` | `dev` | Prevent overlapping analysis entry points, add safe cancellation, and publish immutable beta.6. |
 | `fix/v0.3.6-beta.10-telemetry-integrity` | short-lived | active | `dev` | `dev` | Preserve scan-boundary health transitions and distinguish attempted throughput probes from completed measurements. |
-| `feature/session-completion-remote-checkpoint` | governance | active | `dev` at `3097708` | `dev` | Reconcile the mandatory session-end GitHub checkpoint rule without changing analyzer behavior or distribution. |
+| `feature/session-completion-remote-checkpoint` | governance | integrated; retained | `dev` at `3097708` | `dev` | Reconcile the mandatory session-end GitHub checkpoint rule without changing analyzer behavior or distribution. |
 
 ## Branch Records
 
@@ -48,4 +48,4 @@ Before cleanup, the legacy `dev-test`, checkpoint, and duplicate `noop-check` br
 
 ## Session-continuity reconciliation
 
-- `feature/session-completion-remote-checkpoint`: active governance branch from `dev` at `3097708e9db5621db76ef8f6238e20a2e0498234`, targeting `dev` after review. Scope is limited to `AGENT.md`, `WORKSPACE-STANDARDS.yaml`, and this branch record. It excludes analyzer/runtime behavior, settings, telemetry, TTL, scheduling, capacity, scoring, version, tags, registry metadata, Release, and deployment. Workspace standards validation and `git diff --check` pass.
+- `feature/session-completion-remote-checkpoint`: integrated governance branch from `dev` at `3097708e9db5621db76ef8f6238e20a2e0498234`; integration into `dev` was explicitly approved on `2026-08-26`, and the feature ref is retained pending separate branch-cleanup authority. Scope is limited to `AGENT.md`, `WORKSPACE-STANDARDS.yaml`, and this branch record. It excludes analyzer/runtime behavior, settings, telemetry, TTL, scheduling, capacity, scoring, version, tags, registry metadata, Release, and deployment. All 138 tests, Python compilation, workspace standards validation, exact changed-path review, and `git diff --check` pass.
