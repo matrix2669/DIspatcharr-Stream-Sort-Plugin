@@ -1171,7 +1171,7 @@ def test_known_placeholder_confirmation_is_terminal_without_retries_or_downstrea
     assert cache["42"]["retry_telemetry"]["retries_exhausted"] is False
     assert cache["42"]["retry_pending"] is False
     assert cache["42"]["throughput"] == previous["throughput"]
-    progress = next(args for args in messages["info"] if "[Analyze Media]" in args[0] and "stream=%s" in args[0])
+    progress = next(args for args in messages["info"] if args[1] == "[Analyze Media]" and "stream=%s" in args[0])
     assert "health_class=%s" in progress[0]
     assert "probe_mode=%s" in progress[0]
     assert "placeholder" in progress
