@@ -56,3 +56,9 @@ Status: Draft and deferred until Stream Sort's base analysis, retry, TTL, report
 - Determine the event lead time, post-event window, missing/stale EPG behavior, name-pattern precedence, rescheduled/canceled event behavior, and retry cadence from observed scan duration and event data.
 - Determine whether one pre-event request is sufficient or whether evidence supports an earlier preparation pass plus a near-event confirmation pass without undermining the fewer-provider-checks goal.
 - Revisit implementation only after Stream Sort's base functionality is operating cleanly and event-channel correlation shows enough impact to justify the supplemental plugin.
+
+## Next iteration: Completion runtime logging
+
+- Add total wall-clock runtime to the final completion log entry for every Stream Sort run, including manual and scheduled analysis, analyze-and-sort, and sort-only actions.
+- Keep the existing final counters and append a human-readable elapsed duration so scan-size, TTL, worker, and scheduling changes can be compared over time.
+- Show confirmed placeholder streams as a parenthesized breakdown of the aggregate dead count: `health alive=1320 dead=77 (placeholder=28 other_dead=49)`. Require `placeholder + other_dead == dead` so the breakdown cannot drift from the authoritative total.

@@ -13,6 +13,7 @@ Before deleting a branch, record user-visible results in `CHANGELOG.md` and dura
 | `fix/v0.3.6-beta.6-analysis-control` | short-lived | active | `dev` | `dev` | Prevent overlapping analysis entry points, add safe cancellation, and publish immutable beta.6. |
 | `fix/v0.3.6-beta.10-telemetry-integrity` | short-lived | active | `dev` | `dev` | Preserve scan-boundary health transitions and distinguish attempted throughput probes from completed measurements. |
 | `feature/session-completion-remote-checkpoint` | governance | integrated; retained | `dev` at `3097708` | `dev` | Reconcile the mandatory session-end GitHub checkpoint rule without changing analyzer behavior or distribution. |
+| `docs/github-work-tracking-pilot` | documentation | active; source checkpointed | `dev` at `aef46b8` | `dev` | Pilot GitHub Issues, sub-issues, and a cross-repository Project as the actionable Stream Sort work tracker. |
 
 ## Branch Records
 
@@ -49,3 +50,12 @@ Before cleanup, the legacy `dev-test`, checkpoint, and duplicate `noop-check` br
 ## Session-continuity reconciliation
 
 - `feature/session-completion-remote-checkpoint`: integrated governance branch from `dev` at `3097708e9db5621db76ef8f6238e20a2e0498234`; integration into `dev` was explicitly approved on `2026-08-26`, and the feature ref is retained pending separate branch-cleanup authority. Scope is limited to `AGENT.md`, `WORKSPACE-STANDARDS.yaml`, and this branch record. It excludes analyzer/runtime behavior, settings, telemetry, TTL, scheduling, capacity, scoring, version, tags, registry metadata, Release, and deployment. All 138 tests, Python compilation, workspace standards validation, exact changed-path review, and `git diff --check` pass.
+
+## GitHub work-tracking pilot
+
+- `docs/github-work-tracking-pilot`: active documentation branch from `dev` at `aef46b85c6c3327ba7af6aa704cb7e9aad1b44ee`, targeting `dev` only after the pilot is reviewed and separately approved for integration.
+- Purpose: migrate actionable `TODO.md` work into repository Issues and demonstrate a user-level Workspace Project without changing Stream Sort behavior.
+- Initial continuity checkpoint: preserve the previously local-only completion-runtime logging requirements exactly before restructuring the TODO.
+- Scope: `AGENT.md`, `BRANCHES.md`, `DECISIONS.md`, and `TODO.md`, plus Stream Sort Issues and the `Workspace Roadmap` Project.
+- Exclusions: analyzer/runtime behavior, settings, telemetry, TTL policy, scheduling behavior, capacity, scoring, stream ordering, version, tags, registry metadata, Release, deployment, pull requests, integration, or branch deletion.
+- Validation state: documentation and external tracking changes are in progress; no runtime files are in scope.
