@@ -98,7 +98,7 @@ Inside the same viability/resolution tier, the additive score uses bitrate adequ
 
 - Use **Dead stream TTL** to defer repeated dead-stream rechecks between scans.
 - The default **TTL jitter percent** is `30`, assigning each stream a stable media/throughput TTL between 70% and 130% of the configured value so streams do not expire together. Dead TTL is exact and receives no jitter.
-- Use Channel group and Channel profile filters when a scan must be limited to a controlled scope. Legacy saved `analysis_max_streams` values are ignored.
+- Choose Channel groups or Channel profiles, then use separate Analyze & Sort and Analyze Only filters when a scan must preserve externally managed ordering. Removed group/profile scope settings and legacy saved `analysis_max_streams` values are ignored; empty new filters select all channels.
 - Use the single scheduled Analyze job and choose whether **Apply sort after scheduled analysis** is enabled.
 - Click **Recommend TTLs** after analyzing to get data-driven reachability/dead-TTL and jitter recommendations before changing settings.
 
@@ -138,7 +138,14 @@ Retry passes run at most one recheck per M3U source at a time, while different s
 
 ## Channel scope
 
-Every action can be restricted by channel group and/or channel profile. Multiple values within a filter are ORed. If both group and profile filters are set, a channel must match both. Group matching uses the channel's effective group, including overrides; profile membership must be enabled.
+Choose one filter type for both scope lists: **Channel groups** or **Channel profiles**. Group matching uses the channel's effective group, including overrides; profile matching uses enabled memberships.
+
+- **Analyze & Sort** identifies the ordinary Stream Sort scope.
+- **Analyze Only** adds channels to analysis while always excluding them from Dry Run, Sort, and the sorting phase of Analyze + Sort.
+- If Analyze & Sort is empty, analysis still covers all channels and sorting covers all channels except Analyze Only matches.
+- If a channel matches both lists, Analyze Only wins so another owner such as Teamarr can retain channel ordering while consuming current Stream Sort probe evidence.
+
+Values are separated by commas, semicolons, or new lines. Numeric values and `id:<ID>` match exact IDs; `name:<NAME>` forces name interpretation. Names are case-insensitive and support `*` and `?` wildcards, such as `Event*` or `* PPV ?`.
 
 ## M3U source scores
 

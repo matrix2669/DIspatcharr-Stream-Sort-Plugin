@@ -675,3 +675,44 @@ Dispatcharr's current plugin contract discovers event handlers only from action 
 - GitHub issues #12, #14, #15, and #20 and their acceptance criteria, reviewed on 2026-08-26.
 - Operator decision to prioritize fewer provider checks while retaining periodic placeholder recovery detection.
 - Dispatcharr primary loader, serializer, frontend, and event-registration tests inspected on 2026-08-26.
+
+---
+
+# ADR-019: Separate analysis scope from Stream Sort ordering ownership
+
+## Status
+
+Accepted
+
+## Date
+
+2026-08-27
+
+## Context
+
+The original scope UI exposed simultaneous channel-group and channel-profile filters and applied their intersection to analysis and sorting. Teamarr-managed event channels need current Stream Sort probe evidence for Teamarr scoring, but Stream Sort must not overwrite the advanced ordering Teamarr owns. Keeping both entity types visible also made the effective scope harder to understand.
+
+## Decision
+
+- Expose one filter-type selector shared by both lists: Channel groups or Channel profiles. Group matching uses effective group overrides and profile matching uses enabled memberships.
+- Expose separate Analyze & Sort and Analyze Only filters. Analysis covers the union of both lists. Dry Run, Sort, and every sorting phase exclude Analyze Only channels.
+- Analyze Only wins when a channel matches both lists. This prevents Stream Sort from changing externally managed ordering while retaining normal FFprobe, content, throughput, retry, TTL, capacity, history, and reporting behavior.
+- An empty Analyze & Sort filter retains the ordinary all-channel default. When Analyze Only contains matches, sorting covers all other channels while analysis still covers all channels.
+- Accept comma, semicolon, and newline separators. Preserve case-insensitive exact-name matching, numeric IDs, `id:<ID>`, and `name:<NAME>`. Add case-insensitive `*` and `?` wildcards for names only; IDs remain exact. A token matching nothing remains a configuration error rather than silently widening scope.
+- Ignore removed legacy group/profile settings immediately. When both new lists are empty, analysis and sorting use the all-channel default.
+- Keep EPG interpretation, event discovery, event timing, and Teamarr ordering logic outside Stream Sort. This scope feature does not implement the deferred Event Channel Stream Monitor or the external queued-request contract.
+
+## Rationale
+
+The split keeps Stream Sort's standard analyze-and-sort responsibility intact while establishing an explicit ordering-ownership boundary. It avoids duplicating Teamarr's advanced filters, lets event channels contribute fresh technical evidence, and prevents scheduled sorting from undoing Teamarr decisions. Wildcards make category/profile maintenance practical without adding event-name classification logic to Stream Sort.
+
+## Consequences and review triggers
+
+- Status, health reports, and sort reports identify whether the resolved scope is for analysis or sorting and include both resolved filter lists.
+- Existing installations intentionally stop applying removed scope fields. Operators configure either new list when they need a narrower scope; otherwise the explicit default is all channels.
+- Revisit the ownership boundary if Teamarr consumes a supported external Stream Sort request API instead of shared cached probe evidence, or if Dispatcharr introduces native action-specific scopes.
+
+## Provenance
+
+- Operator requirement on 2026-08-27 to analyze Teamarr-managed event channels without allowing Stream Sort to reorder them.
+- Existing ADR-016 boundary that keeps event interpretation and scheduling outside Stream Sort.

@@ -27,7 +27,7 @@ def test_sort_completion_logs_total_runtime(tmp_path, monkeypatch, apply, mode):
     monkeypatch.setitem(sys.modules, "apps.channels", types.ModuleType("apps.channels"))
     monkeypatch.setitem(sys.modules, "apps.channels.models", models_module)
 
-    monkeypatch.setattr(sorter, "resolve_channel_scope", lambda _settings: (None, {"match_mode": "all", "selected_channel_count": 0}))
+    monkeypatch.setattr(sorter, "resolve_channel_scope", lambda _settings, **_kwargs: (None, {"match_mode": "all", "selected_channel_count": 0}))
     monkeypatch.setattr(sorter, "load_cache", lambda _path: {})
     monkeypatch.setattr(sorter, "load_reliability_cache", lambda _path: {})
     monkeypatch.setattr(sorter, "_load_channel_candidates", lambda *_args: {})

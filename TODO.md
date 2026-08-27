@@ -13,7 +13,7 @@ Status: Draft and deferred until Stream Sort's base analysis, retry, TTL, report
 ### Goal
 
 - Determine whether streams that are expected to be offline between scheduled events materially distort Stream Sort's dead-stream reports and TTL recommendations.
-- If the evidence supports it, create a separate supplemental plugin that monitors event channels and asks Stream Sort to analyze and sort only those channels before their events.
+- If the evidence supports it, create a separate supplemental plugin that monitors event channels and asks Stream Sort to analyze those channels before their events, requesting sorting only when Teamarr or another owner is not already responsible for channel order.
 - Keep EPG interpretation, event-name matching, and event scheduling outside Stream Sort so Stream Sort remains responsible only for standard scoped analysis and sorting.
 
 ### Proposed ownership boundary
@@ -21,12 +21,12 @@ Status: Draft and deferred until Stream Sort's base analysis, retry, TTL, report
 - The Event Channel Stream Monitor owns event-channel configuration, EPG lookup and interpretation, optional stream/channel-name matching, pre-event timing, duplicate-event handling, and trigger history.
 - Stream Sort owns FFprobe and FFmpeg checks, retries, provider capacity, TTL evidence, health and throughput history, scoring, and `ChannelStream.order` changes.
 - The supplemental plugin does not perform media probes, mutate Stream Sort settings, import private Stream Sort implementation functions, or create, delete, match, rename, regroup, or reassign channels, streams, or EPG data.
-- Event channels should be excluded from the ordinary hourly Stream Sort schedule after the monitor becomes responsible for them, preventing expected event inactivity from distorting general dead-stream statistics.
+- Teamarr-managed event channels may remain in Stream Sort's Analyze Only scope so Teamarr can consume current probe evidence without Stream Sort changing their order. A future monitor may replace hourly checks with event-aware requests when the retained evidence justifies that change.
 
 ### Proposed workflow
 
 - Allow operators to define event-channel scope through explicit channels or groups; use EPG scheduling as the primary timing signal and optional name patterns only as a configurable fallback or discovery aid.
-- Monitor upcoming events and submit a scoped Stream Sort analyze-and-sort request early enough to complete initial probes and immediate retries before the broadcast starts.
+- Monitor upcoming events and submit a scoped Stream Sort analysis request early enough to complete initial probes and immediate retries before the broadcast starts; request sorting only for channels whose ordering is not externally owned.
 - Submit channel IDs through Stream Sort's supported external contract without changing Stream Sort's saved UI filters or schedule.
 - Default supplemental scheduled work to serial checks unless later evidence supports parallel execution.
 - Leave the latest Stream Sort result cached between events; the next pre-event request establishes fresh health and order without teaching Stream Sort an event-specific health state.

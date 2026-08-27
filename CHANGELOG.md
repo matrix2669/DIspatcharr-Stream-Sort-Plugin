@@ -1,5 +1,17 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- Add one channel-scope type selector with separate Analyze & Sort and Analyze Only filters.
+- Add case-insensitive `*` and `?` wildcard matching for channel group or profile names while keeping ID matching exact.
+
+### Changed
+
+- Analyze the union of both scope lists while always excluding Analyze Only matches from Stream Sort ordering, including scheduled Analyze + Sort runs.
+- Ignore removed group/profile scope settings immediately; empty new scope lists use the all-channel default.
+
 ## 0.3.6-beta.12 - 2026-08-26
 
 ### Added

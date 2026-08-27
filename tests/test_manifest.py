@@ -40,6 +40,16 @@ def test_plugin_manifest_is_valid_and_matches_version():
         "stream_switch",
     }
     field_ids = {field["id"] for field in manifest["fields"]}
+    assert "channel_filter_type" in field_ids
+    assert "analyze_sort_filter" in field_ids
+    assert "analyze_only_filter" in field_ids
+    assert "channel_group_filter" not in field_ids
+    assert "channel_profile_filter" not in field_ids
+    filter_type = next(field for field in manifest["fields"] if field["id"] == "channel_filter_type")
+    assert {option["value"] for option in filter_type["options"]} == {
+        "channel_group",
+        "channel_profile",
+    }
     assert "analysis_max_streams" not in field_ids
     assert "analysis_max_streams" not in (root / "stream_sorter" / "incremental.py").read_text()
     assert "stream_data_ttl_hours" in field_ids
