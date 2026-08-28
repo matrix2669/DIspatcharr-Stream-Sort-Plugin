@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.3.6-beta.14 - 2026-08-27
+
 ### Added
 
 - Accept comma-separated stream-name shorthand and regex rules while retaining newline compatibility and regex-internal commas.
