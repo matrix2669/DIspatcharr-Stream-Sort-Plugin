@@ -21,9 +21,9 @@ Before deleting a branch, record user-visible results in `CHANGELOG.md` and dura
 - Type: short-lived feature branch
 - Status: local implementation and validation only; push, merge, tag, publication, and deployment are not authorized
 - Base and target: `dev`
-- Purpose: display bounded M3U source score selectors from `+5` down to `-5` without changing defaults, saved values, or scoring
-- Scope: selector option order, focused regression coverage, changelog, and this branch record
-- Exclusions: source-score migration, score calculation, defaults, registry metadata, deployment, and unrelated issue #7 behavior
+- Purpose: prepare the next beta revision with descending M3U selectors, concise schedule actions, evidence-aware TTL recommendations, and validated live defaults
+- Scope: selector presentation, new-install defaults, channel-scope guidance, recommendation evidence reporting, focused regression coverage, documentation, and this branch record
+- Exclusions: source-score migration, score calculation, registry metadata, deployment, and persistent problematic-stream notification implementation
 - Completion: validate locally and retain this branch without publishing until the user authorizes the next beta revision
 
 ### `feature/issue-7-settings-controls`

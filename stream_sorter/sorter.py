@@ -295,10 +295,10 @@ def _settings(settings: Mapping[str, Any]) -> dict[str, Any]:
         "source_rules": parse_source_rules(settings.get("source_scores", "")),
         "name_rules": parse_name_rules(settings.get("name_score_rules", "")),
         "healthy_throughput_ttl_hours": max(
-            0.0, _as_float(settings.get("healthy_throughput_ttl_hours"), 24.0)
+            0.0, _as_float(settings.get("healthy_throughput_ttl_hours"), 48.0)
         ),
         "degraded_throughput_ttl_hours": max(
-            0.0, _as_float(settings.get("degraded_throughput_ttl_hours"), 12.0)
+            0.0, _as_float(settings.get("degraded_throughput_ttl_hours"), 24.0)
         ),
         "unknown_throughput_ttl_hours": max(
             0.0, _as_float(settings.get("unknown_throughput_ttl_hours"), 4.0)
@@ -515,7 +515,7 @@ def probe_assigned_streams(
     from apps.channels.models import ChannelStream
 
     channel_ids, filter_summary = resolve_channel_scope(settings)
-    duration = max(1.0, _as_float(settings.get("probe_duration_seconds"), 8.0))
+    duration = max(1.0, _as_float(settings.get("probe_duration_seconds"), 6.0))
     timeout = max(duration + 2.0, _as_float(settings.get("probe_timeout_seconds"), 10.0))
     rate_per_minute = max(1, _as_int(settings.get("probe_rate_per_minute"), 6))
     per_account_delay = max(0.0, _as_float(settings.get("probe_per_account_delay_seconds"), 1.0))

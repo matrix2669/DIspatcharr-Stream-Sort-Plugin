@@ -57,6 +57,35 @@ def test_plugin_manifest_is_valid_and_matches_version():
     }
     field_ids = {field["id"] for field in manifest["fields"]}
     assert "source_scores" not in field_ids
+    fields_by_id = {field["id"]: field for field in manifest["fields"]}
+    assert fields_by_id["analyze_sort_filter"]["default"] == ""
+    assert fields_by_id["analyze_only_filter"]["default"] == ""
+    assert "Leave empty to include all channels" in fields_by_id["analyze_sort_filter"]["help_text"]
+    assert "Leave both filters empty" in fields_by_id["analyze_only_filter"]["help_text"]
+    assert fields_by_id["analysis_duration_seconds"]["default"] == 5
+    assert fields_by_id["content_sample_seconds"]["default"] == 6
+    assert fields_by_id["probe_duration_seconds"]["default"] == 6
+    assert fields_by_id["analysis_connection_timeout_seconds"]["default"] == 10
+    assert fields_by_id["analysis_probe_timeout_seconds"]["default"] == 20
+    assert fields_by_id["content_ffmpeg_timeout_seconds"]["default"] == 20
+    assert fields_by_id["probe_timeout_seconds"]["default"] == 10
+    assert fields_by_id["stream_data_ttl_hours"]["default"] == 18
+    assert fields_by_id["content_validation_ttl_hours"]["default"] == 168
+    assert fields_by_id["healthy_throughput_ttl_hours"]["default"] == 48
+    assert fields_by_id["degraded_throughput_ttl_hours"]["default"] == 24
+    assert fields_by_id["unknown_throughput_ttl_hours"]["default"] == 4
+    assert fields_by_id["analysis_ttl_jitter_percent"]["default"] == 30
+    assert fields_by_id["dead_content_ttl_hours"]["default"] == 1
+    assert fields_by_id["playback_health_reuse"]["default"] is True
+    assert fields_by_id["playback_health_clean_min_seconds"]["default"] == 60
+    assert fields_by_id["playback_health_min_seconds"]["default"] == 300
+    assert fields_by_id["reliability_scoring_enabled"]["default"] is True
+    assert fields_by_id["stream_sort_schedule_cron"]["default"] == "18 * * * *"
+    assert fields_by_id["stream_sort_apply_sort_after_scheduled_scan"]["default"] is True
+    assert fields_by_id["stream_sort_allow_parallel_checks_on_scheduled_scan"]["default"] is False
+    actions_by_id = {action["id"]: action for action in manifest["actions"]}
+    assert actions_by_id["apply_schedule"]["description"] == "Enable or refresh the cron schedule."
+    assert actions_by_id["schedule_status"]["description"] == "Show schedule configuration and the status of the latest scheduled run."
     assert [field["id"] for field in manifest["fields"]] == [
         "scoring_info",
         "filter_info",
@@ -136,8 +165,8 @@ def test_plugin_manifest_is_valid_and_matches_version():
     assert "playback_health_ttl_hours" not in field_ids
     assert "content_validation_ttl_hours" in field_ids
     assert "healthy_throughput_ttl_hours" in field_ids
-    assert next(field for field in manifest["fields"] if field["id"] == "healthy_throughput_ttl_hours")["default"] == 24
-    assert next(field for field in manifest["fields"] if field["id"] == "degraded_throughput_ttl_hours")["default"] == 12
+    assert next(field for field in manifest["fields"] if field["id"] == "healthy_throughput_ttl_hours")["default"] == 48
+    assert next(field for field in manifest["fields"] if field["id"] == "degraded_throughput_ttl_hours")["default"] == 24
     assert next(field for field in manifest["fields"] if field["id"] == "unknown_throughput_ttl_hours")["default"] == 4
     assert "reset_statistics_include_history" not in field_ids
     assert "probe_per_account_delay_seconds" in field_ids

@@ -745,7 +745,7 @@ Issue #7 identified that the settings page mixed execution, detector, TTL, and s
 ## Consequences and review triggers
 
 - Provider preference remains useful as a close-result tie influence but cannot override dead health or a lower resolution tier.
-- Existing dynamic scores outside the selector range intentionally migrate to a bounded value; unchanged legacy free-form source rules remain available until dynamic selectors are saved.
+- Existing dynamic scores outside the selector range intentionally migrate to a bounded value. A pre-existing internal `source_scores` value may be consumed only during upgrade compatibility until a discovered dynamic selector is saved; it is never exposed as a manual fallback field and cannot bypass required M3U source discovery.
 - Regex rules containing an ambiguous top-level comma immediately followed by text shaped like another rule must escape that comma or group the expression.
 - Revisit the M3U range only after sort reports show that a ten-point maximum provider spread is too weak or too strong relative to measured quality and reliability evidence.
 
@@ -753,3 +753,44 @@ Issue #7 identified that the settings page mixed execution, detector, TTL, and s
 
 - GitHub issue #7 and owner comment `issuecomment-5447118913`, reviewed on 2026-08-27.
 - Operator confirmation that all implementation instructions were captured in that issue comment.
+
+---
+
+# ADR-021: Align next-beta defaults and make recommendation evidence explicit
+
+## Status
+
+Accepted
+
+## Date
+
+2026-08-27
+
+## Context
+
+The validated live configuration has matured beyond several older manifest and headless fallback defaults. Operators also need concise schedule actions, an unambiguous all-channel default, and enough evidence context to judge whether read-only TTL recommendations are mature. Persistent problematic-stream notifications require a separate evidence review rather than being coupled to this settings revision.
+
+## Decision
+
+- Display M3U source score choices from `+5` down to `-5`. Keep every new source neutral at `0`; option order does not change saved values or scoring.
+- Use the validated live operating values as new-install and missing-setting defaults: FFprobe/content/throughput samples of `5/6/6` seconds; connection/direct/content/throughput timeouts of `10/20/20/10` seconds; three provisional retries; one-second per-source analysis and throughput delays; FFprobe/content TTLs of `18/168` hours; healthy/degraded/unknown throughput TTLs of `48/24/4` hours; `30%` non-dead jitter; and a one-hour exact base dead TTL.
+- Keep playback evidence reuse and runtime reliability scoring enabled by default. Keep minimum clean playback at `60` seconds for content and `300` seconds for throughput.
+- Default the scheduled analysis to `18 * * * *`, preserving the established 18-minute offset while running hourly. Apply sorting after scheduled analysis by default and keep scheduled parallel checks disabled.
+- Keep Analyze & Sort and Analyze Only filters empty by default. An empty Analyze & Sort filter includes all channels except explicit Analyze Only matches; leaving both filters empty analyzes and sorts all channels.
+- Shorten Save Schedule to `Enable or refresh the cron schedule.` and Check Schedule to `Show schedule configuration and the status of the latest scheduled run.` This changes presentation only.
+- Include completed observation count, selected stream count, history span, status changes, dead recoveries, completed alive episodes, and confidence in the Recommend TTLs result. Recommend more logging before changing TTLs whenever existing confidence remains low: less than 72 hours of history, fewer than five dead recoveries, or fewer than five completed alive episodes.
+- Keep recommendations read-only. Existing installations retain explicitly saved settings; these defaults apply to new installations and settings that are absent.
+- Defer persistent problematic-stream notifications to GitHub issue #22. Review at least seven days of completed-scan history before approving final repeated-result thresholds; retries do not count as separate results, placeholders are excluded, and event-only behavior must be reviewed before implementation.
+
+## Consequences and review triggers
+
+- UI, analyzer, sorting, incremental analysis, recommendation, and schedule fallbacks use the same defaults.
+- Existing scheduled cron expressions and saved timing values are not overwritten by an upgrade.
+- Medium and high recommendation confidence continue to use one authoritative evidence policy rather than a separate UI-only threshold.
+- Revisit defaults after additional scan/runtime evidence shows they materially increase stale data, provider checks, or scheduled runtime.
+- Do not implement or publish issue #22 until its seven-day evidence review establishes notification qualification and recovery behavior.
+
+## Provenance
+
+- Operator direction on 2026-08-27 to align new-install defaults with the validated live configuration and make recommendation evidence visible.
+- GitHub issue #22 for the separate persistent problematic-stream notification proposal.

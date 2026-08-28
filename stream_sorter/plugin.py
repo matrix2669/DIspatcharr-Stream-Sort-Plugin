@@ -670,10 +670,10 @@ def _recommend_ttls(settings: dict, *, report: dict) -> dict:
     hourly = status_patterns.get("hourly_dead_ratio") if isinstance(status_patterns.get("hourly_dead_ratio"), list) else []
     reasons = report.get("reasons") if isinstance(report.get("reasons"), Mapping) else {}
 
-    health_current = _safe_float(settings.get("stream_data_ttl_hours"), 12.0)
+    health_current = _safe_float(settings.get("stream_data_ttl_hours"), 18.0)
     dead_current = _safe_float(settings.get("dead_content_ttl_hours"), 1.0)
-    healthy_throughput_current = _safe_float(settings.get("healthy_throughput_ttl_hours"), 24.0)
-    degraded_throughput_current = _safe_float(settings.get("degraded_throughput_ttl_hours"), 12.0)
+    healthy_throughput_current = _safe_float(settings.get("healthy_throughput_ttl_hours"), 48.0)
+    degraded_throughput_current = _safe_float(settings.get("degraded_throughput_ttl_hours"), 24.0)
     unknown_throughput_current = _safe_float(settings.get("unknown_throughput_ttl_hours"), 4.0)
     jitter_current = _safe_float(settings.get("analysis_ttl_jitter_percent"), 30.0)
 
@@ -730,7 +730,7 @@ def _recommend_ttls(settings: dict, *, report: dict) -> dict:
         notes.append("Fewer than five completed alive episodes were observed; the reachability TTL recommendation is provisional.")
     if history_span_hours < 72:
         notes.append("Collect at least 72 hours of history before treating TTL recommendations as stable.")
-    notes.append("Throughput TTL recommendations are omitted until sufficient status-duration evidence has been collected; 24h/12h/4h remain provisional trial defaults.")
+    notes.append("Throughput TTL recommendations are omitted until sufficient status-duration evidence has been collected; 48h/24h/4h remain provisional trial defaults.")
 
     confidence = "low"
     if history_span_hours >= 336 and recovery_samples >= 20 and alive_episode_samples >= 20:
@@ -760,8 +760,8 @@ def _recommend_ttls(settings: dict, *, report: dict) -> dict:
         },
         "recommended_ttls": recommendations,
         "throughput_trial_defaults": {
-            "healthy_throughput_ttl_hours": 24.0,
-            "degraded_throughput_ttl_hours": 12.0,
+            "healthy_throughput_ttl_hours": 48.0,
+            "degraded_throughput_ttl_hours": 24.0,
             "unknown_throughput_ttl_hours": 4.0,
             "recommendation_status": "insufficient_evidence",
         },
@@ -776,6 +776,21 @@ def _recommend_ttls(settings: dict, *, report: dict) -> dict:
             "check_concentration": concentration,
             "media_reasons": reasons.get("media_due") or {},
             "max_dead_ratio_by_hour": round(max_dead_ratio_by_hour, 4),
+        },
+        "evidence_summary": {
+            "selected_streams": selected_streams,
+            "history_rows": history_rows,
+            "history_span_hours": round(history_span_hours, 2),
+            "history_span_days": round(history_span_hours / 24.0, 2),
+            "status_changes": int(observations.get("status_changes") or 0),
+            "dead_recovery_samples": recovery_samples,
+            "alive_episode_samples": alive_episode_samples,
+            "more_logging_recommended": confidence == "low",
+            "medium_confidence_requirements": {
+                "history_span_hours": 72,
+                "dead_recovery_samples": 5,
+                "alive_episode_samples": 5,
+            },
         },
         "recommendation_notes": notes,
         "recommendation_file": TTL_RECOMMENDATION_PATH,
@@ -816,12 +831,20 @@ def _run_ttl_recommendation_action(settings: dict) -> dict:
 
     current = result["current_ttls"]
     recommended = result["recommended_ttls"]
+    evidence = result["evidence_summary"]
     message = (
         f"TTL recommendation complete. FFprobe TTL: {_format_hours(current['stream_data_ttl_hours'])}h"
         f" -> {_format_hours(recommended['stream_data_ttl_hours'])}h; Dead TTL: "
         f"{_format_hours(current['dead_content_ttl_hours'])}h -> {_format_hours(recommended['dead_content_ttl_hours'])}h;"
-        f" suggested TTL jitter: {recommended['analysis_ttl_jitter_percent']}%."
+        f" suggested TTL jitter: {recommended['analysis_ttl_jitter_percent']}%. Evidence: "
+        f"{evidence['history_rows']} completed observations across {evidence['selected_streams']} streams "
+        f"over {evidence['history_span_hours']}h ({evidence['history_span_days']} days), including "
+        f"{evidence['status_changes']} status changes, {evidence['dead_recovery_samples']} dead recoveries, "
+        f"and {evidence['alive_episode_samples']} completed alive episodes. "
+        f"Confidence: {result['confidence']}."
     )
+    if evidence["more_logging_recommended"]:
+        message += " More logging is recommended before changing TTL settings."
 
     return {
         "status": "ok",
@@ -904,7 +927,7 @@ def _finish_schedule_job(generation: int | None, job_id: str, *, status: str, me
 
 
 def _apply_schedule_action(settings: dict) -> dict:
-    cron_expr = str(settings.get("stream_sort_schedule_cron") or "").strip()
+    cron_expr = str(settings.get("stream_sort_schedule_cron") or "18 * * * *").strip()
     if cron_expr:
         _parse_cron_expression(cron_expr)
         message = (

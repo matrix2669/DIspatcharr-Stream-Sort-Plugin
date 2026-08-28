@@ -84,6 +84,19 @@ def test_scheduled_scan_forces_single_worker_when_parallel_disabled(tmp_path, mo
     assert captured["schedule_generation"] == 7
 
 
+def test_apply_schedule_action_uses_hourly_default_when_cron_is_missing(tmp_path, monkeypatch):
+    monkeypatch.setattr(plugin, "SCHEDULE_STATE_PATH", str(tmp_path / "schedule.json"))
+    monkeypatch.setattr(plugin, "SCHEDULE_STATE_LOCK_PATH", str(tmp_path / "schedule.lock"))
+
+    result = plugin._apply_schedule_action({})
+
+    assert result["status"] == "ok"
+    state = plugin._load_schedule_state()
+    assert state["cron"] == "18 * * * *"
+    assert state["apply_sort_after_analysis"] is True
+    assert state["allow_parallel_checks"] is False
+
+
 def test_check_schedule_tick_only_runs_once_per_minute_when_due(tmp_path, monkeypatch):
     monkeypatch.setattr(plugin, "SCHEDULE_STATE_PATH", str(tmp_path / "schedule.json"))
     monkeypatch.setattr(plugin, "SCHEDULE_STATE_LOCK_PATH", str(tmp_path / "schedule.lock"))

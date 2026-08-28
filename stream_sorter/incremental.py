@@ -1924,7 +1924,7 @@ def analyze_assigned_streams(
     workers = max(1, min(16, analyzer._as_int(settings.get("analysis_workers"), 2)))
     retries = max(0, min(5, analyzer._as_int(settings.get("analysis_retries"), 3)))
     account_delay = max(0.0, analyzer._as_float(settings.get("analysis_per_account_delay_seconds"), 1.0))
-    ffprobe_ttl_hours = max(0.0, analyzer._as_float(settings.get("stream_data_ttl_hours"), 12.0))
+    ffprobe_ttl_hours = max(0.0, analyzer._as_float(settings.get("stream_data_ttl_hours"), 18.0))
     metadata_ttl_hours = ffprobe_ttl_hours
     health_ttl_hours = ffprobe_ttl_hours
     dead_ttl_hours = max(0.0, analyzer._as_float(settings.get("dead_content_ttl_hours"), 1.0))
@@ -1939,11 +1939,11 @@ def analyze_assigned_streams(
     playback_health_reuse = analyzer._as_bool(settings.get("playback_health_reuse"), True)
     playback_health_min_seconds = max(60.0, analyzer._as_float(settings.get("playback_health_min_seconds"), 300.0))
     playback_health_clean_min_seconds = max(30.0, analyzer._as_float(settings.get("playback_health_clean_min_seconds"), 60.0))
-    throughput_ttl_hours = max(0.0, analyzer._as_float(settings.get("healthy_throughput_ttl_hours"), 24.0))
-    degraded_throughput_ttl_hours = max(0.0, analyzer._as_float(settings.get("degraded_throughput_ttl_hours"), 12.0))
+    throughput_ttl_hours = max(0.0, analyzer._as_float(settings.get("healthy_throughput_ttl_hours"), 48.0))
+    degraded_throughput_ttl_hours = max(0.0, analyzer._as_float(settings.get("degraded_throughput_ttl_hours"), 24.0))
     unknown_throughput_ttl_hours = max(0.0, analyzer._as_float(settings.get("unknown_throughput_ttl_hours"), 4.0))
     analysis_ttl_jitter_percent = max(0.0, min(100.0, analyzer._as_float(settings.get("analysis_ttl_jitter_percent"), 30.0)))
-    throughput_duration = max(1.0, analyzer._as_float(settings.get("probe_duration_seconds"), 8.0))
+    throughput_duration = max(1.0, analyzer._as_float(settings.get("probe_duration_seconds"), 6.0))
     throughput_timeout = max(throughput_duration + 2.0, analyzer._as_float(settings.get("probe_timeout_seconds"), 10.0))
     throughput_account_delay = max(0.0, analyzer._as_float(settings.get("probe_per_account_delay_seconds"), 1.0))
 

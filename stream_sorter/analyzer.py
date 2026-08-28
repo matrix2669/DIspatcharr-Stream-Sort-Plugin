@@ -689,7 +689,7 @@ def probe_assigned_streams(settings: Mapping[str, Any], *, logger, cache_path: s
     from .throughput import DEFAULT_CACHE_PATH
     cache_path = cache_path or DEFAULT_CACHE_PATH
     channel_ids, filter_summary = resolve_channel_scope(settings)
-    duration = max(1.0, _as_float(settings.get('probe_duration_seconds'), 8.0))
+    duration = max(1.0, _as_float(settings.get('probe_duration_seconds'), 6.0))
     timeout = max(duration + 2.0, _as_float(settings.get('probe_timeout_seconds'), 10.0))
     rate_per_minute = max(1, _as_int(settings.get('probe_rate_per_minute'), 6))
     per_account_delay = max(0.0, _as_float(settings.get('probe_per_account_delay_seconds'), 1.0))

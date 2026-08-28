@@ -111,17 +111,17 @@ The settings page is ordered by workflow. Inline help is intentionally brief; th
 | Placeholder / black / frozen / silent detection | enabled | Content-health detectors; silent detection applies only when audio exists. |
 | Content sample / FFmpeg timeout | 6 / 20 seconds | One decode sample shared by enabled black, frozen, and silent detectors. |
 | Black / frozen / silent thresholds | 3 seconds / 4 seconds / -70 dBFS | Minimum continuous detector evidence. |
-| Throughput sample / timeout | 8 / 10 seconds | Wall-clock stream-copy measurement and process timeout. Combined checks reuse this capture for content. |
+| Throughput sample / timeout | 6 / 10 seconds | Wall-clock stream-copy measurement and process timeout. Combined checks reuse this capture for content. |
 | Retries | 3 | Immediate in-scan confirmation after the initial provisional failure. |
 | Analysis / throughput source delays | 1 / 1 seconds | Minimum spacing between starts against the same M3U provider. |
-| FFprobe / content TTL | 12 / 168 hours | Independent freshness clocks; only direct FFprobe resets FFprobe TTL, while qualified playback can satisfy content. |
-| Healthy / degraded / unknown throughput TTL | 24 / 12 / 4 hours | Status-specific delivery evidence reuse. |
+| FFprobe / content TTL | 18 / 168 hours | Independent freshness clocks; only direct FFprobe resets FFprobe TTL, while qualified playback can satisfy content. |
+| Healthy / degraded / unknown throughput TTL | 48 / 24 / 4 hours | Status-specific delivery evidence reuse. |
 | TTL jitter | 30% | Stable per-stream spread for non-dead TTLs; dead TTL is exact. |
 | Dead stream TTL | 1 hour | Exact base recovery interval after retries confirm dead health; adaptive multipliers apply to repeated non-placeholder failures. |
 | Reuse playback / content minimum / throughput minimum | enabled / 60 / 300 seconds | Reuses attributable clean Dispatcharr playback without resetting direct FFprobe. |
 | Runtime reliability scoring | enabled | Mature runtime evidence contributes a bounded -20 through +20 soft score inside hard tiers. |
 | Parallel tests | 2 | Maximum concurrent checks, capped at 16 and constrained by active-viewer provider capacity. |
-| Scheduled analyze cron | empty | Standard five-field UTC cron. Empty means no configured schedule. |
+| Scheduled analyze cron | `18 * * * *` | Runs hourly at 18 minutes past the hour using standard five-field UTC cron. |
 | Apply sort after scheduled analysis | enabled | Runs sorting after the scheduled analysis scope. |
 | Allow parallel scheduled checks | disabled | Disabled uses one worker; enabled uses Parallel tests. |
 
@@ -159,7 +159,7 @@ Throughput is delivery capacity, not the stream's encoded video bitrate.
 - Insufficient: < 1.10x nominal: **-30**
 - Unknown: **0**
 
-Healthy, degraded, and unknown throughput results use independent jittered TTLs of 24, 12, and 4 hours by default, preventing hourly schedules from repeatedly probing the same degraded stream.
+Healthy, degraded, and unknown throughput results use independent jittered TTLs of 48, 24, and 4 hours by default, preventing hourly schedules from repeatedly probing the same degraded stream.
 
 The **Parallel tests** setting controls both media checks and integrated throughput probes (maximum 16). When the worker count is less than or equal to the number of M3U sources with pending work, every active worker uses a different source. Additional workers are distributed round-robin across sources, and capacity is reassigned when a source runs out of pending streams. The per-source start delay still applies, but different M3U sources can start throughput probes at the same time.
 

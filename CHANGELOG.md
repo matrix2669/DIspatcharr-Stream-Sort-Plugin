@@ -5,6 +5,8 @@
 ### Changed
 
 - Display M3U source score selectors from `+5` down through `-5` while keeping `0` neutral and preserving scoring values.
+- Match new-install timing, TTL, jitter, timeout, hourly schedule, and runtime-reliability defaults to the validated live operating configuration.
+- Show recommendation evidence volume and a low-confidence logging warning, shorten schedule action descriptions, and clarify empty channel-scope defaults.
 
 ## 0.3.6-beta.14 - 2026-08-27
 
