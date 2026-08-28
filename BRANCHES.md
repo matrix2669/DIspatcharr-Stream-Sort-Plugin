@@ -70,12 +70,12 @@ Before cleanup, the legacy `dev-test`, checkpoint, and duplicate `noop-check` br
 ### `release/v0.3.6`
 
 - Type: short-lived stable release branch
-- Status: active; stable tag, GitHub Release, registry publication, and managed installation pending
+- Status: published through source `dev` and `main`, immutable tag `v0.3.6`, normal GitHub Release, both registry channels, and managed stable installation
 - Base: `dev` at `e795ecebb4c531b4b801476f43c708dc21c34dee` after beta.15 source, public archive, registry, workflow, and managed-install validation passed
 - Targets: source `dev` and `main`, then focused registry `dev` and `main` publication
 - Purpose: promote the approved beta.15 behavior without functional changes as stable Dispatcharr Stream Sort `0.3.6`
 - Scope: synchronized stable version metadata, cumulative release notes, branch evidence, immutable tag, GitHub Release, focused registry metadata, and managed stable installation
 - Exclusions: no new runtime behavior, setting changes, dependency changes, unrelated plugin metadata, or Dispatcharr core changes
-- Validation: repeat all 159 source tests, compilation, manifest parsing, workspace standards reconciliation, project validation, exact public archive validation, release publication checks, both registry channel gates, and managed installation
-- Completion: publish immutable `v0.3.6`, create the normal GitHub Release, advertise the exact artifact through focused `dev` and `main` registry changes, install it through the stable managed repository, and reconcile final evidence
+- Validation: 159 source tests on the release tree and public archive, Python compilation, manifest parsing, standards reconciliation, project validation, byte-verified manual ZIP and checksum, registry workflows `33138596704` and `33138696338`, public raw manifests, and managed installations pass
+- Completion: tag `v0.3.6` remains pinned to `bbae86f2ded0a1bcd09d2906e0530e70380ce5a4`; source `main` promotion is `d16af98828fa8428cccea73e7dda672f7998fe24`; GitHub Release, `dev` and `main` registry publication, and stable repository 3 deployment are complete
 - Started: `2026-08-27`
