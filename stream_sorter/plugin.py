@@ -425,7 +425,7 @@ class _ProgressLogger:
 
 
 def _build_m3u_source_score_fields(accounts):
-    """Return one neutral numeric score field per operator-managed M3U account."""
+    """Return one bounded score selector per operator-managed M3U account."""
     rows = [dict(account) for account in accounts]
     rows = sorted(
         (row for row in rows if not bool(row.get("locked", False))),
@@ -443,12 +443,16 @@ def _build_m3u_source_score_fields(accounts):
             {
                 "id": f"{M3U_SOURCE_SCORE_PREFIX}{account_id}",
                 "label": name if active else f"{name} (inactive)",
-                "type": "number",
+                "type": "select",
                 "default": 0,
-                "help_text": (
-                    f"M3U source ID {account_id}. Positive values promote this source, "
-                    "negative values demote it, and 0 is neutral."
-                ),
+                "options": [
+                    {
+                        "value": score,
+                        "label": f"{score:+d}" if score else "0 (neutral)",
+                    }
+                    for score in range(-5, 6)
+                ],
+                "help_text": f"M3U source ID {account_id}.",
             }
         )
     return fields
@@ -473,8 +477,12 @@ def _settings_with_dynamic_source_scores(settings, *, allowed_account_ids=None):
         if allowed_ids is not None and account_id_int not in allowed_ids:
             continue
         try:
-            score = float(value)
-        except (TypeError, ValueError) as exc:
+            raw_score = float(value)
+            if raw_score != raw_score or raw_score in {float("inf"), float("-inf")}:
+                raise ValueError
+            score = max(-5, min(5, int(round(raw_score))))
+            normalized[key] = score
+        except (TypeError, ValueError, OverflowError) as exc:
             raise ValueError(
                 f"Invalid score for M3U source ID {account_id}: {value!r}"
             ) from exc
@@ -1479,13 +1487,12 @@ class Plugin:
 
     def __init__(self):
         # Dispatcharr loads fields from the live Plugin instance for enabled
-        # plugins. Replace the legacy free-form source_scores textarea with one
-        # numeric input per current M3U account while retaining the old setting
-        # internally for migration compatibility.
+        # plugins. Insert one bounded selector per current operator-managed M3U
+        # account immediately before the stream-name scoring controls.
         instance_fields = [dict(field) for field in type(self).fields]
         self._m3u_source_score_account_ids = None
         source_index = next(
-            (index for index, field in enumerate(instance_fields) if field.get("id") == "source_scores"),
+            (index for index, field in enumerate(instance_fields) if field.get("id") == "name_score_rules"),
             None,
         )
         if source_index is not None:
@@ -1506,8 +1513,7 @@ class Plugin:
                         "label": "M3U source scores",
                         "type": "info",
                         "description": (
-                            "All configured M3U sources are listed below. Every source starts at 0 (neutral). "
-                            "Use positive values to promote a source and negative values to demote it."
+                            "Choose -5 to demote, 0 for neutral, or +5 to promote each source."
                         ),
                     }
                 ]
@@ -1526,11 +1532,10 @@ class Plugin:
                 self.fields = (
                     instance_fields[:source_index]
                     + replacement
-                    + instance_fields[source_index + 1:]
+                    + instance_fields[source_index:]
                 )
             except Exception as exc:
-                LOGGER.warning("Unable to build dynamic M3U source score fields: %s", exc)
-                self.fields = instance_fields
+                raise RuntimeError("Unable to discover Dispatcharr M3U sources") from exc
         else:
             self.fields = instance_fields
         _start_scheduler()

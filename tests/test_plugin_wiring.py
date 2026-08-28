@@ -20,7 +20,8 @@ def test_plugin_uses_incremental_analyzer_directly():
 
 def test_manual_runtime_collector_action_is_an_explicit_noop(monkeypatch):
     monkeypatch.setattr(plugin, "_start_scheduler", lambda: None)
-    instance = plugin.Plugin()
+    instance = plugin.Plugin.__new__(plugin.Plugin)
+    instance._m3u_source_score_account_ids = set()
     result = instance.run("record_runtime_event", {}, {"settings": {}})
     assert result["recorded"] is False
     assert result["counted"] is False

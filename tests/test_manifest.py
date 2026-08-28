@@ -26,6 +26,22 @@ def test_plugin_manifest_is_valid_and_matches_version():
         "analyze_and_sort",
         "record_runtime_event",
     }
+    assert [action["id"] for action in manifest["actions"]] == [
+        "analyze_streams",
+        "sort_streams",
+        "analyze_and_sort",
+        "check_analysis_status",
+        "stop_analysis",
+        "dry_run",
+        "apply_schedule",
+        "remove_schedule",
+        "schedule_status",
+        "health_report",
+        "recommend_ttls",
+        "reset_scan_statistics",
+        "reset_all_statistics",
+        "record_runtime_event",
+    ]
     reliability_action = next(a for a in manifest["actions"] if a["id"] == "record_runtime_event")
     assert reliability_action["label"] == "Runtime Reliability (automatic)"
     assert reliability_action["button_label"] == "Automatic only"
@@ -40,6 +56,59 @@ def test_plugin_manifest_is_valid_and_matches_version():
         "stream_switch",
     }
     field_ids = {field["id"] for field in manifest["fields"]}
+    assert "source_scores" not in field_ids
+    assert [field["id"] for field in manifest["fields"]] == [
+        "scoring_info",
+        "filter_info",
+        "channel_filter_type",
+        "analyze_sort_filter",
+        "analyze_only_filter",
+        "name_score_rules",
+        "analysis_info",
+        "analysis_ffprobe_path",
+        "analysis_ffmpeg_path",
+        "analysis_duration_seconds",
+        "analysis_connection_timeout_seconds",
+        "analysis_probe_timeout_seconds",
+        "media_bitrate_change_settings",
+        "media_bitrate_relative_tolerance_percent",
+        "minimum_video_bitrate_kbps",
+        "placeholder_file_detection",
+        "content_sample_seconds",
+        "content_ffmpeg_timeout_seconds",
+        "black_screen_detection",
+        "black_screen_min_seconds",
+        "frozen_video_detection",
+        "frozen_video_min_seconds",
+        "silent_audio_detection",
+        "silent_audio_max_db",
+        "throughput_info",
+        "probe_duration_seconds",
+        "probe_timeout_seconds",
+        "analysis_retries",
+        "analysis_per_account_delay_seconds",
+        "probe_per_account_delay_seconds",
+        "stream_data_ttl_hours",
+        "content_validation_ttl_hours",
+        "healthy_throughput_ttl_hours",
+        "degraded_throughput_ttl_hours",
+        "unknown_throughput_ttl_hours",
+        "analysis_ttl_jitter_percent",
+        "dead_content_ttl_hours",
+        "playback_health_reuse",
+        "playback_health_clean_min_seconds",
+        "playback_health_min_seconds",
+        "reliability_info",
+        "reliability_scoring_enabled",
+        "analysis_workers",
+        "stream_sort_schedule_cron",
+        "stream_sort_apply_sort_after_scheduled_scan",
+        "stream_sort_allow_parallel_checks_on_scheduled_scan",
+    ]
+    assert "paths_info" not in field_ids
+    name_rules = next(field for field in manifest["fields"] if field["id"] == "name_score_rules")
+    assert "," in name_rules["default"]
+    assert "\n" not in name_rules["default"]
     assert "channel_filter_type" in field_ids
     assert "analyze_sort_filter" in field_ids
     assert "analyze_only_filter" in field_ids

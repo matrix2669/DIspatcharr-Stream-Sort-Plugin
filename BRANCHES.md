@@ -10,10 +10,22 @@ Before deleting a branch, record user-visible results in `CHANGELOG.md` and dura
 |---|---|---|---|---|---|
 | `main` | long-lived | active | historical repository root | approved stable releases | Reserved stable-release branch; Stream Sort is not yet published in the stable registry. |
 | `dev` | long-lived | active | `main` | `main` | Integrates and validates the next beta and stable release. |
+| `feature/issue-7-settings-controls` | short-lived | active | `dev` | `dev` | Simplify settings/action layout, bound M3U scores, and add comma-separated name rules. |
 | `fix/v0.3.6-beta.6-analysis-control` | short-lived | active | `dev` | `dev` | Prevent overlapping analysis entry points, add safe cancellation, and publish immutable beta.6. |
 | `fix/v0.3.6-beta.10-telemetry-integrity` | short-lived | active | `dev` | `dev` | Preserve scan-boundary health transitions and distinguish attempted throughput probes from completed measurements. |
 
 ## Branch Records
+
+### `feature/issue-7-settings-controls`
+
+- Type: short-lived feature branch
+- Status: active
+- Base: `dev` at `0d83cdb80f882223bceb67ec1afd09d348a4d084`
+- Target: `dev`
+- Purpose: implement GitHub issue #7 without changing established hard scoring precedence
+- Scope: settings/action presentation, dynamic M3U score controls and migration, stream-name rule parsing, focused tests, user documentation, changelog, decision record, and this ledger
+- Exclusions: analyzer probing, TTL calculations, provider capacity, channel scope semantics, stable `main`, registry publication, version bump, deployment, and unrelated issues
+- Completion: focused and full tests, Python compilation, workspace validation, complete contradiction review, remote checkpoint, then separate approval for integration or beta publication
 
 ### `main`
 

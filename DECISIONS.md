@@ -716,3 +716,40 @@ The split keeps Stream Sort's standard analyze-and-sort responsibility intact wh
 
 - Operator requirement on 2026-08-27 to analyze Teamarr-managed event channels without allowing Stream Sort to reorder them.
 - Existing ADR-016 boundary that keeps event interpretation and scheduling outside Stream Sort.
+
+---
+
+# ADR-020: Simplify settings without changing hard scoring precedence
+
+## Status
+
+Accepted
+
+## Date
+
+2026-08-27
+
+## Context
+
+Issue #7 identified that the settings page mixed execution, detector, TTL, and scheduling controls; exposed unconstrained M3U numeric inputs; required newline-only name rules; and carried operational file details better suited to user documentation. The requested simplification must not let provider preference cross established viability or resolution tiers or silently discard saved settings.
+
+## Decision
+
+- Order settings and actions exactly by the operator workflow recorded in issue #7. Ordering changes presentation only; action IDs and behavior remain unchanged.
+- Replace each operator-managed M3U numeric score with an integer selector from `-5` through `+5`, with `0` neutral. M3U score remains additive only inside the existing hard viability and resolution tiers.
+- Normalize saved dynamic M3U values to the nearest integer and clamp them to `-5` through `+5` when consumed. Require Dispatcharr M3U source discovery to build these controls; do not expose a manual source-score fallback, and fail plugin initialization if discovery raises an error.
+- Accept comma-separated stream-name rules while preserving newline-separated settings. Treat a top-level comma as a separator only when the following text begins another valid shorthand or regex rule; retain escaped commas and commas inside regex character classes, groups, and quantifiers.
+- Keep settings-page help limited to information needed to fill each control. Move the full settings interactions and runtime-file inventory to the README, and remove the Files informational row.
+- Preserve every existing default and score except the explicitly approved bounded M3U scale. Name rules, bitrate, FPS, throughput, reliability, viability, resolution, and final existing-order precedence do not change.
+
+## Consequences and review triggers
+
+- Provider preference remains useful as a close-result tie influence but cannot override dead health or a lower resolution tier.
+- Existing dynamic scores outside the selector range intentionally migrate to a bounded value; unchanged legacy free-form source rules remain available until dynamic selectors are saved.
+- Regex rules containing an ambiguous top-level comma immediately followed by text shaped like another rule must escape that comma or group the expression.
+- Revisit the M3U range only after sort reports show that a ten-point maximum provider spread is too weak or too strong relative to measured quality and reliability evidence.
+
+## Provenance
+
+- GitHub issue #7 and owner comment `issuecomment-5447118913`, reviewed on 2026-08-27.
+- Operator confirmation that all implementation instructions were captured in that issue comment.

@@ -348,8 +348,58 @@ def parse_name_rules(text: str | None) -> list[NameRule]:
         15::^USA?\\s*[|:_-]
         -50::\\bBACKUP\\b
     """
+    def looks_like_rule_start(value: str) -> bool:
+        value = value.lstrip()
+        number = r"[+-]?(?:\d+(?:\.\d*)?|\.\d+)"
+        return bool(
+            re.match(rf"{number}\s*::", value)
+            or re.match(rf"[^,=\n]+?=\s*{number}(?:\s*(?:,|$))", value)
+        )
+
+    def split_entries(value: str | None) -> list[str]:
+        entries: list[str] = []
+        for physical_line in (value or "").splitlines():
+            line = physical_line.strip()
+            if not line or line.startswith("#"):
+                continue
+            start = 0
+            escaped = False
+            square_depth = 0
+            round_depth = 0
+            brace_depth = 0
+            for index, char in enumerate(line):
+                if escaped:
+                    escaped = False
+                    continue
+                if char == "\\":
+                    escaped = True
+                    continue
+                if char == "[":
+                    square_depth += 1
+                elif char == "]" and square_depth:
+                    square_depth -= 1
+                elif char == "(" and not square_depth:
+                    round_depth += 1
+                elif char == ")" and round_depth and not square_depth:
+                    round_depth -= 1
+                elif char == "{" and not square_depth:
+                    brace_depth += 1
+                elif char == "}" and brace_depth and not square_depth:
+                    brace_depth -= 1
+                elif (
+                    char == ","
+                    and not square_depth
+                    and not round_depth
+                    and not brace_depth
+                    and looks_like_rule_start(line[index + 1 :])
+                ):
+                    entries.append(line[start:index].strip())
+                    start = index + 1
+            entries.append(line[start:].strip())
+        return [entry for entry in entries if entry]
+
     rules: list[NameRule] = []
-    for raw_line in (text or "").splitlines():
+    for raw_line in split_entries(text):
         line = raw_line.strip()
         if not line or line.startswith("#"):
             continue

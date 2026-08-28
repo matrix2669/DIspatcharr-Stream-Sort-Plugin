@@ -1,5 +1,20 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- Accept comma-separated stream-name shorthand and regex rules while retaining newline compatibility and regex-internal commas.
+
+### Changed
+
+- Reorder settings and actions around normal analyze/sort workflow, use concise inline help, and move detailed settings/file guidance to the README.
+- Replace dynamic M3U numeric scores with integer selectors from -5 through +5; normalize legacy dynamic values to the nearest bounded choice without changing hard scoring tiers.
+
+### Removed
+
+- Remove the Files informational row from the settings page while retaining the complete runtime-file reference in the README.
+
 ## 0.3.6-beta.13 - 2026-08-27
 
 ### Added

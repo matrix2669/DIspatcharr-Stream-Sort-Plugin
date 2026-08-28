@@ -127,6 +127,20 @@ def test_multiple_regex_rules_are_additive():
     assert ranked[0].matched_name_rules == ["^US", r"\bBACKUP\b"]
 
 
+def test_comma_separated_name_rules_preserve_newline_behavior():
+    rules = parse_name_rules(r"US=20, 10::\b4K\b, -7::\bBACKUP\b")
+    ranked = rank_candidates([c(1, "US | ESPN 4K BACKUP", 0)], name_rules=rules)
+    assert ranked[0].breakdown["name_rules"] == 23
+
+
+def test_regex_internal_commas_are_not_rule_separators():
+    rules = parse_name_rules(r"5::^(?:NEWS, WEATHER){1,3}, -2::\bBACKUP\b")
+    assert [rule.label for rule in rules] == [
+        r"^(?:NEWS, WEATHER){1,3}",
+        r"\bBACKUP\b",
+    ]
+
+
 def test_content_starved_stream_crosses_resolution_boundary():
     ranked = rank_candidates(
         [
