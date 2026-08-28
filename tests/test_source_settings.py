@@ -24,7 +24,7 @@ def test_dynamic_m3u_fields_use_bounded_selectors_and_account_ids():
     ]
     assert all(field["type"] == "select" for field in fields)
     assert all(field["default"] == 0 for field in fields)
-    assert [option["value"] for option in fields[0]["options"]] == list(range(-5, 6))
+    assert [option["value"] for option in fields[0]["options"]] == list(range(5, -6, -1))
     assert fields[0]["options"][5]["label"] == "0 (neutral)"
     assert fields[0]["label"] == "Alpha"
     assert fields[1]["label"] == "Backup (inactive)"

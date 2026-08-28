@@ -450,7 +450,7 @@ def _build_m3u_source_score_fields(accounts):
                         "value": score,
                         "label": f"{score:+d}" if score else "0 (neutral)",
                     }
-                    for score in range(-5, 6)
+                for score in range(5, -6, -1)
                 ],
                 "help_text": f"M3U source ID {account_id}.",
             }

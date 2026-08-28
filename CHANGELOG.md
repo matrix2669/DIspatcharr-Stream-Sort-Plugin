@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+### Changed
+
+- Display M3U source score selectors from `+5` down through `-5` while keeping `0` neutral and preserving scoring values.
+
 ## 0.3.6-beta.14 - 2026-08-27
 
 ### Added
