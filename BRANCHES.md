@@ -19,12 +19,12 @@ Before deleting a branch, record user-visible results in `CHANGELOG.md` and dura
 ### `feature/v0.3.6-beta.15-selector-order`
 
 - Type: short-lived feature branch
-- Status: local implementation and validation only; push, merge, tag, publication, and deployment are not authorized
+- Status: implementation and local validation complete; remote checkpoint authorized, while merge, tag, publication, and deployment remain unauthorized
 - Base and target: `dev`
 - Purpose: prepare the next beta revision with descending M3U selectors, concise schedule actions, evidence-aware TTL recommendations, and validated live defaults
 - Scope: selector presentation, new-install defaults, channel-scope guidance, recommendation evidence reporting, focused regression coverage, documentation, and this branch record
 - Exclusions: source-score migration, score calculation, registry metadata, deployment, and persistent problematic-stream notification implementation
-- Completion: validate locally and retain this branch without publishing until the user authorizes the next beta revision
+- Completion: push and verify this exact branch checkpoint for continuity; retain it without merging or publishing until the user authorizes the next beta revision
 
 ### `feature/issue-7-settings-controls`
 
