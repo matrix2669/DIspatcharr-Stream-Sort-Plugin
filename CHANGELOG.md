@@ -2,6 +2,27 @@
 
 ## Unreleased
 
+## 0.3.6 - 2026-08-27
+
+### Added
+
+- Add scheduled incremental analysis, safe scan cancellation, health reporting, statistics reset actions, and evidence-aware TTL recommendations.
+- Add separate Analyze & Sort and Analyze Only channel scopes with group/profile selection and case-insensitive `*` and `?` wildcards.
+- Add runtime reliability and qualified Dispatcharr playback reuse for content and throughput evidence.
+
+### Changed
+
+- Separate FFprobe, content, and throughput freshness with configurable TTLs, randomized non-dead jitter, adaptive dead-stream timing, and provider-capacity protection.
+- Treat confirmed low-bitrate and aggregate content failures as dead, distinguish fixed-file placeholders, and retain completed work when scans stop.
+- Bound M3U source preferences to -5 through +5, list selectors from +5 down to -5, and default every source to neutral on new installations.
+- Align runtime fallbacks with documented defaults and surface recommendation evidence before operators change TTLs.
+
+### Fixed
+
+- Retry provisional FFprobe, content, combined-capture, `0x0`, and minimum-bitrate failures before assigning terminal health.
+- Prevent placeholder streams from receiving redundant content and throughput checks while preserving lightweight recovery detection.
+- Preserve accurate scan telemetry, provider reservations, saved results, and retry logging across parallel, serial, scheduled, and stopped scans.
+
 ## 0.3.6-beta.15 - 2026-08-27
 
 ### Changed

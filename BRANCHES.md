@@ -19,12 +19,12 @@ Before deleting a branch, record user-visible results in `CHANGELOG.md` and dura
 ### `feature/v0.3.6-beta.15-selector-order`
 
 - Type: short-lived feature branch
-- Status: implementation and local validation complete; remote checkpoint authorized, while merge, tag, publication, and deployment remain unauthorized
+- Status: published through source `dev` and immutable tag `v0.3.6-beta.15`; public archive, registry workflow `33138165588`, and managed beta.15 installation pass
 - Base and target: `dev`
 - Purpose: prepare the next beta revision with descending M3U selectors, concise schedule actions, evidence-aware TTL recommendations, and validated live defaults
 - Scope: selector presentation, new-install defaults, channel-scope guidance, recommendation evidence reporting, focused regression coverage, documentation, and this branch record
 - Exclusions: source-score migration, score calculation, registry metadata, deployment, and persistent problematic-stream notification implementation
-- Completion: push and verify this exact branch checkpoint for continuity; retain it without merging or publishing until the user authorizes the next beta revision
+- Completion: beta.15 is the verified stable-release candidate and is superseded by the approved `release/v0.3.6` promotion
 
 ### `feature/issue-7-settings-controls`
 
@@ -66,3 +66,16 @@ Before cleanup, the legacy `dev-test`, checkpoint, and duplicate `noop-check` br
 - `fix/v0.3.6-beta.4-review-corrections`: active corrective branch from `dev`; fixes all beta.3 review findings, expands validation, and targets immutable `v0.3.6-beta.4` before integration back to `dev`.
 - `fix/v0.3.6-beta.6-analysis-control`: active corrective branch from `dev`; preserves viewer-aware capacity while serializing direct/UI/scheduled scans, adds cooperative checkpoint-and-stop behavior, and targets immutable `v0.3.6-beta.6`. Validation: 107 automated tests, Python compilation, diff checks, and workspace standards reconciliation pass; exact archive installation and live Dispatcharr reservation/cancellation checks remain publication gates.
 - `fix/v0.3.6-beta.10-telemetry-integrity`: active corrective branch from `dev`; fixes beta.9 terminal transition attribution and throughput completion accounting, adds regression coverage, and targets immutable `v0.3.6-beta.10`. Excludes TTL, retry-budget, scheduling, provider-capacity, scoring, and stream-order changes. Validation and live clean-scan evidence remain publication gates.
+
+### `release/v0.3.6`
+
+- Type: short-lived stable release branch
+- Status: active; stable tag, GitHub Release, registry publication, and managed installation pending
+- Base: `dev` at `e795ecebb4c531b4b801476f43c708dc21c34dee` after beta.15 source, public archive, registry, workflow, and managed-install validation passed
+- Targets: source `dev` and `main`, then focused registry `dev` and `main` publication
+- Purpose: promote the approved beta.15 behavior without functional changes as stable Dispatcharr Stream Sort `0.3.6`
+- Scope: synchronized stable version metadata, cumulative release notes, branch evidence, immutable tag, GitHub Release, focused registry metadata, and managed stable installation
+- Exclusions: no new runtime behavior, setting changes, dependency changes, unrelated plugin metadata, or Dispatcharr core changes
+- Validation: repeat all 159 source tests, compilation, manifest parsing, workspace standards reconciliation, project validation, exact public archive validation, release publication checks, both registry channel gates, and managed installation
+- Completion: publish immutable `v0.3.6`, create the normal GitHub Release, advertise the exact artifact through focused `dev` and `main` registry changes, install it through the stable managed repository, and reconcile final evidence
+- Started: `2026-08-27`
