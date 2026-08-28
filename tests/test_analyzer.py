@@ -45,6 +45,7 @@ def _settings(**overrides):
         "frozen_video_detection": False,
         "silent_audio_detection": False,
         "placeholder_file_detection": True,
+        "minimum_video_bitrate_kbps": 500,
         "analysis_duration_seconds": 5,
         "analysis_connection_timeout_seconds": 10,
         "analysis_probe_timeout_seconds": 20,
@@ -74,6 +75,50 @@ def test_analyze_stream_alive_calculates_packet_bitrate(monkeypatch):
     assert result["details"]["packet_count"] == 30
 
 
+def test_metadata_only_analysis_does_not_run_content_ffmpeg(monkeypatch):
+    payload = _probe_payload(packet_count=30)
+    calls = []
+
+    def fake_run(*args, **kwargs):
+        calls.append(args[0])
+        return subprocess.CompletedProcess(args[0], 0, stdout=json.dumps(payload), stderr="")
+
+    monkeypatch.setattr(analyzer.subprocess, "run", fake_run)
+    result = analyzer.analyze_stream(
+        "http://example.test/live.ts",
+        stream_id=7,
+        stream_name="Example",
+        settings=_settings(),
+        include_content=False,
+    )
+
+    assert result["status"] == "alive"
+    assert len(calls) == 1
+    assert "content" not in result["details"]
+
+
+def test_zero_dimensions_are_dead_and_retryable(monkeypatch):
+    payload = _probe_payload()
+    payload["streams"][0]["width"] = 0
+    payload["streams"][0]["height"] = 0
+
+    def fake_run(*args, **kwargs):
+        return subprocess.CompletedProcess(args[0], 0, stdout=json.dumps(payload), stderr="")
+
+    monkeypatch.setattr(analyzer.subprocess, "run", fake_run)
+    result = analyzer.analyze_stream(
+        "http://example.test/zero-dimensions.ts",
+        stream_id=12,
+        stream_name="Zero dimensions",
+        settings=_settings(),
+    )
+
+    assert result["status"] == "dead"
+    assert result["error_type"] == "invalid_video_dimensions"
+    assert result["error_type"] in analyzer.RETRYABLE_ERROR_TYPES
+    assert result["stats"]["resolution"] == "0x0"
+
+
 def test_fixed_duration_placeholder_is_dead(monkeypatch):
     payload = _probe_payload(duration=600)
 
@@ -90,7 +135,30 @@ def test_fixed_duration_placeholder_is_dead(monkeypatch):
 
     assert result["status"] == "dead"
     assert result["error_type"] == "placeholder_file"
+    assert result["error_type"] in analyzer.RETRYABLE_ERROR_TYPES
     assert result["stats"]["resolution"] == "1920x1080"
+
+
+def test_video_below_minimum_bitrate_is_dead_and_retryable(monkeypatch):
+    payload = _probe_payload()
+    payload["streams"][0]["bit_rate"] = "400000"
+    for packet in payload["packets"]:
+        packet["size"] = "1600"
+
+    def fake_run(*args, **kwargs):
+        return subprocess.CompletedProcess(args[0], 0, stdout=json.dumps(payload), stderr="")
+
+    monkeypatch.setattr(analyzer.subprocess, "run", fake_run)
+    result = analyzer.analyze_stream(
+        "http://example.test/low-bitrate.ts",
+        stream_id=13,
+        stream_name="Low bitrate",
+        settings=_settings(),
+    )
+
+    assert result["status"] == "dead"
+    assert result["error_type"] == "low_bitrate"
+    assert result["error_type"] in analyzer.RETRYABLE_ERROR_TYPES
 
 
 def test_http_429_is_skipped_not_dead(monkeypatch):
@@ -138,6 +206,16 @@ def test_black_frozen_and_silent_parsers():
     assert analyzer._parse_mean_volume_db(stderr) == -91.0
 
 
+def test_content_health_failures_are_retryable():
+    assert {
+        "invalid_stream",
+        "placeholder_file",
+        "black_screen",
+        "frozen_video",
+        "silent_audio",
+    } <= analyzer.RETRYABLE_ERROR_TYPES
+
+
 def test_streamlink_host_is_skipped_without_running_ffprobe(monkeypatch):
     def should_not_run(*args, **kwargs):
         raise AssertionError("ffprobe should not run")
@@ -151,3 +229,50 @@ def test_streamlink_host_is_skipped_without_running_ffprobe(monkeypatch):
     )
     assert result["status"] == "skipped"
     assert result["error_type"] == "streamlink_only"
+def test_content_timeout_is_retryable_dead_result(monkeypatch):
+    import logging
+    import subprocess
+
+    from stream_sorter import analyzer
+
+    def timeout(*args, **kwargs):
+        raise subprocess.TimeoutExpired(args[0], 20)
+
+    monkeypatch.setattr(analyzer.subprocess, "run", timeout)
+    result = analyzer.apply_content_analysis(
+        {"status": "alive", "stats": {}, "details": {}},
+        "http://provider.test/live",
+        settings={
+            "black_screen_detection": True,
+            "frozen_video_detection": False,
+            "silent_audio_detection": False,
+            "content_ffmpeg_timeout_seconds": 20,
+        },
+        logger=logging.getLogger("test"),
+    )
+
+    assert result["status"] == "dead"
+    assert result["error_type"] == "timeout"
+    assert result["details"]["content"]["measured"] is False
+
+
+def test_no_applicable_content_detectors_are_completed_without_ffmpeg(monkeypatch):
+    from stream_sorter import analyzer
+
+    def should_not_run(*args, **kwargs):
+        raise AssertionError("ffmpeg should not run")
+
+    monkeypatch.setattr(analyzer.subprocess, "run", should_not_run)
+    result = analyzer.apply_content_analysis(
+        {"status": "alive", "stats": {}, "details": {"has_audio": False}},
+        "http://provider.test/live",
+        settings={
+            "black_screen_detection": False,
+            "frozen_video_detection": False,
+            "silent_audio_detection": True,
+        },
+    )
+
+    assert result["status"] == "alive"
+    assert result["details"]["content"]["measured"] is True
+    assert result["details"]["content"]["skip_reason"] == "no_applicable_detectors"

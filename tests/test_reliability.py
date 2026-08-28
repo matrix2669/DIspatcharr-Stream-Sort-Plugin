@@ -100,6 +100,36 @@ def test_channel_stop_accumulates_active_playback_time(tmp_path):
     assert data["channels"]["name:FOX"]["active_stream_id"] is None
 
 
+def test_clean_long_playback_records_sustained_throughput_observation(tmp_path):
+    path = tmp_path / "reliability.json"
+    started = datetime(2026, 8, 18, 1, 0, tzinfo=timezone.utc)
+    record_runtime_event("channel_start", {"channel_name": "LONG", "stream_id": 30}, path=str(path), resolver=_resolver, now=started)
+    record_runtime_event(
+        "channel_stop",
+        {"channel_name": "LONG", "runtime": 300, "total_bytes": 225_000_000},
+        path=str(path), resolver=_resolver, now=started + timedelta(seconds=300),
+    )
+
+    row = _load(path)["streams"]["30"]["playback_throughput_history"][-1]
+    assert row["measured_mbps"] == 6.0
+    assert row["eligible_for_throughput"] is True
+
+
+def test_buffering_failover_records_insufficient_delivery(tmp_path):
+    path = tmp_path / "reliability.json"
+    started = datetime(2026, 8, 18, 1, 0, tzinfo=timezone.utc)
+    record_runtime_event("channel_start", {"channel_name": "BAD", "stream_id": 30}, path=str(path), resolver=_resolver, now=started)
+    record_runtime_event(
+        "channel_failover",
+        {"channel_name": "BAD", "reason": "buffering_timeout", "speed": 0.91},
+        path=str(path), resolver=_resolver, now=started + timedelta(seconds=30),
+    )
+
+    row = _load(path)["streams"]["30"]["playback_throughput_history"][-1]
+    assert row["status"] == "insufficient"
+    assert row["speed"] == 0.91
+
+
 def test_stream_can_be_resolved_from_runtime_url_when_id_is_missing(tmp_path):
     path = tmp_path / "reliability.json"
     result = record_runtime_event(

@@ -127,6 +127,20 @@ def test_multiple_regex_rules_are_additive():
     assert ranked[0].matched_name_rules == ["^US", r"\bBACKUP\b"]
 
 
+def test_comma_separated_name_rules_preserve_newline_behavior():
+    rules = parse_name_rules(r"US=20, 10::\b4K\b, -7::\bBACKUP\b")
+    ranked = rank_candidates([c(1, "US | ESPN 4K BACKUP", 0)], name_rules=rules)
+    assert ranked[0].breakdown["name_rules"] == 23
+
+
+def test_regex_internal_commas_are_not_rule_separators():
+    rules = parse_name_rules(r"5::^(?:NEWS, WEATHER){1,3}, -2::\bBACKUP\b")
+    assert [rule.label for rule in rules] == [
+        r"^(?:NEWS, WEATHER){1,3}",
+        r"\bBACKUP\b",
+    ]
+
+
 def test_content_starved_stream_crosses_resolution_boundary():
     ranked = rank_candidates(
         [
@@ -193,20 +207,39 @@ def test_throughput_score_changes_order_inside_resolution_tier():
     assert [x.stream_id for x in ranked] == [2, 1]
 
 
-def test_stale_throughput_cache_becomes_unknown():
+def test_stale_throughput_cache_uses_status_specific_current_ttl():
     now = datetime.now(timezone.utc)
-    old = now - timedelta(minutes=60)
+    old = now - timedelta(hours=13)
     ranked = rank_candidates(
         [
-            c(1, "A", 0, throughput={"status": "insufficient", "tested_at": old.isoformat()}),
+            c(1, "A", 0, throughput={"status": "insufficient", "checked_at": old.isoformat()}),
             c(2, "B", 1),
         ],
-        throughput_cache_ttl_minutes=30,
+        degraded_throughput_ttl_hours=12,
+        throughput_ttl_jitter_percent=0,
         now=now,
     )
     assert ranked[0].stream_id == 1  # tie falls back to existing order
     assert ranked[0].throughput_status == "unknown"
     assert any("stale" in note for note in ranked[0].notes)
+
+
+def test_healthy_throughput_uses_longer_current_ttl_than_degraded():
+    now = datetime.now(timezone.utc)
+    checked = now - timedelta(hours=13)
+    ranked = rank_candidates(
+        [
+            c(1, "healthy", 0, throughput={"status": "healthy", "checked_at": checked.isoformat()}),
+            c(2, "degraded", 1, throughput={"status": "insufficient", "checked_at": checked.isoformat()}),
+        ],
+        healthy_throughput_ttl_hours=24,
+        degraded_throughput_ttl_hours=12,
+        throughput_ttl_jitter_percent=0,
+        now=now,
+    )
+    by_id = {row.stream_id: row for row in ranked}
+    assert by_id[1].throughput_status == "healthy"
+    assert by_id[2].throughput_status == "unknown"
 
 
 def test_equal_candidates_preserve_existing_order():

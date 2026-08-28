@@ -18,7 +18,20 @@ from .throughput import DEFAULT_USER_AGENT, load_cache as load_throughput_cache,
 ANALYSIS_CACHE_PATH = '/data/dispatcharr_stream_sort_analysis.json'
 MIN_PACKETS_FOR_BITRATE_CALC = 30
 DEFAULT_STREAMLINK_HOSTS = 'youtube.com, youtu.be, twitch.tv, kick.com'
-RETRYABLE_ERROR_TYPES = {'timeout', 'connection_refused', 'network_unreachable', 'stream_unreachable', 'server_error'}
+RETRYABLE_ERROR_TYPES = {
+    'timeout',
+    'connection_refused',
+    'network_unreachable',
+    'stream_unreachable',
+    'server_error',
+    'invalid_stream',
+    'invalid_video_dimensions',
+    'low_bitrate',
+    'placeholder_file',
+    'black_screen',
+    'frozen_video',
+    'silent_audio',
+}
 
 def _utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
@@ -212,12 +225,19 @@ def _classify_error(stderr: str, returncode: int | None=None) -> str:
         return 'stream_unreachable'
     return 'other'
 
-def _analyze_content(raw_url: str, *, settings: Mapping[str, Any], user_agent: str, has_audio: bool, logger) -> dict[str, Any]:
+def _analyze_content(raw_url: str, *, settings: Mapping[str, Any], user_agent: str, has_audio: bool, logger, local_source: bool=False) -> dict[str, Any]:
     want_black = _as_bool(settings.get('black_screen_detection'), True)
     want_freeze = _as_bool(settings.get('frozen_video_detection'), True)
     want_audio = _as_bool(settings.get('silent_audio_detection'), True) and has_audio
     if not (want_black or want_freeze or want_audio):
-        return {'black': None, 'frozen': None, 'mean_volume_db': None, 'measured': False}
+        return {
+            'black': None,
+            'frozen': None,
+            'mean_volume_db': None,
+            'measured': True,
+            'skipped': True,
+            'skip_reason': 'no_applicable_detectors',
+        }
     ffmpeg_path = str(settings.get('analysis_ffmpeg_path') or '/usr/local/bin/ffmpeg')
     sample_seconds = max(2, _as_int(settings.get('content_sample_seconds'), 6))
     min_black = max(1, _as_int(settings.get('black_screen_min_seconds'), 3))
@@ -229,8 +249,10 @@ def _analyze_content(raw_url: str, *, settings: Mapping[str, Any], user_agent: s
     if want_freeze:
         video_filters.append(f'freezedetect=n=-60dB:d={freeze_seconds}')
     cmd = [ffmpeg_path, '-hide_banner', '-nostats', '-loglevel', 'info']
-    cmd.extend(_input_http_args(extra_headers, user_agent))
-    cmd.extend(['-rw_timeout', str(connection_timeout * 1000000), '-i', clean_url, '-t', str(sample_seconds)])
+    if not local_source:
+        cmd.extend(_input_http_args(extra_headers, user_agent))
+        cmd.extend(['-rw_timeout', str(connection_timeout * 1000000)])
+    cmd.extend(['-i', clean_url, '-t', str(sample_seconds)])
     if want_audio:
         cmd.extend(['-af', 'volumedetect'])
     else:
@@ -240,18 +262,99 @@ def _analyze_content(raw_url: str, *, settings: Mapping[str, Any], user_agent: s
         completed = subprocess.run(cmd, capture_output=True, text=True, timeout=ffmpeg_timeout)
     except FileNotFoundError:
         logger.warning('[Analyze] ffmpeg not found at %s; content checks fail open', ffmpeg_path)
-        return {'black': None, 'frozen': None, 'mean_volume_db': None, 'measured': False}
+        return {
+            'black': None,
+            'frozen': None,
+            'mean_volume_db': None,
+            'measured': False,
+            'error_type': 'content_tool_unavailable',
+            'error': f'ffmpeg not found at {ffmpeg_path}',
+        }
     except subprocess.TimeoutExpired:
-        logger.warning('[Analyze] ffmpeg content check timed out after %ss; content checks fail open', ffmpeg_timeout)
-        return {'black': None, 'frozen': None, 'mean_volume_db': None, 'measured': False}
+        logger.warning('[Analyze] ffmpeg content check timed out after %ss', ffmpeg_timeout)
+        return {
+            'black': None,
+            'frozen': None,
+            'mean_volume_db': None,
+            'measured': False,
+            'error_type': 'timeout',
+            'error': f'Content check timed out after {ffmpeg_timeout} seconds',
+        }
     except Exception as exc:
-        logger.warning('[Analyze] ffmpeg content check failed (%s); content checks fail open', exc)
-        return {'black': None, 'frozen': None, 'mean_volume_db': None, 'measured': False}
+        logger.warning('[Analyze] ffmpeg content check failed (%s)', exc)
+        return {
+            'black': None,
+            'frozen': None,
+            'mean_volume_db': None,
+            'measured': False,
+            'error_type': 'stream_unreachable',
+            'error': f'{type(exc).__name__}: {exc}',
+        }
     stderr = completed.stderr or ''
     clean_exit = completed.returncode == 0
+    if not clean_exit:
+        classified = _classify_error(stderr, completed.returncode)
+        retryable_type = classified if classified in RETRYABLE_ERROR_TYPES else 'stream_unreachable'
+        return {
+            'black': None,
+            'frozen': None,
+            'mean_volume_db': None,
+            'measured': False,
+            'error_type': retryable_type,
+            'error': stderr.strip()[-1000:] or f'ffmpeg exited with status {completed.returncode}',
+        }
     return {'black': True if _parse_blackdetect_output(stderr) else False if clean_exit and want_black else None, 'frozen': True if want_freeze and _parse_freezedetect_output(stderr) else False if clean_exit and want_freeze else None, 'mean_volume_db': _parse_mean_volume_db(stderr) if want_audio else None, 'measured': clean_exit}
 
-def analyze_stream(raw_url: str, *, stream_id: Any, stream_name: str, settings: Mapping[str, Any], user_agent: str=DEFAULT_USER_AGENT, logger=None) -> dict[str, Any]:
+def apply_content_analysis(
+    result: Mapping[str, Any],
+    source: str,
+    *,
+    settings: Mapping[str, Any],
+    user_agent: str = DEFAULT_USER_AGENT,
+    logger=None,
+    local_source: bool = False,
+) -> dict[str, Any]:
+    """Apply black, freeze, and audio checks to a remote URL or local sample."""
+    updated = dict(result)
+    details = dict(updated.get('details') or {})
+    stats = dict(updated.get('stats') or {})
+    has_audio = bool(details.get('has_audio') or stats.get('audio_codec'))
+    content = dict(_analyze_content(
+        source,
+        settings=settings,
+        user_agent=user_agent,
+        has_audio=has_audio,
+        logger=logger,
+        local_source=local_source,
+    ))
+    content.setdefault('tested_at', _utc_now_iso())
+    details['content'] = content
+    updated.update({'status': 'alive', 'error_type': None, 'error': '', 'details': details})
+    if content.get('error'):
+        error_type = str(content.get('error_type') or 'stream_unreachable')
+        if error_type == 'content_tool_unavailable':
+            return updated
+        updated.update({'status': 'dead', 'error_type': error_type, 'error': str(content.get('error'))})
+        return updated
+    if _as_bool(settings.get('black_screen_detection'), True) and content.get('black') is True:
+        updated.update({'status': 'dead', 'error_type': 'black_screen', 'error': 'Stream decodes to a black screen'})
+        return updated
+    if _as_bool(settings.get('frozen_video_detection'), True) and content.get('frozen') is True:
+        updated.update({'status': 'dead', 'error_type': 'frozen_video', 'error': 'Stream decodes to a frozen (unchanging) picture'})
+        return updated
+    if _as_bool(settings.get('silent_audio_detection'), True) and has_audio:
+        threshold = _as_float(settings.get('silent_audio_max_db'), -70.0)
+        mean_db = content.get('mean_volume_db')
+        if mean_db is not None and float(mean_db) <= threshold:
+            updated.update({
+                'status': 'dead',
+                'error_type': 'silent_audio',
+                'error': f'Audio track is silent (mean {mean_db} dBFS; threshold {threshold} dBFS)',
+            })
+    return updated
+
+
+def analyze_stream(raw_url: str, *, stream_id: Any, stream_name: str, settings: Mapping[str, Any], user_agent: str=DEFAULT_USER_AGENT, logger=None, include_content: bool=True) -> dict[str, Any]:
     logger = logger or logging.getLogger('plugins.stream_sorter')
     tested_at = _utc_now_iso()
     base = {'tested_at': tested_at, 'status': 'dead', 'error_type': 'other', 'error': '', 'stats': {}, 'details': {}}
@@ -295,21 +398,20 @@ def analyze_stream(raw_url: str, *, stream_id: Any, stream_name: str, settings: 
     width = _as_int(video_stream.get('width'), 0)
     height = _as_int(video_stream.get('height'), 0)
     fps = _parse_rate(video_stream.get('r_frame_rate') or video_stream.get('avg_frame_rate'))
-    video_bitrate: float | None = None
-    for raw_bitrate in (video_stream.get('bit_rate'), (probe_data.get('format') or {}).get('bit_rate')):
-        try:
-            if raw_bitrate not in (None, '', 'N/A'):
-                video_bitrate = float(raw_bitrate) / 1000.0
-                break
-        except (TypeError, ValueError):
-            pass
+    declared_video_bitrate: float | None = None
+    try:
+        raw_video_bitrate = video_stream.get('bit_rate')
+        if raw_video_bitrate not in (None, '', 'N/A'):
+            declared_video_bitrate = float(raw_video_bitrate) / 1000.0
+    except (TypeError, ValueError):
+        declared_video_bitrate = None
     packets = probe_data.get('packets') or []
     video_index = video_stream.get('index')
     video_packets = [packet for packet in packets if packet.get('stream_index') == video_index]
     if not video_packets:
         video_packets = packets
     calculated_bitrate = None
-    if video_bitrate is None and len(video_packets) >= MIN_PACKETS_FOR_BITRATE_CALC:
+    if len(video_packets) >= MIN_PACKETS_FOR_BITRATE_CALC:
         total_size = 0
         total_duration = 0.0
         for packet in video_packets:
@@ -320,7 +422,7 @@ def analyze_stream(raw_url: str, *, stream_id: Any, stream_name: str, settings: 
                 continue
         if total_duration > 0:
             calculated_bitrate = total_size * 8.0 / (total_duration * 1000.0)
-            video_bitrate = calculated_bitrate
+    video_bitrate = calculated_bitrate if calculated_bitrate is not None else declared_video_bitrate
     if video_bitrate is not None:
         video_bitrate = float(int(round(video_bitrate)))
     audio_codec = None
@@ -355,6 +457,15 @@ def analyze_stream(raw_url: str, *, stream_id: Any, stream_name: str, settings: 
     details: dict[str, Any] = {'probe_elapsed_seconds': round(elapsed, 3), 'packet_count': len(video_packets), 'analysis_duration_seconds': analysis_duration}
     if calculated_bitrate is not None:
         details['calculated_bitrate_kbps'] = round(calculated_bitrate, 1)
+    if width <= 0 or height <= 0:
+        return {
+            **base,
+            'status': 'dead',
+            'error_type': 'invalid_video_dimensions',
+            'error': f'Video stream reported invalid dimensions ({width}x{height})',
+            'stats': stats,
+            'details': details,
+        }
     container_duration = _parse_container_duration(probe_data)
     if container_duration is not None:
         details['container_duration_seconds'] = round(container_duration, 3)
@@ -363,18 +474,22 @@ def analyze_stream(raw_url: str, *, stream_id: Any, stream_name: str, settings: 
             details['container_bitrate_kbps'] = container_bitrate
         if _as_bool(settings.get('placeholder_file_detection'), True):
             return {**base, 'status': 'dead', 'error_type': 'placeholder_file', 'error': f'Fixed-duration file ({container_duration:.1f}s) instead of a continuous live stream', 'stats': stats, 'details': details}
-    content = _analyze_content(raw_url, settings=settings, user_agent=user_agent, has_audio=audio_stream is not None, logger=logger)
-    details['content'] = content
-    if _as_bool(settings.get('black_screen_detection'), True) and content.get('black') is True:
-        return {**base, 'status': 'dead', 'error_type': 'black_screen', 'error': 'Stream decodes to a black screen', 'stats': stats, 'details': details}
-    if _as_bool(settings.get('frozen_video_detection'), True) and content.get('frozen') is True:
-        return {**base, 'status': 'dead', 'error_type': 'frozen_video', 'error': 'Stream decodes to a frozen (unchanging) picture', 'stats': stats, 'details': details}
-    if _as_bool(settings.get('silent_audio_detection'), True) and audio_stream is not None:
-        threshold = _as_float(settings.get('silent_audio_max_db'), -70.0)
-        mean_db = content.get('mean_volume_db')
-        if mean_db is not None and float(mean_db) <= threshold:
-            return {**base, 'status': 'dead', 'error_type': 'silent_audio', 'error': f'Audio track is silent (mean {mean_db} dBFS; threshold {threshold} dBFS)', 'stats': stats, 'details': details}
-    return {**base, 'status': 'alive', 'error_type': None, 'error': '', 'stats': stats, 'details': details}
+    minimum_video_bitrate = max(0.0, _as_float(settings.get('minimum_video_bitrate_kbps'), 500.0))
+    if minimum_video_bitrate > 0 and video_bitrate is not None and video_bitrate < minimum_video_bitrate:
+        details['minimum_video_bitrate_kbps'] = minimum_video_bitrate
+        return {
+            **base,
+            'status': 'dead',
+            'error_type': 'low_bitrate',
+            'error': f'Video bitrate {video_bitrate:.0f} kbps is below the {minimum_video_bitrate:.0f} kbps minimum',
+            'stats': stats,
+            'details': details,
+        }
+    details['has_audio'] = audio_stream is not None
+    result = {**base, 'status': 'alive', 'error_type': None, 'error': '', 'stats': stats, 'details': details}
+    if not include_content:
+        return result
+    return apply_content_analysis(result, raw_url, settings=settings, user_agent=user_agent, logger=logger)
 
 class RateLimitGuard:
     WINDOW_SECONDS = 60
@@ -452,6 +567,9 @@ def _persist_dispatcharr_result(stream_id: int, result: Mapping[str, Any], logge
             logger.warning('[Analyze] stream=%s disappeared before metadata update', stream_id)
             return False
         stream.stream_stats = dict(result.get('stats') or {}) if status == 'alive' else {}
+        # Dispatcharr owns is_stale as provider-refresh lifecycle state. It is
+        # not a playback exclusion flag, so analyzer health remains in the
+        # plugin cache/report until Dispatcharr exposes a supported health API.
         fields = ['stream_stats']
         if hasattr(stream, 'stream_stats_updated_at'):
             stream.stream_stats_updated_at = django_timezone.now()
@@ -571,7 +689,7 @@ def probe_assigned_streams(settings: Mapping[str, Any], *, logger, cache_path: s
     from .throughput import DEFAULT_CACHE_PATH
     cache_path = cache_path or DEFAULT_CACHE_PATH
     channel_ids, filter_summary = resolve_channel_scope(settings)
-    duration = max(1.0, _as_float(settings.get('probe_duration_seconds'), 8.0))
+    duration = max(1.0, _as_float(settings.get('probe_duration_seconds'), 6.0))
     timeout = max(duration + 2.0, _as_float(settings.get('probe_timeout_seconds'), 10.0))
     rate_per_minute = max(1, _as_int(settings.get('probe_rate_per_minute'), 6))
     per_account_delay = max(0.0, _as_float(settings.get('probe_per_account_delay_seconds'), 1.0))

@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 import os
+import signal
+import subprocess
 import tempfile
 import time
 import urllib.parse
@@ -15,6 +17,137 @@ from .scoring import classify_throughput
 DEFAULT_CACHE_PATH = "/data/dispatcharr_stream_sort_analysis.json"
 LEGACY_CACHE_PATH = "/data/dispatcharr_stream_sort_throughput.json"
 DEFAULT_USER_AGENT = "VLC/3.0.20 LibVLC/3.0.20"
+
+
+def capture_stream_sample(
+    url: str,
+    *,
+    nominal_video_kbps: float,
+    duration_seconds: float = 8.0,
+    timeout_seconds: float = 10.0,
+    user_agent: str | None = None,
+    ffmpeg_path: str = "ffmpeg",
+    temp_directory: str | None = None,
+) -> tuple[dict[str, Any], str | None]:
+    """Capture one wall-clock-bounded provider sample for throughput and local analysis.
+
+    The caller owns the returned path and must remove it. Output bytes are
+    measured from the MPEG-TS stream-copy sample, so no video decode is needed
+    while the provider reservation is held.
+    """
+    tested_at = datetime.now(timezone.utc).isoformat()
+    if not url:
+        return {
+            "status": "unknown",
+            "tested_at": tested_at,
+            "error_type": "stream_unreachable",
+            "error": "Stream URL is empty",
+        }, None
+
+    clean_url, embedded_headers = _split_url_headers(url)
+    headers = dict(embedded_headers)
+    headers.setdefault("User-Agent", user_agent or DEFAULT_USER_AGENT)
+    header_blob = "".join(f"{key}: {value}\r\n" for key, value in headers.items())
+    started = time.monotonic()
+    fd = None
+    sample_path = None
+    intentionally_stopped = False
+    capture_elapsed = 0.0
+    stderr = ""
+    try:
+        fd, sample_path = tempfile.mkstemp(
+            prefix="stream-sort-capture-",
+            suffix=".ts",
+            dir=temp_directory,
+        )
+        os.close(fd)
+        fd = None
+        command = [
+            ffmpeg_path,
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-nostdin",
+            "-y",
+            "-rw_timeout",
+            str(int(max(1.0, timeout_seconds) * 1_000_000)),
+        ]
+        if header_blob:
+            command.extend(["-headers", header_blob])
+        command.extend([
+            "-i",
+            clean_url,
+            "-map",
+            "0:v:0",
+            "-map",
+            "0:a:0?",
+            "-c",
+            "copy",
+            "-f",
+            "mpegts",
+            sample_path,
+        ])
+        process = subprocess.Popen(
+            command,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        try:
+            _stdout, stderr = process.communicate(timeout=max(0.1, duration_seconds))
+            capture_elapsed = max(time.monotonic() - started, 0.001)
+            minimum_elapsed = max(0.1, duration_seconds * 0.9)
+            if capture_elapsed < minimum_elapsed:
+                raise RuntimeError(
+                    f"FFmpeg capture ended after {capture_elapsed:.3f}s; expected at least {minimum_elapsed:.3f}s"
+                )
+        except subprocess.TimeoutExpired:
+            intentionally_stopped = True
+            capture_elapsed = max(time.monotonic() - started, 0.001)
+            process.send_signal(signal.SIGINT)
+            try:
+                _stdout, stderr = process.communicate(timeout=2.0)
+            except subprocess.TimeoutExpired:
+                process.terminate()
+                try:
+                    _stdout, stderr = process.communicate(timeout=1.0)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    _stdout, stderr = process.communicate()
+        captured_bytes = os.path.getsize(sample_path)
+        if captured_bytes <= 0 or (process.returncode and not intentionally_stopped):
+            error = (stderr or "FFmpeg produced no usable capture data").strip()
+            raise RuntimeError(error)
+
+        measured_mbps = captured_bytes * 8.0 / capture_elapsed / 1_000_000.0
+        return {
+            "status": classify_throughput(measured_mbps, nominal_video_kbps),
+            "tested_at": tested_at,
+            "measured_mbps": round(measured_mbps, 3),
+            "nominal_video_kbps": round(float(nominal_video_kbps), 1),
+            "bytes": captured_bytes,
+            "elapsed_seconds": round(capture_elapsed, 4),
+            "measurement_source": "ffmpeg_stream_copy",
+        }, sample_path
+    except Exception as exc:
+        if fd is not None:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        if sample_path:
+            try:
+                os.unlink(sample_path)
+            except OSError:
+                pass
+        return {
+            "status": "unknown",
+            "tested_at": tested_at,
+            "error_type": "stream_unreachable",
+            "error": f"{type(exc).__name__}: {exc}",
+            "elapsed_seconds": round(max(time.monotonic() - started, 0.0), 4),
+            "measurement_source": "ffmpeg_stream_copy",
+        }, None
 
 
 def _read_json(path: str) -> dict[str, Any]:
@@ -45,24 +178,12 @@ def _write_json_atomic(data: dict[str, Any], path: str) -> None:
         raise
 
 
-def _expired(value: Any) -> bool:
-    if not value:
-        return False
-    try:
-        expires = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
-    except (TypeError, ValueError):
-        return False
-    if expires.tzinfo is None:
-        expires = expires.replace(tzinfo=timezone.utc)
-    return datetime.now(timezone.utc) >= expires.astimezone(timezone.utc)
-
-
 def load_cache(path: str = DEFAULT_CACHE_PATH) -> dict[str, dict[str, Any]]:
     """Load throughput entries from the unified analysis cache.
 
-    The old standalone throughput file is read as a migration fallback. Nested
-    entries carry their own expiration time, so an old stored 30-minute plugin
-    setting cannot expire a still-valid 6-hour throughput measurement.
+    The old standalone throughput file is read as a migration fallback.
+    Freshness is evaluated by scoring from checked_at, status-specific current
+    TTL settings, and stable stream jitter rather than stored expiration data.
     """
     data = _read_json(path)
     nested: dict[str, dict[str, Any]] = {}
@@ -73,13 +194,7 @@ def load_cache(path: str = DEFAULT_CACHE_PATH) -> dict[str, dict[str, Any]]:
         throughput = value.get("throughput")
         if isinstance(throughput, dict):
             entry = dict(throughput)
-            if _expired(entry.get("expires_at")):
-                entry["status"] = "unknown"
-                entry["error"] = "cached throughput measurement expired"
-            # Freshness for unified entries is owned by expires_at. Removing
-            # tested_at from this copy prevents the legacy scorer TTL from
-            # applying a second, contradictory expiration policy.
-            entry.pop("tested_at", None)
+            entry.pop("expires_at", None)
             nested[str(key)] = entry
         elif "status" in value and (
             "measured_mbps" in value or "bytes" in value or "nominal_video_kbps" in value

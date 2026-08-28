@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import math
 import re
 from dataclasses import dataclass, field
@@ -297,6 +298,20 @@ def classify_throughput(
     return "insufficient"
 
 
+def throughput_ttl_with_jitter(
+    ttl_hours: float,
+    *,
+    identity: Any,
+    jitter_percent: float,
+) -> float:
+    if ttl_hours <= 0 or jitter_percent <= 0:
+        return ttl_hours
+    jitter_ratio = max(0.0, min(100.0, float(jitter_percent))) / 100.0
+    digest = int(hashlib.md5(str(identity or "").encode("utf-8")).hexdigest()[:8], 16)
+    variance = (digest / float(0xFFFFFFFF)) * 2.0 - 1.0
+    return max(0.0, ttl_hours * (1.0 + variance * jitter_ratio))
+
+
 def parse_source_rules(text: str | None) -> list[SourceRule]:
     rules: list[SourceRule] = []
     for raw_line in (text or "").splitlines():
@@ -333,8 +348,58 @@ def parse_name_rules(text: str | None) -> list[NameRule]:
         15::^USA?\\s*[|:_-]
         -50::\\bBACKUP\\b
     """
+    def looks_like_rule_start(value: str) -> bool:
+        value = value.lstrip()
+        number = r"[+-]?(?:\d+(?:\.\d*)?|\.\d+)"
+        return bool(
+            re.match(rf"{number}\s*::", value)
+            or re.match(rf"[^,=\n]+?=\s*{number}(?:\s*(?:,|$))", value)
+        )
+
+    def split_entries(value: str | None) -> list[str]:
+        entries: list[str] = []
+        for physical_line in (value or "").splitlines():
+            line = physical_line.strip()
+            if not line or line.startswith("#"):
+                continue
+            start = 0
+            escaped = False
+            square_depth = 0
+            round_depth = 0
+            brace_depth = 0
+            for index, char in enumerate(line):
+                if escaped:
+                    escaped = False
+                    continue
+                if char == "\\":
+                    escaped = True
+                    continue
+                if char == "[":
+                    square_depth += 1
+                elif char == "]" and square_depth:
+                    square_depth -= 1
+                elif char == "(" and not square_depth:
+                    round_depth += 1
+                elif char == ")" and round_depth and not square_depth:
+                    round_depth -= 1
+                elif char == "{" and not square_depth:
+                    brace_depth += 1
+                elif char == "}" and brace_depth and not square_depth:
+                    brace_depth -= 1
+                elif (
+                    char == ","
+                    and not square_depth
+                    and not round_depth
+                    and not brace_depth
+                    and looks_like_rule_start(line[index + 1 :])
+                ):
+                    entries.append(line[start:index].strip())
+                    start = index + 1
+            entries.append(line[start:].strip())
+        return [entry for entry in entries if entry]
+
     rules: list[NameRule] = []
-    for raw_line in (text or "").splitlines():
+    for raw_line in split_entries(text):
         line = raw_line.strip()
         if not line or line.startswith("#"):
             continue
@@ -390,7 +455,11 @@ def source_score(
 def _throughput_entry_status(
     entry: Mapping[str, Any] | None,
     nominal_video_kbps: float | None,
-    cache_ttl_minutes: float | None,
+    healthy_ttl_hours: float,
+    degraded_ttl_hours: float,
+    unknown_ttl_hours: float,
+    ttl_jitter_percent: float,
+    identity: Any,
     now: datetime | None,
 ) -> tuple[str, list[str]]:
     if not entry:
@@ -398,21 +467,30 @@ def _throughput_entry_status(
     notes: list[str] = []
     status = str(entry.get("status") or "").strip().lower()
 
-    tested_at = entry.get("tested_at")
-    if cache_ttl_minutes and tested_at:
-        try:
-            tested_dt = datetime.fromisoformat(str(tested_at).replace("Z", "+00:00"))
-            if tested_dt.tzinfo is None:
-                tested_dt = tested_dt.replace(tzinfo=timezone.utc)
-            now_dt = now or datetime.now(timezone.utc)
-            if now_dt.tzinfo is None:
-                now_dt = now_dt.replace(tzinfo=timezone.utc)
-            age_minutes = (now_dt - tested_dt).total_seconds() / 60.0
-            if age_minutes > cache_ttl_minutes:
-                notes.append(f"throughput cache stale ({age_minutes:.1f}m)")
-                return "unknown", notes
-        except (TypeError, ValueError):
-            notes.append("invalid throughput tested_at")
+    checked_at = entry.get("checked_at") or entry.get("tested_at")
+    status_ttl_hours = unknown_ttl_hours if status == "unknown" else degraded_ttl_hours if status != "healthy" else healthy_ttl_hours
+    effective_ttl_hours = throughput_ttl_with_jitter(
+        status_ttl_hours,
+        identity=entry.get("url_hash") or identity,
+        jitter_percent=ttl_jitter_percent,
+    )
+    if not checked_at:
+        notes.append("throughput cache missing checked_at")
+        return "unknown", notes
+    try:
+        tested_dt = datetime.fromisoformat(str(checked_at).replace("Z", "+00:00"))
+        if tested_dt.tzinfo is None:
+            tested_dt = tested_dt.replace(tzinfo=timezone.utc)
+        now_dt = now or datetime.now(timezone.utc)
+        if now_dt.tzinfo is None:
+            now_dt = now_dt.replace(tzinfo=timezone.utc)
+        age_hours = (now_dt - tested_dt).total_seconds() / 3600.0
+        if effective_ttl_hours <= 0 or age_hours >= effective_ttl_hours:
+            notes.append(f"throughput cache stale ({age_hours:.2f}h; ttl={effective_ttl_hours:.2f}h)")
+            return "unknown", notes
+    except (TypeError, ValueError):
+        notes.append("invalid throughput checked_at")
+        return "unknown", notes
 
     if status in THROUGHPUT_SCORES:
         return status, notes
@@ -461,7 +539,10 @@ def evaluate_candidate(
     *,
     source_rules: Iterable[SourceRule] = (),
     name_rules: Iterable[NameRule] = (),
-    throughput_cache_ttl_minutes: float | None = 30.0,
+    healthy_throughput_ttl_hours: float = 48.0,
+    degraded_throughput_ttl_hours: float = 24.0,
+    unknown_throughput_ttl_hours: float = 4.0,
+    throughput_ttl_jitter_percent: float = 30.0,
     reliability_scoring_enabled: bool = True,
     now: datetime | None = None,
 ) -> Evaluation:
@@ -505,7 +586,11 @@ def evaluate_candidate(
     throughput_status, throughput_notes = _throughput_entry_status(
         candidate.throughput,
         throughput_nominal_kbps,
-        throughput_cache_ttl_minutes,
+        healthy_throughput_ttl_hours,
+        degraded_throughput_ttl_hours,
+        unknown_throughput_ttl_hours,
+        throughput_ttl_jitter_percent,
+        candidate.url or candidate.stream_id,
         now,
     )
     notes.extend(throughput_notes)
@@ -565,7 +650,10 @@ def rank_candidates(
     *,
     source_rules: Iterable[SourceRule] = (),
     name_rules: Iterable[NameRule] = (),
-    throughput_cache_ttl_minutes: float | None = 30.0,
+    healthy_throughput_ttl_hours: float = 48.0,
+    degraded_throughput_ttl_hours: float = 24.0,
+    unknown_throughput_ttl_hours: float = 4.0,
+    throughput_ttl_jitter_percent: float = 30.0,
     reliability_scoring_enabled: bool = True,
     now: datetime | None = None,
 ) -> list[Evaluation]:
@@ -574,7 +662,10 @@ def rank_candidates(
             candidate,
             source_rules=source_rules,
             name_rules=name_rules,
-            throughput_cache_ttl_minutes=throughput_cache_ttl_minutes,
+            healthy_throughput_ttl_hours=healthy_throughput_ttl_hours,
+            degraded_throughput_ttl_hours=degraded_throughput_ttl_hours,
+            unknown_throughput_ttl_hours=unknown_throughput_ttl_hours,
+            throughput_ttl_jitter_percent=throughput_ttl_jitter_percent,
             reliability_scoring_enabled=reliability_scoring_enabled,
             now=now,
         )
