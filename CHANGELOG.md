@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.3.7-beta.1 - 2026-09-02
+
 ### Added
 
 - Retain 90 days of direct throughput outcomes with exact media-change causes and expose their aggregates in Health Report.

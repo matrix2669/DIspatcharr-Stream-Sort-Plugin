@@ -8,9 +8,9 @@ Before deleting a branch, record user-visible results in `CHANGELOG.md` and dura
 
 | Branch | Type | Status | Base | Target | Purpose |
 |---|---|---|---|---|---|
-| `main` | long-lived | active | historical repository root | approved stable releases | Reserved stable-release branch; Stream Sort is not yet published in the stable registry. |
+| `main` | long-lived | active | historical repository root | approved stable releases | Reserved stable-release branch; currently carries the released `0.3.6` baseline. |
 | `dev` | long-lived | active | `main` | `main` | Integrates and validates the next beta and stable release. |
-| `feature/analysis-telemetry-retention` | short-lived | active | `dev` | `dev` | Retain direct throughput/media-change evidence and applied-sort movement history. |
+| `feature/analysis-telemetry-retention` | short-lived | integrated | `dev` | `dev` | Retain direct throughput/media-change evidence and applied-sort movement history. |
 | `feature/issue-7-settings-controls` | short-lived | active | `dev` | `dev` | Simplify settings/action layout, bound M3U scores, and add comma-separated name rules. |
 | `fix/v0.3.6-beta.6-analysis-control` | short-lived | active | `dev` | `dev` | Prevent overlapping analysis entry points, add safe cancellation, and publish immutable beta.6. |
 | `fix/v0.3.6-beta.10-telemetry-integrity` | short-lived | active | `dev` | `dev` | Preserve scan-boundary health transitions and distinguish attempted throughput probes from completed measurements. |
@@ -20,7 +20,7 @@ Before deleting a branch, record user-visible results in `CHANGELOG.md` and dura
 ### `feature/analysis-telemetry-retention`
 
 - Type: short-lived feature branch
-- Status: active
+- Status: integrated into `dev` for immutable `v0.3.7-beta.1` publication; feature checkpoint remains available on GitHub
 - Base and target: `dev` at `c1b1172177c87c93ab5edeec2d45870c9328ed81`
 - Purpose: use the first six days of stable scheduled evidence to make media-change, throughput, and repeated sorting behavior directly measurable
 - Scope: direct throughput retention, exact media-change causes, applied-sort movement and score-delta retention, Sort History action, reset integration, focused tests, user documentation, changelog, and decision record
