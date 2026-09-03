@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+### Added
+
+- Retain 90 days of direct throughput outcomes with exact media-change causes and expose their aggregates in Health Report.
+- Add a Sort History action with 90-day applied channel/stream movement details, score-component deltas, and 365-day daily totals.
+
+### Changed
+
+- Clarify and enforce that 500 Kbps is only the minimum bitrate health floor; percentage-based confirmed bitrate movement is the media-change trigger.
+- Clear retained sort history with both statistics reset actions while preserving channel order, schedules, and settings.
+
 ## 0.3.6 - 2026-08-27
 
 ### Added

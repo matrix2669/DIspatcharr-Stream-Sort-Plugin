@@ -1,5 +1,6 @@
 import collections
 import itertools
+import json
 import sys
 import threading
 import types
@@ -1375,6 +1376,47 @@ def test_media_stats_bitrate_change_is_treated_as_significant_only_above_toleran
     assert _is_significant_bitrate_change(5000.0, 7000.0)
     assert not _is_significant_bitrate_change(None, 5000.0)
     assert not _is_significant_bitrate_change(5000.0, None)
+
+
+def test_media_change_reasons_use_percentage_not_500_kbps_delta():
+    baseline = {"resolution": "1920x1080", "source_fps": 60, "video_bitrate": 5000}
+    ten_percent = {"resolution": "1920x1080", "source_fps": 60, "video_bitrate": 5500}
+    forty_percent = {"resolution": "1920x1080", "source_fps": 60, "video_bitrate": 7000}
+
+    assert incremental._media_stats_change_reasons(
+        baseline,
+        ten_percent,
+        media_history=[{"stats": baseline}] * 3 + [{"stats": ten_percent}],
+    ) == []
+    assert incremental._media_stats_change_reasons(
+        baseline,
+        forty_percent,
+        media_history=[{"stats": baseline}] * 3 + [{"stats": forty_percent}],
+    ) == ["bitrate_relative"]
+
+
+def test_throughput_history_retains_media_change_cause_without_url():
+    item = {"id": 42, "name": "Example", "url": "http://user:secret@example.test/live", "account_id": 3, "account_name": "Provider"}
+    previous = {"throughput": {"status": "healthy", "checked_at": "2026-08-26T00:00:00+00:00"}}
+    result = {
+        "status": "marginal",
+        "tested_at": "2026-08-27T00:00:00+00:00",
+        "reason": "media_changed",
+        "measured_mbps": 5.5,
+        "nominal_video_kbps": 5000,
+        "capacity_ratio": 1.1,
+        "duration_seconds": 6.0,
+        "media_change": {"source": "direct_ffprobe", "causes": ["bitrate_relative"]},
+    }
+
+    merged = incremental._merge_throughput_result(item, previous, result)
+    row = merged["throughput_check_history"][0]
+
+    assert row["previous_status"] == "healthy"
+    assert row["status"] == "marginal"
+    assert row["media_change"]["causes"] == ["bitrate_relative"]
+    assert "url" not in row
+    assert "secret" not in json.dumps(row)
 
 
 def test_media_stats_changed_for_throughput_uses_signature_and_bitrate_tolerance():

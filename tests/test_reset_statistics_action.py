@@ -12,6 +12,7 @@ def _configure_paths(tmp_path, monkeypatch):
         "ANALYSIS_HEALTH_REPORT_PATH": tmp_path / "health-report.json",
         "TTL_RECOMMENDATION_PATH": tmp_path / "ttl.json",
         "STATUS_PATH": tmp_path / "status.json",
+        "REPORT_PATH": tmp_path / "sort-report.json",
         "RELIABILITY_PATH": tmp_path / "reliability.json",
     }
     for name, path in paths.items():

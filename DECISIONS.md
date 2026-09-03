@@ -794,3 +794,46 @@ The validated live configuration has matured beyond several older manifest and h
 
 - Operator direction on 2026-08-27 to align new-install defaults with the validated live configuration and make recommendation evidence visible.
 - GitHub issue #22 for the separate persistent problematic-stream notification proposal.
+
+---
+
+# ADR-022: Retain media-change, throughput, and applied-sort evidence
+
+## Status
+
+Accepted
+
+## Date
+
+2026-09-02
+
+## Context
+
+Six days of scheduled analysis showed that most throughput classifications remain stable, while `media_changed` still accounted for a material share of throughput work and nearly every scheduled sort changed at least one channel. Existing state retained only the latest direct throughput result and latest sort report, so it could not identify which media field caused a refresh, whether throughput status changed, or whether the same channels repeatedly reversed order.
+
+The same review confirmed that known-placeholder probes average about 2.51 seconds end to end. Moving the serial schedule from twice hourly to hourly reduces their cadence, while adaptive placeholder cooldown would save only about 20 to 28 additional minutes per day for the observed 66 placeholders and could delay event recovery by four to twelve hours.
+
+## Decision
+
+- Keep 500 Kbps solely as the minimum direct-FFprobe video-bitrate health floor. It is not an absolute media-change delta. Bitrate-triggered `media_changed` work uses only the configured percentage threshold after the existing consecutive rolling-median and median-absolute-deviation confirmation.
+- Record the exact media-change cause as `resolution`, `fps`, or `bitrate_relative`, together with whether the source was direct FFprobe or Dispatcharr stream statistics. Do not record URLs or credentials.
+- Retain terminal direct-throughput observations for 90 days, bounded to 512 rows per stream. Include reason, previous and resulting status, numeric measurement, nominal rate, capacity ratio, duration, provider identity, and media-change evidence when applicable. Playback and legacy-cache imports remain separate evidence and do not create direct-probe history rows.
+- Aggregate direct-throughput status, reason, transition, duration, ratio, and media-change cause counts into the existing Health Report action.
+- Retain applied-sort run and changed-channel movement details for 90 days, bounded to 5,000 runs, plus daily applied-sort totals for 365 days. Each movement records old/new position, current and previous score, score delta, score-component delta, viability tier, resolution tier, throughput status, and reliability status.
+- Preserve applied-sort history across dry runs and do not count dry-run proposals as actual shifts. Expose retained evidence through a Sort History action.
+- Reset Scan Statistics and Reset All Statistics both clear retained direct-throughput and sort history. Neither reset changes channel order, schedule, settings, or provider configuration.
+- Keep placeholders on the exact one-hour base dead TTL and one-second confirmation probe. Do not add adaptive placeholder backoff before an event-aware external caller can request timely checks.
+- Operate scheduled serial analysis hourly at minute 18. Existing installations require the operator or action to refresh the saved schedule because upgrades do not overwrite explicit saved cron settings.
+
+## Consequences and review triggers
+
+- Future TTL analysis can distinguish stable healthy throughput, degraded recovery, and metadata-triggered work without reconstructing container logs.
+- Future sorting analysis can identify repeated channel oscillation and the score component that changed before adjusting scoring weights.
+- The sort report grows with bounded historical evidence; review file size after 30 and 90 days and reduce per-movement detail only if storage or action rendering becomes material.
+- Revisit placeholder cooldown only after the external event-check contract is implemented or measured placeholder runtime becomes operationally material enough to outweigh delayed event detection.
+- Revisit the 30 percent media-change threshold and throughput TTLs only after the retained cause and status-transition history spans at least seven representative days.
+
+## Provenance
+
+- Operator review of six days of scheduled Stream Sort evidence on 2026-09-02.
+- Operator clarification that 500 Kbps is the bitrate floor and 30 percent is the media-change trigger.

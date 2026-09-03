@@ -5,7 +5,7 @@ import os
 import re
 import tempfile
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from fnmatch import fnmatchcase
 from typing import Any, Iterable, Mapping
 
@@ -24,6 +24,9 @@ from .reliability import RELIABILITY_PATH, load_reliability_cache
 
 
 REPORT_PATH = "/data/dispatcharr_stream_sort_report.json"
+SORT_HISTORY_RETENTION_DAYS = 90
+SORT_ROLLUP_RETENTION_DAYS = 365
+SORT_HISTORY_MAX_RUNS = 5000
 
 
 def _as_bool(value: Any, default: bool = False) -> bool:
@@ -406,6 +409,168 @@ def _write_json_atomic(payload: dict[str, Any], path: str) -> None:
         raise
 
 
+def _load_sort_report(path: str) -> dict[str, Any]:
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            payload = json.load(handle)
+    except (FileNotFoundError, OSError, ValueError, TypeError):
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _parse_report_datetime(value: Any) -> datetime | None:
+    try:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _applied_snapshot(channels: Iterable[Mapping[str, Any]]) -> list[dict[str, Any]]:
+    snapshot = []
+    for channel in channels:
+        streams = []
+        for stream in channel.get("streams") or []:
+            streams.append({
+                "stream_id": stream.get("stream_id"),
+                "name": stream.get("name"),
+                "score": stream.get("score"),
+                "score_breakdown": dict(stream.get("score_breakdown") or {}),
+                "viability": stream.get("viability"),
+                "resolution_tier": stream.get("resolution_tier"),
+                "throughput_status": stream.get("throughput_status"),
+                "reliability_status": stream.get("reliability_status"),
+            })
+        snapshot.append({
+            "channel_id": channel.get("channel_id"),
+            "channel_number": channel.get("channel_number"),
+            "channel_name": channel.get("channel_name"),
+            "stream_ids": list(channel.get("proposed_stream_ids") or []),
+            "streams": streams,
+        })
+    return snapshot
+
+
+def _numeric_breakdown_delta(current: Mapping[str, Any], previous: Mapping[str, Any]) -> dict[str, float]:
+    delta = {}
+    for key in set(current) | set(previous):
+        try:
+            current_value = float(current.get(key) or 0.0)
+            previous_value = float(previous.get(key) or 0.0)
+        except (TypeError, ValueError):
+            continue
+        difference = round(current_value - previous_value, 4)
+        if difference:
+            delta[str(key)] = difference
+    return delta
+
+
+def _sort_movement(channel: Mapping[str, Any], previous: Mapping[str, Any] | None) -> dict[str, Any]:
+    previous = previous or {}
+    old_ids = list(channel.get("current_stream_ids") or [])
+    new_ids = list(channel.get("proposed_stream_ids") or [])
+    previous_streams = {
+        stream.get("stream_id"): stream
+        for stream in previous.get("streams") or []
+        if isinstance(stream, Mapping)
+    }
+    movements = []
+    for stream in channel.get("streams") or []:
+        stream_id = stream.get("stream_id")
+        old_position = old_ids.index(stream_id) + 1 if stream_id in old_ids else None
+        new_position = new_ids.index(stream_id) + 1 if stream_id in new_ids else None
+        if old_position == new_position:
+            continue
+        prior = previous_streams.get(stream_id) or {}
+        current_score = stream.get("score")
+        previous_score = prior.get("score")
+        try:
+            score_delta = round(float(current_score) - float(previous_score), 4)
+        except (TypeError, ValueError):
+            score_delta = None
+        movements.append({
+            "stream_id": stream_id,
+            "name": stream.get("name"),
+            "old_position": old_position,
+            "new_position": new_position,
+            "score": current_score,
+            "previous_score": previous_score,
+            "score_delta": score_delta,
+            "score_breakdown": dict(stream.get("score_breakdown") or {}),
+            "score_breakdown_delta": _numeric_breakdown_delta(
+                stream.get("score_breakdown") or {},
+                prior.get("score_breakdown") or {},
+            ),
+            "viability": stream.get("viability"),
+            "resolution_tier": stream.get("resolution_tier"),
+            "throughput_status": stream.get("throughput_status"),
+            "reliability_status": stream.get("reliability_status"),
+        })
+    return {
+        "channel_id": channel.get("channel_id"),
+        "channel_number": channel.get("channel_number"),
+        "channel_name": channel.get("channel_name"),
+        "previous_stream_ids": old_ids,
+        "new_stream_ids": new_ids,
+        "movements": movements,
+    }
+
+
+def _merge_sort_history(previous_report: Mapping[str, Any], payload: dict[str, Any], *, now: datetime) -> dict[str, Any]:
+    cutoff = now - timedelta(days=SORT_HISTORY_RETENTION_DAYS)
+    history = [
+        dict(row) for row in (previous_report.get("sort_history") or [])
+        if isinstance(row, Mapping)
+        and (_parse_report_datetime(row.get("generated_at")) or now) >= cutoff
+    ][-SORT_HISTORY_MAX_RUNS:]
+    rollup_cutoff = (now - timedelta(days=SORT_ROLLUP_RETENTION_DAYS)).date().isoformat()
+    rollups = {
+        str(day): dict(bucket)
+        for day, bucket in (previous_report.get("sort_daily_rollups") or {}).items()
+        if str(day) >= rollup_cutoff and isinstance(bucket, Mapping)
+    }
+    previous_snapshot = previous_report.get("last_applied_snapshot")
+    if not isinstance(previous_snapshot, list) and previous_report.get("mode") == "apply":
+        previous_snapshot = _applied_snapshot(previous_report.get("channels") or [])
+    previous_by_channel = {
+        row.get("channel_id"): row
+        for row in (previous_snapshot or [])
+        if isinstance(row, Mapping)
+    }
+
+    if payload.get("mode") == "apply":
+        changed = [
+            _sort_movement(channel, previous_by_channel.get(channel.get("channel_id")))
+            for channel in payload.get("channels") or []
+            if channel.get("changed")
+        ]
+        history.append({
+            "generated_at": payload.get("generated_at"),
+            "channels_evaluated": payload.get("channels_evaluated", 0),
+            "channels_changed": payload.get("channels_changed", 0),
+            "rows_changed": payload.get("rows_changed", 0),
+            "changed_channels": changed,
+        })
+        history = history[-SORT_HISTORY_MAX_RUNS:]
+        day = now.date().isoformat()
+        bucket = dict(rollups.get(day) or {})
+        bucket["applied_runs"] = int(bucket.get("applied_runs") or 0) + 1
+        bucket["channels_evaluated"] = int(bucket.get("channels_evaluated") or 0) + int(payload.get("channels_evaluated") or 0)
+        bucket["channels_changed"] = int(bucket.get("channels_changed") or 0) + int(payload.get("channels_changed") or 0)
+        bucket["rows_changed"] = int(bucket.get("rows_changed") or 0) + int(payload.get("rows_changed") or 0)
+        rollups[day] = bucket
+        previous_snapshot = _applied_snapshot(payload.get("channels") or [])
+
+    payload["sort_history_retention_days"] = SORT_HISTORY_RETENTION_DAYS
+    payload["sort_rollup_retention_days"] = SORT_ROLLUP_RETENTION_DAYS
+    payload["sort_history"] = history
+    payload["sort_daily_rollups"] = rollups
+    payload["last_applied_snapshot"] = previous_snapshot or []
+    return payload
+
+
 def sort_channels(
     settings: dict[str, Any],
     *,
@@ -418,6 +583,7 @@ def sort_channels(
     from apps.channels.models import ChannelStream
 
     run_started = time.monotonic()
+    previous_report = _load_sort_report(report_path)
     cfg = _settings(settings)
     channel_ids, filter_summary = resolve_channel_scope(settings, purpose="sort")
     cache = load_cache(cache_path)
@@ -490,6 +656,7 @@ def sort_channels(
         "total_runtime": _format_eta(runtime_seconds),
         "channels": channel_reports,
     }
+    payload = _merge_sort_history(previous_report, payload, now=now)
     _write_json_atomic(payload, report_path)
 
     logger.info(

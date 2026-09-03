@@ -143,6 +143,7 @@ The 90-day health trend report (`/data/dispatcharr_stream_sort_health_report.jso
 - completed dead-recovery and alive-episode durations,
 - censored currently-dead episodes, and
 - actual check concentration used to tune jitter.
+- retained direct throughput outcomes, status transitions, and exact `media_changed` causes (`resolution`, `fps`, or `bitrate_relative`).
 
 Suggested process:
 
@@ -208,11 +209,12 @@ Comma and newline separators are accepted. Commas inside escaped regex, characte
 - **Check Schedule** — show current schedule configuration and final status of the latest scheduled job.
 - **Disable Schedule** — stop automatic scheduled analysis and clear any in-memory due-minute state.
 - **Health Report** — show problematic streams with provider and current channel associations, completed scan-to-scan directional health transitions, dead recovery, and time concentration in the UI. Initial `unknown` observations and intermediate FFprobe/content/retry states do not count as transitions.
+- **Sort History** — show 90 days of applied-sort channel movements, stream position changes, and score-component deltas, plus 365 days of daily totals. Dry runs do not count as actual shifts.
 - **Recommend TTLs** — compute read-only health/dead TTL and jitter recommendations from recent directional evidence, with confidence and sparse-data warnings.
-- **Reset Scan Statistics** — clear unified and legacy scan caches, scan status, health reports, and TTL recommendations while preserving runtime reliability and playback history.
+- **Reset Scan Statistics** — clear unified and legacy scan caches, scan status, health and sort reports, and TTL recommendations while preserving runtime reliability and playback history.
 - **Reset All Statistics** — clear the same scan evidence plus all runtime reliability and playback history.
 
-Both reset actions use the same cross-process lease as analysis and are refused while any scan is active. Schedules, settings, channel order, sort reports, and provider configuration are preserved.
+Both reset actions use the same cross-process lease as analysis and are refused while any scan is active. Schedules, settings, channel order, and provider configuration are preserved.
 - **Dry Run** — write `/data/dispatcharr_stream_sort_report.json` without changing order.
 - **Sort Streams** — apply the calculated `ChannelStream.order` only.
 - **Analyze + Sort** — incrementally analyze, then apply the refreshed ordering.
@@ -228,9 +230,9 @@ Separate `Probe Throughput` actions are no longer shown because throughput is pa
 - `/data/dispatcharr_stream_sort_health_report.json`: retained health trends.
 - `/data/dispatcharr_stream_sort_ttl_recommendations.json`: latest read-only recommendation output.
 - `/data/dispatcharr_stream_sort_reliability.json`: runtime playback reliability evidence.
-- `/data/dispatcharr_stream_sort_report.json`: latest dry-run or applied sort report.
+- `/data/dispatcharr_stream_sort_report.json`: latest dry-run or applied sort report, 90-day applied-sort movement history, and 365-day daily rollups.
 
-Health history uses the documented 90-day retention window. Reset actions do not clear the schedule or plugin settings. The old standalone throughput cache is read only as a migration fallback.
+Health and direct-throughput history use the documented 90-day retention window. Reset actions do not clear the schedule or plugin settings. The old standalone throughput cache is read only as a migration fallback.
 
 Stopping a scan checkpoints every media and throughput probe that has already completed, then skips remaining probes and post-analysis sorting. A dead media result that has not completed its configured retry sequence is saved as retry-pending with an effective dead TTL of zero, so the next scan immediately resumes confirmation instead of treating it as confirmed dead. Once retries confirm the terminal result as dead, FFprobe, content, and throughput all wait behind the adaptive exact Dead stream TTL recovery gate; placeholders use the base Dead stream TTL without streak expansion. Retry-pending observations remain visible as provisional evidence but are excluded from terminal dead percentages. Stopping a scan does not disable its recurring schedule.
 

@@ -40,6 +40,7 @@ MEDIA_CHECK_HISTORY_RETENTION_DAYS = 90
 MEDIA_CHECK_HISTORY_MAX_ROWS = 10000
 MEDIA_CHECK_ROLLUP_RETENTION_DAYS = 365
 FFPROBE_STATS_HISTORY_MAX_ROWS = 7
+THROUGHPUT_CHECK_HISTORY_MAX_ROWS = 512
 HEALTH_REPORT_TIMEZONE = ZoneInfo("America/New_York")
 MEDIA_BITRATE_RELATIVE_TOLERANCE = 0.30
 SUSTAINED_PLAYBACK_HEALTHY_RATIO = 1.10
@@ -495,6 +496,36 @@ def _persistent_bitrate_change(
     return (previous_bitrate - baseline) * (new_bitrate - baseline) > 0
 
 
+def _media_stats_change_reasons(
+    previous_stats: Mapping[str, Any] | None,
+    new_stats: Mapping[str, Any] | None,
+    *,
+    media_bitrate_relative_tolerance: float = MEDIA_BITRATE_RELATIVE_TOLERANCE,
+    media_history: Any = None,
+) -> list[str]:
+    if not previous_stats:
+        return []
+    if not new_stats:
+        return []
+    reasons = []
+    previous_width, previous_height = parse_resolution(previous_stats)
+    new_width, new_height = parse_resolution(new_stats)
+    if previous_width and previous_height and new_width and new_height and (previous_width, previous_height) != (new_width, new_height):
+        reasons.append("resolution")
+    history = _history_stats(media_history)
+    if not history:
+        history = [previous_stats]
+    if _persistent_fps_change(history, new_stats):
+        reasons.append("fps")
+    if _persistent_bitrate_change(
+        history,
+        new_stats,
+        relative_tolerance=media_bitrate_relative_tolerance,
+    ):
+        reasons.append("bitrate_relative")
+    return reasons
+
+
 def _media_stats_changed_for_throughput(
     previous_stats: Mapping[str, Any] | None,
     new_stats: Mapping[str, Any] | None,
@@ -502,22 +533,24 @@ def _media_stats_changed_for_throughput(
     media_bitrate_relative_tolerance: float = MEDIA_BITRATE_RELATIVE_TOLERANCE,
     media_history: Any = None,
 ) -> bool:
-    if not previous_stats:
-        return False
-    if not new_stats:
-        return False
-    previous_width, previous_height = parse_resolution(previous_stats)
-    new_width, new_height = parse_resolution(new_stats)
-    if previous_width and previous_height and new_width and new_height and (previous_width, previous_height) != (new_width, new_height):
-        return True
-    history = _history_stats(media_history)
-    if not history:
-        history = [previous_stats]
-    return _persistent_fps_change(history, new_stats) or _persistent_bitrate_change(
-        history,
-        new_stats,
-        relative_tolerance=media_bitrate_relative_tolerance,
+    return bool(
+        _media_stats_change_reasons(
+            previous_stats,
+            new_stats,
+            media_bitrate_relative_tolerance=media_bitrate_relative_tolerance,
+            media_history=media_history,
+        )
     )
+
+
+def _media_stats_snapshot(stats: Mapping[str, Any] | None) -> dict[str, Any]:
+    stats = stats or {}
+    width, height = parse_resolution(stats)
+    return {
+        "resolution": f"{width}x{height}" if width and height else None,
+        "fps": parse_fps(stats),
+        "video_bitrate_kbps": _extract_video_bitrate(stats),
+    }
 
 
 def _status_counts(items, cache) -> collections.Counter[str]:
@@ -751,6 +784,115 @@ def _append_health_history(
     rollup_cutoff = (observed_at - timedelta(days=MEDIA_CHECK_ROLLUP_RETENTION_DAYS)).date().isoformat()
     entry["health_daily_rollups"] = {
         key: value for key, value in sorted(rollups.items()) if key >= rollup_cutoff
+    }
+
+
+def _throughput_history_report(items, cache: Mapping[str, Any], *, now: datetime) -> dict[str, Any]:
+    cutoff = now - timedelta(days=MEDIA_CHECK_HISTORY_RETENTION_DAYS)
+    status_counts: collections.Counter[str] = collections.Counter()
+    reason_counts: collections.Counter[str] = collections.Counter()
+    source_counts: collections.Counter[str] = collections.Counter()
+    transition_counts: collections.Counter[str] = collections.Counter()
+    media_cause_counts: collections.Counter[str] = collections.Counter()
+    media_source_counts: collections.Counter[str] = collections.Counter()
+    media_status_counts: collections.Counter[str] = collections.Counter()
+    per_stream: collections.Counter[int] = collections.Counter()
+    observed_at = []
+    ratios = []
+    durations = []
+    same_status = 0
+    changed_status = 0
+    media_same_status = 0
+    media_changed_status = 0
+    item_by_id = {int(item["id"]): item for item in items}
+
+    for item in items:
+        stream_id = int(item["id"])
+        entry = cache.get(str(stream_id)) or {}
+        for row in entry.get("throughput_check_history") or []:
+            if not isinstance(row, Mapping):
+                continue
+            checked_at = _parse_datetime(row.get("checked_at"))
+            if checked_at is None or checked_at < cutoff:
+                continue
+            status = str(row.get("status") or "unknown").lower()
+            previous_status = str(row.get("previous_status") or "unknown").lower()
+            reason = str(row.get("reason") or "unknown")
+            source = str(row.get("source") or "direct_probe")
+            status_counts[status] += 1
+            reason_counts[reason] += 1
+            source_counts[source] += 1
+            per_stream[stream_id] += 1
+            observed_at.append(checked_at)
+            if previous_status in {"healthy", "marginal", "insufficient", "unknown"}:
+                transition_counts[f"{previous_status}_to_{status}"] += 1
+                if previous_status == status:
+                    same_status += 1
+                else:
+                    changed_status += 1
+            for value, target in (
+                (row.get("capacity_ratio"), ratios),
+                (row.get("duration_seconds"), durations),
+            ):
+                try:
+                    target.append(float(value))
+                except (TypeError, ValueError):
+                    pass
+            media_change = row.get("media_change")
+            if not isinstance(media_change, Mapping):
+                continue
+            media_status_counts[status] += 1
+            media_source_counts[str(media_change.get("source") or "unknown")] += 1
+            for cause in media_change.get("causes") or []:
+                media_cause_counts[str(cause)] += 1
+            if previous_status in {"healthy", "marginal", "insufficient", "unknown"}:
+                if previous_status == status:
+                    media_same_status += 1
+                else:
+                    media_changed_status += 1
+
+    observed_at.sort()
+    top_streams = []
+    for stream_id, count in per_stream.most_common(20):
+        item = item_by_id.get(stream_id) or {}
+        top_streams.append({
+            "stream_id": stream_id,
+            "name": str(item.get("name") or ""),
+            "source_name": str(item.get("account_name") or ""),
+            "observations": count,
+        })
+    return {
+        "retention_days": MEDIA_CHECK_HISTORY_RETENTION_DAYS,
+        "observations": sum(status_counts.values()),
+        "streams": len(per_stream),
+        "history_span_hours": round(
+            (observed_at[-1] - observed_at[0]).total_seconds() / 3600.0, 4
+        ) if len(observed_at) >= 2 else 0.0,
+        "status_counts": dict(status_counts),
+        "reason_counts": dict(reason_counts),
+        "source_counts": dict(source_counts),
+        "status_transition_counts": dict(transition_counts),
+        "same_status": same_status,
+        "changed_status": changed_status,
+        "capacity_ratio": {
+            "samples": len(ratios),
+            "p50": _round_if_present(_percentile(ratios, 0.5), 4),
+            "p90": _round_if_present(_percentile(ratios, 0.9), 4),
+        },
+        "duration_seconds": {
+            "samples": len(durations),
+            "p50": _round_if_present(_percentile(durations, 0.5), 4),
+            "p90": _round_if_present(_percentile(durations, 0.9), 4),
+        },
+        "media_changed": {
+            "observations": sum(media_status_counts.values()),
+            "cause_counts": dict(media_cause_counts),
+            "source_counts": dict(media_source_counts),
+            "status_counts": dict(media_status_counts),
+            "same_status": media_same_status,
+            "changed_status": media_changed_status,
+        },
+        "top_observed_streams": top_streams,
     }
 
 
@@ -1049,6 +1191,7 @@ def _build_health_report(
             "throughput_due": dict(throughput_reason_counts),
         },
         "playback_throughput": _playback_throughput_report(items, cache),
+        "throughput_history": _throughput_history_report(items, cache, now=now),
         "ttl_tuning_guidance": {
             "suggested_health_ttl_hours": _round_if_present(alive_episode_p25, 2),
             "suggested_dead_ttl_hours": _round_if_present(dead_recovery_p50, 2),
@@ -1599,7 +1742,7 @@ def _sync_runtime_playback_evidence(
                     "source": row.get("source"),
                     "reason": row.get("reason"),
                 }
-                entry = _merge_throughput_result(item, entry, result)
+                entry = _merge_throughput_result(item, entry, result, record_history=False)
 
         cutoff = datetime.now(timezone.utc) - timedelta(days=MEDIA_CHECK_HISTORY_RETENTION_DAYS)
         entry["playback_throughput_history"] = [
@@ -1815,8 +1958,44 @@ def _merge_content_result(
     return merged
 
 
-def _merge_throughput_result(item, entry, result) -> dict[str, Any]:
+def _append_throughput_history(item, entry, result) -> dict[str, Any]:
     merged = dict(entry)
+    checked_at = result.get("tested_at") or result.get("checked_at") or analyzer._utc_now_iso()
+    previous = merged.get("throughput") if isinstance(merged.get("throughput"), Mapping) else {}
+    previous_status = str(result.get("previous_status") or previous.get("status") or "unknown").lower()
+    row = {
+        "checked_at": checked_at,
+        "status": str(result.get("status") or "unknown").lower(),
+        "previous_status": previous_status,
+        "reason": str(result.get("reason") or "unknown"),
+        "source": str(result.get("source") or "direct_probe"),
+        "measured_mbps": result.get("measured_mbps"),
+        "nominal_video_kbps": result.get("nominal_video_kbps"),
+        "capacity_ratio": result.get("capacity_ratio"),
+        "duration_seconds": result.get("duration_seconds"),
+        "error_type": str(result.get("error_type") or ""),
+        "error": str(result.get("error") or ""),
+        "m3u_account_id": item.get("account_id"),
+        "m3u_account_name": item.get("account_name"),
+    }
+    if isinstance(result.get("media_change"), Mapping):
+        row["media_change"] = dict(result["media_change"])
+    history = [row for row in (merged.get("throughput_check_history") or []) if isinstance(row, Mapping)]
+    observed_at = _parse_datetime(checked_at) or datetime.now(timezone.utc)
+    cutoff = observed_at - timedelta(days=MEDIA_CHECK_HISTORY_RETENTION_DAYS)
+    history = [
+        dict(row) for row in history
+        if (_parse_datetime(row.get("checked_at")) or observed_at) >= cutoff
+    ]
+    history.append(row)
+    merged["throughput_check_history"] = history[-THROUGHPUT_CHECK_HISTORY_MAX_ROWS:]
+    return merged
+
+
+def _merge_throughput_result(item, entry, result, *, record_history: bool = True) -> dict[str, Any]:
+    merged = dict(entry)
+    if record_history:
+        merged = _append_throughput_history(item, merged, result)
     throughput = dict(result)
     checked_at = throughput.get("tested_at") or analyzer._utc_now_iso()
     throughput["checked_at"] = checked_at
@@ -1853,7 +2032,7 @@ def _migrate_legacy_throughput(items, cache) -> int:
         result = legacy.get(key)
         if not isinstance(result, Mapping):
             continue
-        cache[key] = _merge_throughput_result(item, entry, result)
+        cache[key] = _merge_throughput_result(item, entry, result, record_history=False)
         migrated += 1
     return migrated
 
@@ -2335,18 +2514,32 @@ def analyze_assigned_streams(
             canceled = analysis_cancel_requested()
 
     canceled = canceled or analysis_cancel_requested()
-    media_changed_ids = {
-        sid for sid, result in media_results.items()
-        if str(result.get("status") or "unknown").lower() == "alive"
-        and not _is_confirmed_placeholder_result(result)
-        if _media_stats_changed_for_throughput(
+    media_change_evidence_by_id = {}
+    for sid, result in media_results.items():
+        if str(result.get("status") or "unknown").lower() != "alive":
+            continue
+        if _is_confirmed_placeholder_result(result):
+            continue
+        causes = _media_stats_change_reasons(
             previous_media_stats.get(sid),
             result.get("stats"),
             media_bitrate_relative_tolerance=media_bitrate_relative_tolerance,
             media_history=previous_media_history.get(sid),
         )
-    }
-    media_changed_ids.update(dispatcharr_metadata_changed_ids)
+        if causes:
+            media_change_evidence_by_id[sid] = {
+                "source": "direct_ffprobe",
+                "causes": causes,
+                "previous": _media_stats_snapshot(previous_media_stats.get(sid)),
+                "current": _media_stats_snapshot(result.get("stats")),
+            }
+    for sid in dispatcharr_metadata_changed_ids:
+        media_change_evidence_by_id.setdefault(sid, {
+            "source": "dispatcharr_stream_stats",
+            "causes": ["resolution"],
+            "current": _media_stats_snapshot((cache.get(str(sid)) or {}).get("stats")),
+        })
+    media_changed_ids = set(media_change_evidence_by_id)
     placeholder_recovered_ids = {
         sid
         for sid, result in media_results.items()
@@ -2396,6 +2589,16 @@ def analyze_assigned_streams(
     content_capacity_deferred_ids = set()
     item_by_id = {int(item["id"]): item for item in items}
     throughput_reason_by_id = {int(item["id"]): reason for item, reason in throughput_due}
+
+    def annotate_throughput_result(sid, result, nominal):
+        annotated = dict(result)
+        annotated["reason"] = throughput_reason_by_id.get(sid, "unknown")
+        annotated["nominal_video_kbps"] = nominal
+        previous = (cache.get(str(sid)) or {}).get("throughput") or {}
+        annotated["previous_status"] = str(previous.get("status") or "unknown").lower()
+        if sid in media_change_evidence_by_id:
+            annotated["media_change"] = dict(media_change_evidence_by_id[sid])
+        return annotated
     content_candidate_ids = {
         sid for sid in content_reason_by_id
         if str((media_results.get(sid) or cache.get(str(sid)) or {}).get("status") or "unknown").lower() == "alive"
@@ -2615,7 +2818,7 @@ def analyze_assigned_streams(
                     sample_path = None
                     nominal = None
                 if sample_path:
-                    throughput_results[sid] = dict(throughput_result)
+                    throughput_results[sid] = annotate_throughput_result(sid, throughput_result, nominal)
                     if throughput_result.get("measured_mbps") is not None:
                         throughput_checked_ids.add(sid)
                         throughput_retry_ids.discard(sid)
@@ -2787,7 +2990,7 @@ def analyze_assigned_streams(
 
                 if sample_path:
                     combined_capture_retry_ids.discard(sid)
-                    throughput_results[sid] = dict(throughput_result)
+                    throughput_results[sid] = annotate_throughput_result(sid, throughput_result, nominal)
                     if throughput_result.get("measured_mbps") is not None:
                         throughput_checked_ids.add(sid)
                         throughput_retry_ids.discard(sid)
@@ -2939,7 +3142,7 @@ def analyze_assigned_streams(
                         "error": f"{type(exc).__name__}: {exc}",
                     }
                     nominal = None
-                throughput_results[sid] = dict(result)
+                throughput_results[sid] = annotate_throughput_result(sid, result, nominal)
                 if result.get("measured_mbps") is not None:
                     throughput_checked_ids.add(sid)
                     throughput_retry_ids.discard(sid)
@@ -3084,7 +3287,7 @@ def analyze_assigned_streams(
                     "error": f"{type(exc).__name__}: {exc}",
                 }
                 nominal = None
-            throughput_results[sid] = dict(result)
+            throughput_results[sid] = annotate_throughput_result(sid, result, nominal)
             if result.get("measured_mbps") is not None:
                 throughput_checked_ids.add(sid)
             elapsed = max(time.monotonic() - throughput_started, 0.001)
@@ -3107,6 +3310,7 @@ def analyze_assigned_streams(
         item = item_by_id[sid]
         terminal = content_results.get(sid) or media_results.get(sid) or {}
         if str(terminal.get("status") or "unknown").lower() == "dead":
+            cache[str(sid)] = _append_throughput_history(item, cache.get(str(sid)) or {}, result)
             continue
         cache[str(sid)] = _merge_throughput_result(item, cache.get(str(sid)) or {}, result)
 

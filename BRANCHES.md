@@ -10,11 +10,23 @@ Before deleting a branch, record user-visible results in `CHANGELOG.md` and dura
 |---|---|---|---|---|---|
 | `main` | long-lived | active | historical repository root | approved stable releases | Reserved stable-release branch; Stream Sort is not yet published in the stable registry. |
 | `dev` | long-lived | active | `main` | `main` | Integrates and validates the next beta and stable release. |
+| `feature/analysis-telemetry-retention` | short-lived | active | `dev` | `dev` | Retain direct throughput/media-change evidence and applied-sort movement history. |
 | `feature/issue-7-settings-controls` | short-lived | active | `dev` | `dev` | Simplify settings/action layout, bound M3U scores, and add comma-separated name rules. |
 | `fix/v0.3.6-beta.6-analysis-control` | short-lived | active | `dev` | `dev` | Prevent overlapping analysis entry points, add safe cancellation, and publish immutable beta.6. |
 | `fix/v0.3.6-beta.10-telemetry-integrity` | short-lived | active | `dev` | `dev` | Preserve scan-boundary health transitions and distinguish attempted throughput probes from completed measurements. |
 
 ## Branch Records
+
+### `feature/analysis-telemetry-retention`
+
+- Type: short-lived feature branch
+- Status: active
+- Base and target: `dev` at `c1b1172177c87c93ab5edeec2d45870c9328ed81`
+- Purpose: use the first six days of stable scheduled evidence to make media-change, throughput, and repeated sorting behavior directly measurable
+- Scope: direct throughput retention, exact media-change causes, applied-sort movement and score-delta retention, Sort History action, reset integration, focused tests, user documentation, changelog, and decision record
+- Exclusions: probing thresholds, placeholder TTL behavior, scoring weights, registry metadata, version bump, deployment, and persistent problematic-stream notifications
+- Completion: focused and full tests, Python compilation, workspace validation, contradiction review, chat-independence review, and remote checkpoint before separate integration or publication approval
+- Validation: 164 full-suite tests and 67 initial focused tests passed; Python compilation, diff checks, governed-project validation, and standards reconciliation passed on 2026-09-02.
 
 ### `feature/v0.3.6-beta.15-selector-order`
 

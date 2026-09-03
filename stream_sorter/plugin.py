@@ -883,6 +883,50 @@ def _run_health_report_action() -> dict:
     }
 
 
+def _run_sort_history_action() -> dict:
+    report = _load_json(REPORT_PATH, {})
+    history = report.get("sort_history") if isinstance(report.get("sort_history"), list) else []
+    if not history:
+        return {
+            "status": "error",
+            "message": "No applied sort history found. Run Sort Streams or Analyze + Sort first.",
+        }
+    first_at = _parse_datetime(history[0].get("generated_at"))
+    last_at = _parse_datetime(history[-1].get("generated_at"))
+    span_hours = (
+        max(0.0, (last_at - first_at).total_seconds() / 3600.0)
+        if first_at is not None and last_at is not None
+        else 0.0
+    )
+    changed_channels = sum(int(row.get("channels_changed") or 0) for row in history)
+    movement_events = sum(
+        len(channel.get("movements") or [])
+        for row in history
+        for channel in row.get("changed_channels") or []
+        if isinstance(channel, Mapping)
+    )
+    result = {
+        "generated_at": report.get("generated_at"),
+        "retention_days": report.get("sort_history_retention_days", 90),
+        "rollup_retention_days": report.get("sort_rollup_retention_days", 365),
+        "applied_runs": len(history),
+        "history_span_hours": round(span_hours, 2),
+        "channels_changed": changed_channels,
+        "stream_movements": movement_events,
+        "sort_history": history,
+        "daily_rollups": report.get("sort_daily_rollups") or {},
+    }
+    return {
+        "status": "ok",
+        "message": (
+            f"Sort history: {len(history)} applied runs over {span_hours:.1f}h; "
+            f"{changed_channels} changed-channel results; {movement_events} stream movements."
+        ),
+        "report_path": REPORT_PATH,
+        "result": result,
+    }
+
+
 def _scheduled_settings(settings: dict, *, allow_parallel_checks: bool) -> dict:
     scheduled = dict(settings or {})
     scheduled.pop("stream_sort_schedule_cron", None)
@@ -1472,6 +1516,7 @@ def _run_reset_statistics_action(*, include_history: bool) -> dict:
             ANALYSIS_HEALTH_REPORT_PATH,
             TTL_RECOMMENDATION_PATH,
             STATUS_PATH,
+            REPORT_PATH,
         )
         removed = []
         for path in scan_paths:
@@ -1613,6 +1658,9 @@ class Plugin:
 
             if action == "health_report":
                 return _run_health_report_action()
+
+            if action == "sort_history":
+                return _run_sort_history_action()
 
             if action == "reset_scan_statistics":
                 return _run_reset_statistics_action(include_history=False)
