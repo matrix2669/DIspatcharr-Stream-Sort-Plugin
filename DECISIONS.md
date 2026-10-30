@@ -992,3 +992,6 @@ Attempt observations preserve valid internal due reasons, the actual normalized 
 
 
 Archive-abort cleanup uses an explicit result-disposal callback on the two combined-capture schedulers. The scheduler owns only its bounded unconsumed results, including completed results withheld by an archive error and results finishing during shutdown; it disposes them after workers finish. Yield transfers ownership to the caller/local decoder, and generic results do not grant permission to unlink arbitrary paths. This closes the completed-review R5 capture leak without changing provider, classification or retention policy.
+
+
+ADR-025 source acceptance is established at `329ba52c15198fa16a098b0788c858fcb6f755b9` by completed independent review (R1-R5 closed) and original full media/PostgreSQL CI run `41135518859`. This supersedes the prior222141a deployment candidate only for the explicitly approved richer telemetry scope; it does not execute production cutover. Keep the operator's recording/viewer readiness gate, capture reuse disabled and the post-cutover Analyze-only scan serial. Performance/usefulness conclusions require collected production evidence; implementation/CI alone is not an impact result.
