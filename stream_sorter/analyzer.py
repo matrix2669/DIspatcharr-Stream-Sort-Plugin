@@ -252,6 +252,8 @@ def _analyze_content(raw_url: str, *, settings: Mapping[str, Any], user_agent: s
     if not local_source:
         cmd.extend(_input_http_args(extra_headers, user_agent))
         cmd.extend(['-rw_timeout', str(connection_timeout * 1000000)])
+    else:
+        cmd.extend(['-protocol_whitelist', 'file,pipe', '-f', 'mpegts', '-progress', 'pipe:1'])
     cmd.extend(['-i', clean_url, '-t', str(sample_seconds)])
     if want_audio:
         cmd.extend(['-af', 'volumedetect'])
@@ -292,6 +294,17 @@ def _analyze_content(raw_url: str, *, settings: Mapping[str, Any], user_agent: s
         }
     stderr = completed.stderr or ''
     clean_exit = completed.returncode == 0
+    if local_source and clean_exit:
+        progress = []
+        for line in (getattr(completed, 'stdout', '') or '').splitlines():
+            if line.startswith('out_time_us='):
+                try:
+                    progress.append(int(line.split('=', 1)[1]) / 1_000_000)
+                except ValueError:
+                    pass
+        if not progress or max(progress) < sample_seconds - 0.25:
+            return {'measured': False, 'error_type': 'content_sample_incomplete',
+                    'error': 'Local sample decoded less than the required playable duration'}
     if not clean_exit:
         classified = _classify_error(stderr, completed.returncode)
         retryable_type = classified if classified in RETRYABLE_ERROR_TYPES else 'stream_unreachable'
@@ -354,7 +367,7 @@ def apply_content_analysis(
     return updated
 
 
-def analyze_stream(raw_url: str, *, stream_id: Any, stream_name: str, settings: Mapping[str, Any], user_agent: str=DEFAULT_USER_AGENT, logger=None, include_content: bool=True) -> dict[str, Any]:
+def analyze_stream(raw_url: str, *, stream_id: Any, stream_name: str, settings: Mapping[str, Any], user_agent: str=DEFAULT_USER_AGENT, logger=None, include_content: bool=True, local_source: bool=False) -> dict[str, Any]:
     logger = logger or logging.getLogger('plugins.stream_sorter')
     tested_at = _utc_now_iso()
     base = {'tested_at': tested_at, 'status': 'dead', 'error_type': 'other', 'error': '', 'stats': {}, 'details': {}}
@@ -369,8 +382,12 @@ def analyze_stream(raw_url: str, *, stream_id: Any, stream_name: str, settings: 
     total_timeout = probe_timeout + analysis_duration + 5
     clean_url, extra_headers = _split_url_headers(raw_url)
     cmd = [ffprobe_path, '-print_format', 'json']
-    cmd.extend(_input_http_args(extra_headers, user_agent))
-    cmd.extend(['-timeout', str(connection_timeout * 1000000), '-analyzeduration', str(probe_timeout * 1000000), '-probesize', '10000000', '-show_streams', '-show_packets', '-show_format', '-read_intervals', f'%+{analysis_duration}', clean_url])
+    if not local_source:
+        cmd.extend(_input_http_args(extra_headers, user_agent))
+        cmd.extend(['-timeout', str(connection_timeout * 1000000)])
+    else:
+        cmd.extend(['-protocol_whitelist', 'file,pipe', '-f', 'mpegts'])
+    cmd.extend(['-analyzeduration', str(probe_timeout * 1000000), '-probesize', '10000000', '-show_streams', '-show_packets', '-show_format', '-read_intervals', f'%+{analysis_duration}', clean_url])
     started = time.monotonic()
     try:
         completed = subprocess.run(cmd, capture_output=True, text=True, timeout=total_timeout)
@@ -467,7 +484,9 @@ def analyze_stream(raw_url: str, *, stream_id: Any, stream_name: str, settings: 
             'details': details,
         }
     container_duration = _parse_container_duration(probe_data)
-    if container_duration is not None:
+    if local_source and container_duration is not None:
+        details['sample_duration_seconds'] = container_duration
+    if container_duration is not None and not local_source:
         details['container_duration_seconds'] = round(container_duration, 3)
         container_bitrate = _parse_container_bitrate_kbps(probe_data)
         if container_bitrate is not None:
@@ -485,11 +504,14 @@ def analyze_stream(raw_url: str, *, stream_id: Any, stream_name: str, settings: 
             'stats': stats,
             'details': details,
         }
+    if local_source:
+        stats.pop('stream_type', None)
+        details['metadata_source'] = 'bounded_local_sample'
     details['has_audio'] = audio_stream is not None
     result = {**base, 'status': 'alive', 'error_type': None, 'error': '', 'stats': stats, 'details': details}
     if not include_content:
         return result
-    return apply_content_analysis(result, raw_url, settings=settings, user_agent=user_agent, logger=logger)
+    return apply_content_analysis(result, raw_url, settings=settings, user_agent=user_agent, logger=logger, local_source=local_source)
 
 class RateLimitGuard:
     WINDOW_SECONDS = 60
@@ -587,6 +609,8 @@ def _overall_text(counts: Mapping[str, int], total: int, completed: int) -> str:
     return f"alive={counts.get('alive', 0)} dead={counts.get('dead', 0)} skipped={counts.get('skipped', 0)} pending={max(0, total - completed)}"
 
 def analyze_assigned_streams(settings: Mapping[str, Any], *, logger, cache_path: str=ANALYSIS_CACHE_PATH) -> dict[str, Any]:
+    from .storage import reject_postgres
+    reject_postgres(settings, 'legacy analyzer; use incremental analyzer for PostgreSQL')
     from apps.channels.models import ChannelStream
     from .sorter import resolve_channel_scope
     channel_ids, filter_summary = resolve_channel_scope(settings)
@@ -684,6 +708,8 @@ def analyze_assigned_streams(settings: Mapping[str, Any], *, logger, cache_path:
     return {'streams_analyzed': len(results), 'channels_selected': len({row.channel_id for row in rows}), 'filters': filter_summary, 'status_counts': {key: value for key, value in counts.items() if value > 0}, 'cache_path': cache_path}
 
 def probe_assigned_streams(settings: Mapping[str, Any], *, logger, cache_path: str | None=None) -> dict[str, Any]:
+    from .storage import reject_postgres
+    reject_postgres(settings, 'probe_assigned_streams')
     from apps.channels.models import ChannelStream
     from .sorter import resolve_channel_scope
     from .throughput import DEFAULT_CACHE_PATH

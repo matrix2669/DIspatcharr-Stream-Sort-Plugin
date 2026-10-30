@@ -95,9 +95,9 @@ Behavior affecting provider connections also requires controlled Dispatcharr int
 
 ## Scheduler and Health-State Contracts
 
-- Accumulate scan imports and observations in RAM until the completion/cooperative-cancellation save. Preserve previous completed data on abrupt failure; do not add per-stream whole-cache writes.
+- In JSON mode accumulate scan imports and observations in RAM until the completion/cooperative-cancellation save. PostgreSQL mode follows ADR-024's bounded phase transactions and targeted re-query; do not add per-stream whole-cache or whole-history rewrites.
 - Keep individual system log entries. Persist UI progress no more often than every ten seconds within an unchanged phase, immediately on phase changes, and always publish terminal job status.
-- PostgreSQL persistence is a proposed contract under ADR-023, not implemented schema support. Do not register dynamic Django applications, run global migrations, create tables during module import, or mutate Dispatcharr-owned schemas to enable it.
+- PostgreSQL implementation follows ADR-024 and must remain explicitly initialized/selected behind its validation gates. Do not register dynamic Django applications, run global migrations, create tables during module import, or mutate Dispatcharr-owned schemas to enable it. Phase component persistence cannot publish provisional aggregate health as terminal; fence every scan batch and separate playback field ownership.
 
 - Scheduled analysis state is `/data/dispatcharr_stream_sort_schedule_state.json`; configuration is versioned, every due minute is atomically claimed through Django cache, and every run loads current `PluginConfig.settings`.
 - Every long-lived scheduler cycle that can use the ORM must call `close_old_connections()` before and after work.

@@ -316,3 +316,68 @@ def probe_stream(
         "nominal_video_kbps": nominal_video_kbps,
         "edge_host": edge_host,
     }
+
+
+def capture_bounded_sample(raw_url, *, duration_seconds, timeout_seconds, temp_directory,
+                           user_agent=DEFAULT_USER_AGENT, max_bytes=32 * 1024 * 1024,
+                           stop_requested=lambda: False):
+    """Raw HTTP sample: exact byte bound, bounded read deadlines, no remux.
+
+    Only a completed wall-time sample measures throughput. EOF, cancellation,
+    byte-cap exhaustion, and read errors leave components due. The caller must
+    delete a returned path immediately after local processing.
+    """
+    tested = datetime.now(timezone.utc).isoformat()
+    started = time.monotonic()
+    path = None
+    response = None
+    total = 0
+    try:
+        if not 1 <= duration_seconds <= 30 or timeout_seconds < duration_seconds:
+            raise ValueError('Shared capture requires 1-30 seconds and a sufficient timeout')
+        if not 0 < max_bytes <= 64 * 1024 * 1024:
+            raise ValueError('Shared capture byte bound must not exceed 64 MiB')
+        if stop_requested():
+            raise RuntimeError('Capture canceled')
+        url, headers = _split_url_headers(raw_url)
+        headers.setdefault('User-Agent', user_agent)
+        headers.setdefault('Accept', '*/*')
+        if not url.lower().startswith(('http://', 'https://')):
+            raise ValueError('Shared RAM capture supports HTTP(S) only')
+        response = urllib.request.urlopen(urllib.request.Request(url, headers=headers),
+                                          timeout=min(2.0, timeout_seconds))
+        if response.headers.get('Content-Length') or response.headers.get('Content-Range'):
+            raise RuntimeError('Finite HTTP object requires direct placeholder validation')
+        fd, path = tempfile.mkstemp(prefix='stream-sort-bounded-', suffix='.sample', dir=temp_directory)
+        deadline = started + min(duration_seconds, timeout_seconds)
+        with os.fdopen(fd, 'wb') as output:
+            while time.monotonic() < deadline:
+                if stop_requested():
+                    raise RuntimeError('Capture canceled')
+                remaining = max_bytes - total
+                if remaining <= 0:
+                    raise RuntimeError('Capture byte limit reached')
+                # read1 returns available data instead of waiting for a full block.
+                chunk = response.read1(min(64 * 1024, remaining))
+                if not chunk:
+                    raise RuntimeError('Source ended before a sustained live sample completed')
+                output.write(chunk)
+                total += len(chunk)
+        elapsed = max(time.monotonic() - started, 0.001)
+        if total < 64 * 1024:
+            raise RuntimeError('Sample too small')
+        return {'tested_at': tested, 'bytes': total, 'elapsed_seconds': elapsed,
+                'measured_mbps': total * 8 / elapsed / 1_000_000,
+                'measurement_source': 'raw_http_capture', 'complete': True}, path
+    except Exception:
+        if path:
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+        return {'tested_at': tested, 'status': 'unknown', 'complete': False,
+                'bytes': total, 'error_type': 'capture_incomplete',
+                'error': 'Bounded sample incomplete; direct reserved fallback required'}, None
+    finally:
+        if response is not None:
+            response.close()

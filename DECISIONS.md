@@ -844,7 +844,7 @@ The same review confirmed that known-placeholder probes average about 2.51 secon
 
 ## Status
 
-Accepted for bounded JSON write reductions and evaluation requirements. PostgreSQL backend, schema initialization, run-lease replacement, metadata bulk updates, and shared-capture implementation are proposed pending the compatibility and equivalence gates below.
+Accepted for bounded JSON write reductions and evaluation requirements. ADR-024 subsequently accepts implementation of phase-boundary PostgreSQL storage and bounded capture reuse following the installed-lifecycle review. Production activation remains subject to the compatibility, migration, concurrency and equivalence gates below; metadata bulk-update behavior remains pending evaluation.
 
 ## Date and provenance
 
@@ -895,3 +895,40 @@ Retain fast direct probes for metadata-only and placeholder checks. When multipl
 4. Resume telemetry corrections, transition audit, sorting-history replay/stability, event classification, dead-feed investigation, storage/scheduler monitoring, TTL interval analysis, and notification qualification in the previously accepted order. Those are tracked work, not delivered by the write-reduction phase.
 
 A shared-capture planner must account for FFprobe discovering a new media-change cause after initial due decisions. It must either retain a sufficient measured capture for newly due throughput/content or explicitly perform a capacity-reserved fallback check; it must never claim those components complete from metadata-only data. Controlled comparisons must report actual provider opens, received bytes, capture wall time, usable media duration, metadata/content equivalence, and peak memory. Keep immutable fixtures and all sample data outside the repository; do not store provider credentials in reports.
+
+---
+
+# ADR-024: Phase-boundary PostgreSQL batches and bounded media reuse
+
+## Status
+
+Accepted architecture and implementation scope; activation requires migration, concurrency, capture-equivalence, and operational acceptance evidence. Existing installations retain JSON storage until explicit migration and backend selection. This record does not assert production migration or deployment.
+
+## Date and provenance
+
+2026-10-30. Operator approved phase-boundary batch writes followed by targeted database queries, with bounded RAM capture reuse to reduce provider openings. The earlier ADR-023 installed-lifecycle review established no native Dispatcharr plugin migration facility; operator selected the plugin-owned migration-runner path for evaluation and implementation.
+
+## Decision
+
+- Implement plugin-owned versioned PostgreSQL tables through Django's existing configured database connection. Initialization and legacy-data migration are explicit operations, never module-import, app-registration, or automatic global-migrate side effects. Keep existing runtime data files intact through acceptance. Missing/incompatible schema or database failure after selecting PostgreSQL is an error, not a silent switch to an older JSON snapshot.
+- At scan start query only selected stream/provider identities and component state needed for eligibility. Keep intermediate work in RAM. Flush completed component evidence and historical inserts in bounded batches at logical phase boundaries, scan completion, and cooperative cancellation. Do not add per-result full-state or full-history rewrites.
+- After FFprobe/retry phase persistence, query affected stream/provider IDs for current components and newer eligible playback evidence. Recalculate content/throughput eligibility using component timestamps, current settings, terminal-dead gates and media-change decisions; no persisted derived due flag or expiration timestamp replaces these rules.
+- Phase component persistence must not manufacture terminal aggregate health. Preserve the last terminal aggregate for ordinary readers until final confirmation; keep scan-start status as the terminal history baseline. A scan contributes at most one terminal health observation per stream, never one for each phase or retry. Interrupted dead retries remain provisional and immediately due under ADR-009/015.
+- All probes and local decoding run outside database transactions. Every persistence batch is a short, bounded transaction. Use idempotent observation identifiers so retries after uncertain commits do not duplicate history or rollups. Retention remains detailed 90 days and daily rollups 365 days.
+- Scan-owned state and playback-owned events/reliability are persisted separately. Scan batches update only owned fields; targeted playback reuse must not overwrite a newer event or promote confirmed dead health. Source profile credential rotation preserves stream/provider attribution, and provider reassignment invalidates reusable component evidence.
+- Use an expiring owner-token lease with heartbeat and atomic fencing on writes. Loss of ownership stops new provider operations and rejects stale commits or releases. Do not reclaim viewer/provider counters during crash recovery. Heartbeat/expiry defaults must be stated in the implementation and validated against worst-case operation durations before activation.
+- Continue every individual system log. Ten-second UI progress persistence and logical-phase handling from ADR-023 remain unchanged.
+
+## Bounded capture reuse
+
+- Metadata-only and known-placeholder checks retain the lightweight direct path. When multiple components are due, use at most a worker-sized or otherwise explicitly bounded set of RAM-backed provider captures. Decode/analyze each sample promptly and delete it on every success, failure, cancellation and exception path; never retain every sample until a whole serial FFprobe phase completes.
+- Run local FFprobe/content checks against reusable captured media only when their completeness/equivalence criteria are met. Provider identity, timestamp provenance and URL attribution must refer to the original stream, not the temporary local pathname.
+- Throughput is measured only over provider acquisition time/bytes. Reading the local sample is never a throughput test. Incomplete samples cannot satisfy component TTLs. The existing remux measurement is labeled as such; metadata lost or changed by remuxing must not be asserted equivalent without tests.
+- FFprobe can discover a media change that makes downstream work newly due. Use a retained valid measured sample if available; otherwise use an explicit, viewer-capacity-reserved fallback check. Bounded reuse reduces openings but does not promise exactly one opening for every stream, failure or protocol.
+- Preserve native profile URL resolution, user agent and headers, active viewer protection, provider-safe retries, exact reservation release, configured capture windows, minimum bitrate floor, placeholder rules and independent component TTLs. This supersedes ADR-010's separate live FFprobe opening only where the tested reusable-capture path is explicitly selected.
+
+## Acceptance and limits
+
+Test actual PostgreSQL schema initialization/version rejection, migration idempotence and restart, batch rollback/retry, targeted query scope, concurrent playback updates, lease expiry/takeover/stale writer, cooperative cancellation, phase-vs-terminal health, resets and retention. Use disposable PostgreSQL and finite controlled fixtures; production DDL and provider probes require their operational gates. Test video metadata/bitrate/content equivalence, insufficient playable duration, capacity/timeout cleanup, sample memory bound, actual provider-opening counts and newly due fallback.
+
+Retain JSON compatibility and do not silently enable an unvalidated backend or capture path. Backup coverage, real Dispatcharr role DDL privileges, live capacity/cancellation checks, supported downgrade behavior and WAL/I/O/runtime measurements remain required before production adoption. PostgreSQL still generates WAL and data writes on Ceph; no disk-free or measured speedup claim follows from this design alone.

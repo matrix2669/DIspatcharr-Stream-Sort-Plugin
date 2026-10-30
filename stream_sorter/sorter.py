@@ -579,6 +579,8 @@ def sort_channels(
     report_path: str = REPORT_PATH,
     cache_path: str = DEFAULT_CACHE_PATH,
 ) -> dict[str, Any]:
+    from .storage import reject_postgres
+    reject_postgres(settings, 'sort_channels')
     from django.db import transaction
     from apps.channels.models import ChannelStream
 
@@ -679,6 +681,8 @@ def probe_assigned_streams(
     logger,
     cache_path: str = DEFAULT_CACHE_PATH,
 ) -> dict[str, Any]:
+    from .storage import reject_postgres
+    reject_postgres(settings, 'probe_assigned_streams')
     from apps.channels.models import ChannelStream
 
     channel_ids, filter_summary = resolve_channel_scope(settings)

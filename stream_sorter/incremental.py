@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import collections
+import copy
 import json
 import os
 import statistics
@@ -11,7 +12,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Mapping
 from zoneinfo import ZoneInfo
 
-from . import analyzer
+from . import analyzer, storage
 from .capacity import build_capacity_manager
 from .execution_control import (
     AnalysisCancelled,
@@ -24,12 +25,14 @@ from .scoring import (
     parse_fps,
     parse_resolution,
     throughput_ttl_with_jitter,
+    classify_throughput,
 )
 from .reliability import RELIABILITY_PATH, load_reliability_cache
 from .throughput import (
     DEFAULT_USER_AGENT,
     LEGACY_CACHE_PATH,
     capture_stream_sample,
+    capture_bounded_sample,
     load_cache as load_throughput_cache,
     probe_stream,
 )
@@ -1389,7 +1392,17 @@ def _fair_account_futures(
                         else item
                     )
                     try:
-                        future = executor.submit(worker, worker_item)
+                        def guarded_work(prepared):
+                            run = storage.active_run()
+                            try:
+                                if analysis_cancel_requested():
+                                    raise AnalysisCancelled('Canceled before provider operation')
+                                storage.ensure_provider_work()
+                                return worker(prepared)
+                            finally:
+                                if run:
+                                    run.store.close_worker_connection()
+                        future = executor.submit(guarded_work, worker_item)
                     except Exception:
                         if capacity_manager is not None:
                             capacity_manager.release(reservation)
@@ -1420,7 +1433,8 @@ def _fair_account_futures(
                 running[key] -= 1
                 if capacity_manager is not None:
                     capacity_manager.release(reservation)
-                completed_rows.append((item, future))
+                if not isinstance(future.exception(), AnalysisCancelled):
+                    completed_rows.append((item, future))
             for item, future in completed_rows:
                 yield item, future
 
@@ -2078,6 +2092,7 @@ def _unique_items_from_rows(rows, channel_attachments) -> list[dict[str, Any]]:
 
 
 @exclusive_analysis_execution
+@storage.postgres_scan
 def analyze_assigned_streams(
     settings: Mapping[str, Any],
     *,
@@ -2135,14 +2150,39 @@ def analyze_assigned_streams(
     items = _unique_items_from_rows(rows, channel_attachments)
 
     total = len(items)
-    cache = analyzer.load_analysis_cache(cache_path)
+    run = storage.active_run()
+    store = run.store if run else None
+    cache = store.load(items) if store else analyzer.load_analysis_cache(cache_path)
+    storage_start = copy.deepcopy(cache) if store else None
+
+    def playback_snapshot(selected):
+        return store.playback([item['id'] for item in selected]) if store else load_reliability_cache(RELIABILITY_PATH)
+
+    def phase_flush(entries):
+        if not store or not entries:
+            return
+        run.ensure()
+        store.flush(entries, run.owner)
+        selected = [item for item in items if str(item['id']) in entries]
+        refreshed = store.load(selected, owner=run.owner)
+        if playback_health_reuse:
+            _sync_runtime_playback_evidence(
+                selected, refreshed, playback_snapshot(selected),
+                min_clean_playback_seconds=playback_health_clean_min_seconds,
+                min_throughput_playback_seconds=playback_health_min_seconds,
+            )
+        for sid, entry in refreshed.items():
+            for key in storage.HISTORY_KEYS:
+                if key in cache.get(sid, {}):
+                    entry[key] = cache[sid][key]
+        cache.update(refreshed)
 
     playback_health_refreshed = 0
     if playback_health_reuse:
         playback_health_refreshed = _sync_runtime_playback_evidence(
             items,
             cache,
-            load_reliability_cache(RELIABILITY_PATH),
+            playback_snapshot(items),
             min_clean_playback_seconds=playback_health_clean_min_seconds,
             min_throughput_playback_seconds=playback_health_min_seconds,
         )
@@ -2152,7 +2192,7 @@ def analyze_assigned_streams(
                 playback_health_refreshed,
             )
 
-    migrated = _migrate_legacy_throughput(items, cache)
+    migrated = _migrate_legacy_throughput(items, cache) if not store else 0
     if migrated:
         logger.info("[Analyze] Migrated %d matching legacy throughput measurements into the unified cache", migrated)
 
@@ -2164,6 +2204,8 @@ def analyze_assigned_streams(
     if dispatcharr_metadata_refreshed:
         logger.info("[Analyze] Refreshed basic metadata for %d streams from newer Dispatcharr stream_stats", dispatcharr_metadata_refreshed)
 
+    # Final merge starts from the scan-start terminal state, never a phase overlay.
+    terminal_base = copy.deepcopy(cache) if store else None
     scan_start_status_by_id = {
         int(item["id"]): str((cache.get(str(item["id"])) or {}).get("status") or "unknown").lower()
         for item in items
@@ -2212,6 +2254,7 @@ def analyze_assigned_streams(
     media_due_ids = {int(item["id"]) for item, _ in media_due}
     initial_due_ids = media_due_ids | set(content_reason_by_id)
     initial_throughput_due = 0
+    initial_throughput_due_ids = set()
     initial_fully_cached = 0
     for item in items:
         entry = cache.get(str(item["id"])) or {}
@@ -2230,6 +2273,7 @@ def analyze_assigned_streams(
             )
             if reason or int(item["id"]) in dispatcharr_metadata_changed_ids:
                 initial_throughput_due += 1
+                initial_throughput_due_ids.add(int(item["id"]))
             elif int(item["id"]) not in initial_due_ids:
                 initial_fully_cached += 1
         elif int(item["id"]) not in initial_due_ids:
@@ -2249,17 +2293,18 @@ def analyze_assigned_streams(
             _overall_throughput_text(collections.Counter()),
             analyzer._format_eta(runtime_seconds),
         )
-        _save_json(
-            health_report_path,
-            _build_health_report(
-                [],
-                cache,
-                now=datetime.now(timezone.utc),
-                media_reason_counts=media_reason_counts,
-                throughput_reason_counts={},
-                channels_selected=len({row.channel_id for row in rows}),
-            ),
-        )
+        if not store:
+            _save_json(
+                health_report_path,
+                _build_health_report(
+                    [],
+                    cache,
+                    now=datetime.now(timezone.utc),
+                    media_reason_counts=media_reason_counts,
+                    throughput_reason_counts={},
+                    channels_selected=len({row.channel_id for row in rows}),
+                ),
+            )
         return {
             "streams_analyzed": 0,
             "streams_selected": 0,
@@ -2280,10 +2325,19 @@ def analyze_assigned_streams(
             "health_summary": health_summary,
             "total_runtime_seconds": round(runtime_seconds, 3),
             "total_runtime": analyzer._format_eta(runtime_seconds),
-            "cache_path": cache_path,
-            "analysis_health_report_path": health_report_path,
+            "storage_backend": "postgresql" if store else "json",
+            "cache_path": None if store else cache_path,
+            "analysis_health_report_path": None if store else health_report_path,
         }
 
+    reuse_captures = analyzer._as_bool(settings.get('bounded_capture_reuse'), False)
+    reuse_temp_directory = _select_capture_temp_directory(workers, logger=logger) if reuse_captures else None
+    capture_bytes = max(1024 * 1024, min(64 * 1024 * 1024,
+        analyzer._as_int(settings.get('capture_max_mib'), 32) * 1024 * 1024))
+    if reuse_temp_directory:
+        ram = os.statvfs(reuse_temp_directory)
+        if ram.f_bavail * (ram.f_frsize or ram.f_bsize) < workers * capture_bytes + _CAPTURE_HEADROOM_BYTES:
+            reuse_temp_directory = None
     capacity_manager = build_capacity_manager(items, logger=logger)
 
     canceled = False
@@ -2317,10 +2371,72 @@ def analyze_assigned_streams(
         result["details"] = details
         return result
 
+    def shared_media_probe(item):
+        sample_seconds = max(2, analyzer._as_int(settings.get('content_sample_seconds'), 6))
+        duration = max(throughput_duration, sample_seconds + 2,
+                       analyzer._as_int(settings.get('analysis_duration_seconds'), 5) + 2)
+        if duration > 30:
+            return None
+        measured, path = capture_bounded_sample(
+            str(item.get('url') or ''), duration_seconds=duration,
+            timeout_seconds=max(throughput_timeout, duration + 2),
+            user_agent=str(item.get('user_agent') or DEFAULT_USER_AGENT),
+            temp_directory=reuse_temp_directory, max_bytes=capture_bytes,
+            stop_requested=analysis_cancel_requested,
+        )
+        if not path:
+            return None
+        try:
+            metadata = analyzer.analyze_stream(
+                path, stream_id=item['id'], stream_name=str(item.get('name') or ''),
+                settings=settings, logger=logger, include_content=False, local_source=True,
+            )
+            # A manifest, corrupt/truncated sample or incomplete local decode is
+            # not evidence that the provider stream is invalid. Reserve fallback.
+            if metadata.get('status') != 'alive':
+                return None
+            playable = (metadata.get('details') or {}).get('sample_duration_seconds', 0)
+            if playable < sample_seconds:
+                return None
+            stats = metadata.get('stats') or {}
+            _, height = parse_resolution(stats)
+            nominal = estimate_nominal_throughput_kbps(height, parse_fps(stats))
+            measured.update({'status': classify_throughput(measured['measured_mbps'], nominal),
+                             'nominal_video_kbps': nominal})
+            shared = {'throughput': measured}
+            if int(item['id']) in content_reason_by_id:
+                content = analyzer.apply_content_analysis(metadata, path, settings=settings,
+                            logger=logger, local_source=True)
+                details = content.get('details') or {}
+                if not (details.get('content') or {}).get('measured'):
+                    return None
+                shared['content'] = content
+            metadata['_shared_capture'] = shared
+            return metadata
+        except Exception:
+            logger.warning('[Analyze] Local shared sample unusable; retaining reserved direct fallback')
+            return None
+        finally:
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+
     def run_media(item, *, force_full: bool = False):
         analyzer._RATE_LIMIT_GUARD.wait_if_throttled()
         limiter.wait(item.get("account_id"))
+        if analysis_cancel_requested():
+            raise AnalysisCancelled("Canceled before media probe")
+        storage.ensure_provider_work()
         sid = int(item["id"])
+        # Metadata-only and known-placeholder gates keep their lightweight path.
+        if reuse_temp_directory and (sid in content_reason_by_id or sid in initial_throughput_due_ids) and sid not in known_placeholder_ids and not force_full:
+            shared = shared_media_probe(item)
+            if shared is not None:
+                return shared
+            if analysis_cancel_requested():
+                raise AnalysisCancelled('Canceled after incomplete capture')
+            storage.ensure_provider_work()
         known_placeholder = sid in known_placeholder_ids and not force_full
         if force_full or not known_placeholder:
             result = full_media_probe(item)
@@ -2511,6 +2627,13 @@ def analyze_assigned_streams(
             canceled = analysis_cancel_requested()
 
     canceled = canceled or analysis_cancel_requested()
+    shared_results = {sid: result.pop('_shared_capture') for sid, result in media_results.items() if '_shared_capture' in result}
+    phase_flush({
+        str(item['id']): _merge_media_result(
+            item, cache.get(str(item['id'])), media_results[int(item['id'])],
+            record_history=False,
+        ) for item, _ in media_due if int(item['id']) in media_results
+    })
     media_change_evidence_by_id = {}
     for sid, result in media_results.items():
         if str(result.get("status") or "unknown").lower() != "alive":
@@ -2546,6 +2669,21 @@ def analyze_assigned_streams(
     for sid in placeholder_recovered_ids:
         content_reason_by_id[sid] = "placeholder_recovered"
 
+    if store:
+        for item in items:
+            sid = int(item['id'])
+            if sid in known_placeholder_ids and sid not in placeholder_recovered_ids:
+                continue
+            reason = content_check_reason(
+                cache.get(str(sid)), url_hash=analyzer._stream_url_hash(str(item.get('url') or '')),
+                ttl_hours=content_ttl_hours, dead_ttl_hours=dead_ttl_hours,
+                provider_id=item.get('account_id'), ttl_jitter_percent=analysis_ttl_jitter_percent,
+                now=datetime.now(timezone.utc),
+            )
+            if reason:
+                content_reason_by_id[sid] = reason
+            else:
+                content_reason_by_id.pop(sid, None)
     now = datetime.now(timezone.utc)
     throughput_due = []
     for item in items:
@@ -2629,7 +2767,20 @@ def analyze_assigned_streams(
         content_checked_ids.add(sid)
         content_candidate_ids.remove(sid)
 
-    combined_ids = content_candidate_ids & set(throughput_reason_by_id)
+    # Opt-in fallback uses direct reserved checks, never an unbounded remux file.
+    combined_ids = set() if reuse_captures else content_candidate_ids & set(throughput_reason_by_id)
+    for sid, shared in shared_results.items():
+        if sid in content_candidate_ids and 'content' in shared:
+            content_results[sid] = shared['content']
+            content_checked_ids.add(sid)
+            content_attempted_ids.add(sid)
+            content_candidate_ids.discard(sid)
+        if sid in throughput_reason_by_id:
+            measured = shared['throughput']
+            throughput_results[sid] = annotate_throughput_result(sid, measured, measured['nominal_video_kbps'])
+            throughput_checked_ids.add(sid)
+            throughput_attempted_ids.add(sid)
+        combined_ids.discard(sid)
 
     def note_content_result(sid, result):
         content_attempted_ids.add(sid)
@@ -2644,6 +2795,10 @@ def analyze_assigned_streams(
         error_type = str(result.get("error_type") or "")
         if error_type and error_type not in telemetry["failure_types"]:
             telemetry["failure_types"].append(error_type)
+
+    for sid in shared_results:
+        if sid in content_results:
+            note_content_result(sid, content_results[sid])
 
     def run_content(item):
         sid = int(item["id"])
@@ -3161,6 +3316,12 @@ def analyze_assigned_streams(
         canceled = analysis_cancel_requested()
 
     canceled = canceled or analysis_cancel_requested()
+    if store and canceled:
+        for sid, result in media_results.items():
+            if scan_start_status_by_id.get(sid) == 'dead' and sid in content_reason_by_id and sid not in content_results:
+                original = terminal_base.get(str(sid)) or {}
+                result.update({'status': 'dead', 'error_type': original.get('error_type'),
+                               'error': original.get('error', ''), 'retry_pending': True})
     terminal_result_ids = set(media_results) | set(content_results)
     for sid in terminal_result_ids:
         result = effective_result(sid)
@@ -3179,13 +3340,14 @@ def analyze_assigned_streams(
             and str(result.get("error_type") or "") in analyzer.RETRYABLE_ERROR_TYPES
         )
         telemetry["retry_pending"] = bool(
-            not confirmed_placeholder
+            (result.get("retry_pending") or not confirmed_placeholder)
             and
             terminal_status == "dead"
             and retries > 0
             and telemetry["current_retry_attempts"] < retries
             and str(result.get("error_type") or "") in analyzer.RETRYABLE_ERROR_TYPES
         )
+        telemetry['retry_pending'] = bool(telemetry['retry_pending'] or result.get('retry_pending'))
         result["retry_pending"] = telemetry["retry_pending"]
         result["retry_telemetry"] = telemetry
         if sid in content_results:
@@ -3193,6 +3355,8 @@ def analyze_assigned_streams(
         else:
             media_results[sid] = result
 
+    if store:
+        cache = terminal_base
     for item, _ in media_due:
         sid = int(item["id"])
         if sid not in media_results:
@@ -3219,12 +3383,14 @@ def analyze_assigned_streams(
             merged.pop("throughput", None)
         cache[str(sid)] = merged
 
+    phase_flush({str(sid): cache[str(sid)] for sid in terminal_result_ids})
     if throughput_due and not canceled:
         throughput_started = time.monotonic()
         account_probe_limiter = analyzer._PerAccountStartLimiter(throughput_account_delay)
 
         def run_throughput(item):
             account_probe_limiter.wait(item.get("account_id"))
+            storage.ensure_provider_work()
             entry = cache.get(str(item["id"])) or {}
             stats = (media_results.get(int(item["id"])) or entry).get("stats") or {}
             _width, height = parse_resolution(stats)
@@ -3243,6 +3409,7 @@ def analyze_assigned_streams(
             item
             for item, _reason in throughput_due
             if int(item["id"]) not in combined_ids
+            and int(item["id"]) not in throughput_results
             and not _is_placeholder_result(effective_result(int(item["id"])))
         ]
         if not throughput_items:
@@ -3323,9 +3490,26 @@ def analyze_assigned_streams(
     )
     canceled = bool(close_analysis_cancel_window() or canceled)
     terminal_results = {**media_results, **content_results}
-    for sid, result in terminal_results.items():
-        analyzer._persist_dispatcharr_result(sid, result, logger)
-    analyzer.save_analysis_cache(cache, cache_path)
+    if store:
+        run.ensure()
+        if playback_health_reuse:
+            _sync_runtime_playback_evidence(items, cache, playback_snapshot(items),
+                min_clean_playback_seconds=playback_health_clean_min_seconds,
+                min_throughput_playback_seconds=playback_health_min_seconds)
+        store.persist_core({sid: result for sid, result in terminal_results.items()
+                            if result.get('status') != 'skipped'}, run.owner, logger)
+    else:
+        for sid, result in terminal_results.items():
+            analyzer._persist_dispatcharr_result(sid, result, logger)
+    if store:
+        run.ensure()
+        changed = {sid: entry for sid, entry in cache.items()
+                   if storage._current(entry) != storage._current(storage_start.get(sid, {}))
+                   or entry.get('health_check_history') or entry.get('throughput_check_history')}
+        if changed:
+            store.flush(changed, run.owner, terminal=True)
+    else:
+        analyzer.save_analysis_cache(cache, cache_path)
     health_counts = _status_counts(items, cache)
     throughput_counts = _throughput_counts(items, cache)
     placeholder_count = _placeholder_dead_count(items, cache)
@@ -3338,16 +3522,17 @@ def analyze_assigned_streams(
         total, len(media_checked_ids), len(content_checked_ids), len(throughput_attempted_ids), len(throughput_checked_ids), len(capacity_deferred_ids), fully_cached, playback_health_refreshed, dispatcharr_metadata_refreshed,
         health_summary, _overall_throughput_text(throughput_counts), analyzer._format_eta(runtime_seconds),
     )
-    report = _build_health_report(
-        items,
-        cache,
-        now=datetime.now(timezone.utc),
-        media_reason_counts=media_reason_counts,
-        throughput_reason_counts=throughput_reason_counts,
-        channels_selected=len({row.channel_id for row in rows}),
-    )
-    report["filters"] = filter_summary
-    _save_json(health_report_path, report)
+    if not store:
+        report = _build_health_report(
+            items,
+            cache,
+            now=datetime.now(timezone.utc),
+            media_reason_counts=media_reason_counts,
+            throughput_reason_counts=throughput_reason_counts,
+            channels_selected=len({row.channel_id for row in rows}),
+        )
+        report["filters"] = filter_summary
+        _save_json(health_report_path, report)
     result = {
         "streams_analyzed": total,
         "streams_selected": total,
@@ -3368,8 +3553,9 @@ def analyze_assigned_streams(
         "health_summary": health_summary,
         "total_runtime_seconds": round(runtime_seconds, 3),
         "total_runtime": analyzer._format_eta(runtime_seconds),
-        "cache_path": cache_path,
-        "analysis_health_report_path": health_report_path,
+        "storage_backend": "postgresql" if store else "json",
+        "cache_path": None if store else cache_path,
+        "analysis_health_report_path": None if store else health_report_path,
     }
     if canceled:
         raise AnalysisCancelled(

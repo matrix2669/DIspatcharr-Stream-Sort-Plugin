@@ -11,6 +11,9 @@ def test_plugin_manifest_is_valid_and_matches_version():
     assert manifest["name"] == "Dispatcharr Stream Sort"
     assert version == manifest["version"] == project["project"]["version"]
     assert {a["id"] for a in manifest["actions"]} == {
+        "initialize_storage",
+        "retain_storage",
+        "import_storage",
         "analyze_streams",
         "check_analysis_status",
         "stop_analysis",
@@ -42,6 +45,9 @@ def test_plugin_manifest_is_valid_and_matches_version():
         "recommend_ttls",
         "reset_scan_statistics",
         "reset_all_statistics",
+        "initialize_storage",
+        "retain_storage",
+        "import_storage",
         "record_runtime_event",
     ]
     reliability_action = next(a for a in manifest["actions"] if a["id"] == "record_runtime_event")
@@ -89,6 +95,9 @@ def test_plugin_manifest_is_valid_and_matches_version():
     assert actions_by_id["apply_schedule"]["description"] == "Enable or refresh the cron schedule."
     assert actions_by_id["schedule_status"]["description"] == "Show schedule configuration and the status of the latest scheduled run."
     assert [field["id"] for field in manifest["fields"]] == [
+        "storage_backend",
+        "bounded_capture_reuse",
+        "capture_max_mib",
         "scoring_info",
         "filter_info",
         "channel_filter_type",

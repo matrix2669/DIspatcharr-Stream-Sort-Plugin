@@ -367,6 +367,7 @@ def record_runtime_event(
     path: str = RELIABILITY_PATH,
     resolver: Callable[[int | None, Mapping[str, Any]], dict[str, Any] | None] = _default_stream_resolver,
     now: datetime | None = None,
+    settings: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     event = str(event_name or "").strip()
     if event not in TRACKED_EVENTS:
@@ -387,8 +388,21 @@ def record_runtime_event(
     event_counted = True
     event_classification: str | None = None
 
-    with _locked_cache(path):
-        data = load_reliability_cache(path)
+    from .storage import selected_store
+    store = selected_store(settings or {})
+    if store:
+        store.check_schema()
+    @contextmanager
+    def event_data():
+        if store:
+            with store.playback_event(payload_dict, resolver) as data:
+                yield data
+        else:
+            with _locked_cache(path):
+                data = load_reliability_cache(path)
+                yield data
+                _save_reliability_cache(data, path)
+    with event_data() as data:
         key = _channel_key(data, payload_dict)
         if key is None:
             return {
@@ -618,7 +632,6 @@ def record_runtime_event(
         channel_state["updated_at"] = now_iso
         data["updated_at"] = now_iso
         data["scoring_enabled"] = True
-        _save_reliability_cache(data, path)
 
     if recorded_stream_id is None:
         event_counted = False

@@ -16,6 +16,7 @@ try:
 except ImportError:  # pragma: no cover - Dispatcharr runs on Linux
     fcntl = None
 
+from . import storage
 from .analyzer import ANALYSIS_CACHE_PATH, _format_eta, probe_assigned_streams
 from .execution_control import (
     AnalysisAlreadyRunning,
@@ -1428,6 +1429,10 @@ def _start_background_job(
     sort_after: bool,
     schedule_generation: int | None = None,
 ) -> dict:
+    if kind != 'analyze' or sort_after:
+        storage.reject_postgres(settings, 'analysis with sort or throughput-only scan')
+    if storage.backend_name(settings) == 'postgresql':
+        storage.PostgresStore().check_schema()
     _channel_ids, scope = resolve_channel_scope(settings)
     lock_handle = _acquire_job_lock()
     if lock_handle is None:
@@ -1637,6 +1642,29 @@ class Plugin:
         logger = LOGGER
 
         try:
+            if action == 'initialize_storage':
+                return {'status': 'ok', **storage.PostgresStore().initialize()}
+            if action == 'retain_storage':
+                with analysis_maintenance_execution(), storage.RunLease(storage.PostgresStore()) as run:
+                    removed = run.store.retain(run.owner)
+                return {'status': 'ok', 'removed_rows': removed, 'maximum_rows': 2000}
+            if action == 'import_storage':
+                from .storage_import import import_analysis
+                with analysis_maintenance_execution():
+                    result = import_analysis(storage.PostgresStore(), ANALYSIS_CACHE_PATH)
+                return {'status': 'ok', **result}
+            if storage.backend_name(settings) == 'postgresql':
+                if action in {'recommend_ttls', 'health_report', 'sort_history', 'dry_run', 'sort_streams', 'analyze_and_sort', 'probe_throughput', 'probe_and_sort'}:
+                    storage.reject_postgres(settings, action)
+                if action in {'reset_scan_statistics', 'reset_all_statistics'}:
+                    with analysis_maintenance_execution(), storage.RunLease(storage.PostgresStore()) as run:
+                        run.store.reset(run.owner, include_history=action == 'reset_all_statistics')
+                        for artifact in (STATUS_PATH, ANALYSIS_HEALTH_REPORT_PATH, TTL_RECOMMENDATION_PATH):
+                            try:
+                                os.unlink(artifact)
+                            except FileNotFoundError:
+                                pass
+                    return {'status': 'ok', 'reset_scope': 'all_history' if action == 'reset_all_statistics' else 'scan_only', 'reliability_reset': action == 'reset_all_statistics'}
             if action == "record_runtime_event":
                 event_name = (params or {}).get("event")
                 if not event_name:
@@ -1654,8 +1682,11 @@ class Plugin:
                     (params or {}).get("payload") or {},
                     logger=logger,
                     path=RELIABILITY_PATH,
+                    settings=settings,
                 )
             if action == "apply_schedule":
+                if _safe_bool(settings.get("stream_sort_apply_sort_after_scheduled_scan"), True):
+                    storage.reject_postgres(settings, "scheduled analysis with sorting; disable Apply sort after scheduled analysis")
                 return _apply_schedule_action(settings)
 
             if action == "remove_schedule":
