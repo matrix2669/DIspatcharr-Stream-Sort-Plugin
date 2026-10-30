@@ -14,6 +14,7 @@ import urllib.request
 from datetime import datetime, timezone
 from typing import Any
 
+from . import observations
 from .scoring import classify_throughput
 
 
@@ -23,6 +24,7 @@ DEFAULT_USER_AGENT = "VLC/3.0.20 LibVLC/3.0.20"
 _CAPTURE_WORKER_PATH = os.path.join(os.path.dirname(__file__), "capture_worker.py")
 
 
+@observations.probe('throughput', 'combined_stream_copy')
 def capture_stream_sample(
     url: str,
     *,
@@ -57,6 +59,7 @@ def capture_stream_sample(
     sample_path = None
     intentionally_stopped = False
     capture_elapsed = 0.0
+    captured_bytes = None
     stderr = ""
     try:
         fd, sample_path = tempfile.mkstemp(
@@ -118,6 +121,7 @@ def capture_stream_sample(
                 except subprocess.TimeoutExpired:
                     process.kill()
                     _stdout, stderr = process.communicate()
+        observations.details(tool_returncode=observations.number(process.returncode))
         captured_bytes = os.path.getsize(sample_path)
         if captured_bytes <= 0 or (process.returncode and not intentionally_stopped):
             error = (stderr or "FFmpeg produced no usable capture data").strip()
@@ -132,6 +136,7 @@ def capture_stream_sample(
             "bytes": captured_bytes,
             "elapsed_seconds": round(capture_elapsed, 4),
             "measurement_source": "ffmpeg_stream_copy",
+            "elapsed_source": "provider_capture_wall",
         }, sample_path
     except Exception as exc:
         if fd is not None:
@@ -141,6 +146,10 @@ def capture_stream_sample(
                 pass
         if sample_path:
             try:
+                captured_bytes = os.path.getsize(sample_path)
+            except OSError:
+                pass
+            try:
                 os.unlink(sample_path)
             except OSError:
                 pass
@@ -149,8 +158,10 @@ def capture_stream_sample(
             "tested_at": tested_at,
             "error_type": "stream_unreachable",
             "error": f"{type(exc).__name__}: {exc}",
-            "elapsed_seconds": round(max(time.monotonic() - started, 0.0), 4),
+            "bytes": captured_bytes,
+            "elapsed_seconds": round(capture_elapsed if capture_elapsed > 0 else max(time.monotonic() - started, 0.0), 4),
             "measurement_source": "ffmpeg_stream_copy",
+            "elapsed_source": "provider_capture_wall" if capture_elapsed > 0 else "parent_wall",
         }, None
 
 
@@ -251,6 +262,7 @@ def _split_url_headers(raw_url: str) -> tuple[str, dict[str, str]]:
     return url, headers
 
 
+@observations.probe('throughput', 'direct_http_read')
 def probe_stream(
     raw_url: str,
     *,
@@ -296,8 +308,12 @@ def probe_stream(
             "status": "unknown",
             "tested_at": tested_at,
             "bytes": total,
+            "elapsed_seconds": round(max(time.monotonic() - started, 0), 4),
             "edge_host": edge_host,
+            "measurement_source": "direct_http_read",
+            "elapsed_source": "provider_read_wall",
             "error": f"{type(exc).__name__}: {exc}",
+            "error_type": "timeout" if isinstance(exc, TimeoutError) else "stream_unreachable",
         }
     elapsed = max(time.monotonic() - started, 0.001)
     if total < 64 * 1024 and elapsed < 1.0:
@@ -307,6 +323,8 @@ def probe_stream(
             "bytes": total,
             "elapsed_seconds": round(elapsed, 4),
             "edge_host": edge_host,
+            "measurement_source": "direct_http_read",
+            "elapsed_source": "provider_read_wall",
             "error": "probe returned too little data for a sustained live-stream measurement",
         }
     measured_mbps = (total * 8.0) / elapsed / 1_000_000.0
@@ -319,6 +337,8 @@ def probe_stream(
         "measured_mbps": round(measured_mbps, 4),
         "nominal_video_kbps": nominal_video_kbps,
         "edge_host": edge_host,
+        "measurement_source": "direct_http_read",
+        "elapsed_source": "provider_read_wall",
     }
 
 
@@ -374,6 +394,7 @@ def _capture_number(value):
         return None
 
 
+@observations.probe('throughput', 'bounded_http_capture')
 def capture_bounded_sample(raw_url, *, duration_seconds, timeout_seconds, temp_directory,
                            user_agent=DEFAULT_USER_AGENT, max_bytes=32 * 1024 * 1024,
                            stop_requested=lambda: False):

@@ -19,12 +19,21 @@ class MemoryStore:
     def __init__(self, initial):
         self.current = copy.deepcopy(initial)
         self.staged = {}
+        self.observation_rows = {}
+        self.observation_runs = {}
         self.calls = []
         self.playback_calls = 0
         self.new_playback = None
         self.record_scan = Mock()
         self.persist_core = Mock()
         self.close_worker_connection = Mock()
+    def observation_run(self, owner, provenance, metrics, state):
+        assert owner == self.owner
+        self.observation_runs[owner] = copy.deepcopy((provenance, metrics, state))
+    def observation_batch(self, owner, batch):
+        assert owner == self.owner and len(batch) <= 100
+        for row in batch:
+            self.observation_rows.setdefault(row[0], row)
     def acquire(self, owner):
         self.owner = owner
     def release(self, owner):
@@ -53,6 +62,7 @@ class QuietLease:
     def __init__(self, store):
         self.store = store
         self.owner = 'own-run'
+        self.io_lock = __import__('threading').RLock()
         self.lost = __import__('threading').Event()
     def ensure(self):
         if self.lost.is_set():

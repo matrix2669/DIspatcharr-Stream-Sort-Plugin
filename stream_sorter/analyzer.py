@@ -13,6 +13,7 @@ import urllib.parse
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from typing import Any, Mapping
+from . import observations
 from .scoring import estimate_nominal_throughput_kbps, parse_fps, parse_resolution
 from .throughput import DEFAULT_USER_AGENT, load_cache as load_throughput_cache, probe_stream, save_cache as save_throughput_cache
 ANALYSIS_CACHE_PATH = '/data/dispatcharr_stream_sort_analysis.json'
@@ -245,16 +246,18 @@ def _analyze_content(raw_url: str, *, settings: Mapping[str, Any], user_agent: s
     freeze_seconds = _effective_freeze_seconds(settings.get('frozen_video_min_seconds'), sample_seconds)
     ffmpeg_timeout = max(sample_seconds + 5, _as_int(settings.get('content_ffmpeg_timeout_seconds'), 20))
     connection_timeout = max(1, _as_int(settings.get('analysis_connection_timeout_seconds'), 10))
+    observations.details(requested_sample_seconds=sample_seconds, tool_timeout_seconds=ffmpeg_timeout,
+        want_black=want_black, want_freeze=want_freeze, want_audio=want_audio)
     clean_url, extra_headers = _split_url_headers(raw_url)
     video_filters = [f'blackdetect=d={min_black}:pic_th=0.98']
     if want_freeze:
         video_filters.append(f'freezedetect=n=-60dB:d={freeze_seconds}')
-    cmd = [ffmpeg_path, '-hide_banner', '-nostats', '-loglevel', 'info']
+    cmd = [ffmpeg_path, '-hide_banner', '-nostats', '-loglevel', 'info', '-progress', 'pipe:1']
     if not local_source:
         cmd.extend(_input_http_args(extra_headers, user_agent))
         cmd.extend(['-rw_timeout', str(connection_timeout * 1000000)])
     else:
-        cmd.extend(['-protocol_whitelist', 'file,pipe', '-f', 'mpegts', '-progress', 'pipe:1'])
+        cmd.extend(['-protocol_whitelist', 'file,pipe', '-f', 'mpegts'])
     cmd.extend(['-i', clean_url, '-t', str(sample_seconds)])
     if want_audio:
         cmd.extend(['-af', 'volumedetect'])
@@ -273,7 +276,8 @@ def _analyze_content(raw_url: str, *, settings: Mapping[str, Any], user_agent: s
             'error_type': 'content_tool_unavailable',
             'error': f'ffmpeg not found at {ffmpeg_path}',
         }
-    except subprocess.TimeoutExpired:
+    except subprocess.TimeoutExpired as exc:
+        observations.content_output(exc.stdout, exc.stderr, partial=True)
         logger.warning('[Analyze] ffmpeg content check timed out after %ss', ffmpeg_timeout)
         return {
             'black': None,
@@ -294,16 +298,11 @@ def _analyze_content(raw_url: str, *, settings: Mapping[str, Any], user_agent: s
             'error': f'{type(exc).__name__}: {exc}',
         }
     stderr = completed.stderr or ''
+    observations.details(tool_returncode=observations.number(completed.returncode))
+    decoded = observations.content_output(getattr(completed, 'stdout', None), stderr)
     clean_exit = completed.returncode == 0
     if local_source and clean_exit:
-        progress = []
-        for line in (getattr(completed, 'stdout', '') or '').splitlines():
-            if line.startswith('out_time_us='):
-                try:
-                    progress.append(int(line.split('=', 1)[1]) / 1_000_000)
-                except ValueError:
-                    pass
-        if not progress or max(progress) < sample_seconds - 0.25:
+        if decoded is None or decoded < sample_seconds - 0.25:
             return {'measured': False, 'error_type': 'content_sample_incomplete',
                     'error': 'Local sample decoded less than the required playable duration'}
     if not clean_exit:
@@ -319,6 +318,7 @@ def _analyze_content(raw_url: str, *, settings: Mapping[str, Any], user_agent: s
         }
     return {'black': True if _parse_blackdetect_output(stderr) else False if clean_exit and want_black else None, 'frozen': True if want_freeze and _parse_freezedetect_output(stderr) else False if clean_exit and want_freeze else None, 'mean_volume_db': _parse_mean_volume_db(stderr) if want_audio else None, 'measured': clean_exit}
 
+@observations.probe('content', 'remote_decode')
 def apply_content_analysis(
     result: Mapping[str, Any],
     source: str,
@@ -368,6 +368,7 @@ def apply_content_analysis(
     return updated
 
 
+@observations.probe('metadata', 'direct_ffprobe')
 def analyze_stream(raw_url: str, *, stream_id: Any, stream_name: str, settings: Mapping[str, Any], user_agent: str=DEFAULT_USER_AGENT, logger=None, include_content: bool=True, local_source: bool=False) -> dict[str, Any]:
     logger = logger or logging.getLogger('plugins.stream_sorter')
     tested_at = _utc_now_iso()
@@ -381,6 +382,8 @@ def analyze_stream(raw_url: str, *, stream_id: Any, stream_name: str, settings: 
     probe_timeout = max(1, _as_int(settings.get('analysis_probe_timeout_seconds'), 20))
     analysis_duration = max(1, _as_int(settings.get('analysis_duration_seconds'), 5))
     total_timeout = probe_timeout + analysis_duration + 5
+    observations.details(requested_sample_seconds=analysis_duration,
+        tool_timeout_seconds=total_timeout, connection_timeout_seconds=connection_timeout)
     clean_url, extra_headers = _split_url_headers(raw_url)
     cmd = [ffprobe_path, '-print_format', 'json']
     if not local_source:
@@ -399,6 +402,7 @@ def analyze_stream(raw_url: str, *, stream_id: Any, stream_name: str, settings: 
     except Exception as exc:
         return {**base, 'error_type': 'other', 'error': str(exc)}
     elapsed = max(time.monotonic() - started, 0.001)
+    observations.details(tool_returncode=observations.number(completed.returncode))
     if completed.returncode != 0:
         error = (completed.stderr or '').strip() or 'Stream not accessible'
         error_type = _classify_error(error, completed.returncode)
@@ -408,6 +412,7 @@ def analyze_stream(raw_url: str, *, stream_id: Any, stream_name: str, settings: 
         probe_data = json.loads(completed.stdout or '{}')
     except json.JSONDecodeError as exc:
         return {**base, 'error_type': 'invalid_probe_json', 'error': f'ffprobe returned invalid JSON: {exc}', 'details': {'probe_elapsed_seconds': round(elapsed, 3)}}
+    observations.metadata(probe_data)
     streams = probe_data.get('streams') or []
     video_stream = next((row for row in streams if row.get('codec_type') == 'video'), None)
     audio_stream = next((row for row in streams if row.get('codec_type') == 'audio'), None)
@@ -426,7 +431,8 @@ def analyze_stream(raw_url: str, *, stream_id: Any, stream_name: str, settings: 
     packets = probe_data.get('packets') or []
     video_index = video_stream.get('index')
     video_packets = [packet for packet in packets if packet.get('stream_index') == video_index]
-    if not video_packets:
+    packet_fallback = not video_packets
+    if packet_fallback:
         video_packets = packets
     calculated_bitrate = None
     if len(video_packets) >= MIN_PACKETS_FOR_BITRATE_CALC:
@@ -472,6 +478,8 @@ def analyze_stream(raw_url: str, *, stream_id: Any, stream_name: str, settings: 
         stream_type = format_name.split(',', 1)[0] if format_name else 'unknown'
     stats = {'video_codec': video_stream.get('codec_name'), 'resolution': f'{width}x{height}' if width and height else '0x0', 'width': width, 'height': height, 'source_fps': round(fps, 3) if fps else None, 'pixel_format': video_stream.get('pix_fmt'), 'video_bitrate': video_bitrate, 'audio_codec': audio_codec, 'sample_rate': sample_rate, 'audio_channels': audio_channels, 'audio_bitrate': audio_bitrate, 'stream_type': stream_type}
     stats = {key: value for key, value in stats.items() if value is not None}
+    observations.selected_metadata(calculated=calculated_bitrate,
+        declared=declared_video_bitrate, selected=video_bitrate, packet_fallback=packet_fallback)
     details: dict[str, Any] = {'probe_elapsed_seconds': round(elapsed, 3), 'packet_count': len(video_packets), 'analysis_duration_seconds': analysis_duration}
     if calculated_bitrate is not None:
         details['calculated_bitrate_kbps'] = round(calculated_bitrate, 1)

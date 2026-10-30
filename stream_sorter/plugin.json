@@ -6,6 +6,7 @@
   "help_url": "https://github.com/matrix2669/DIspatcharr-Stream-Sort-Plugin",
   "fields": [
     {"id":"storage_backend","label":"Storage backend","type":"select","default":"json","options":[{"label":"JSON (default)","value":"json"},{"label":"PostgreSQL (initialize / upgrade schema first)","value":"postgresql"}]},
+    {"id":"retain_probe_observations","label":"Retain detailed probe observations","type":"boolean","default":true,"description":"PostgreSQL only: retain bounded attempt evidence for evaluation. Disabling preserves existing rows. Requires explicit schema 3 upgrade."},
     {"id":"bounded_capture_reuse","label":"Reuse bounded RAM captures","type":"boolean","default":false,"description":"Experimental HTTP(S) sample reuse; requires writable RAM storage. Direct probes remain the fallback."},
     {"id":"capture_max_mib","label":"Maximum RAM sample per worker (MiB)","type":"number","default":32,"min":1,"max":64},
     {"id":"scoring_info","label":"Sorting model","type":"info","description":"Health and resolution are hard tiers. Other scores order streams only within the same tier."},

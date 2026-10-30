@@ -12,7 +12,7 @@ import json
 import threading
 import uuid
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 BATCH_SIZE = 100
 LEASE_SECONDS = 120
 HEARTBEAT_SECONDS = 20
@@ -63,6 +63,24 @@ def _chunks(rows):
         yield rows[offset:offset + BATCH_SIZE]
 
 
+def coordinate_lease_io(function):
+    """Serialize this owner's archive transactions and lease renewals in RAM.
+
+    Wait before opening a transaction, not on our own PostgreSQL lease-row lock.
+    The guard ends after commit/rollback and is never held during a probe.
+    Other processes still arbitrate ownership exclusively through DB fencing.
+    """
+    @wraps(function)
+    def wrapped(self, owner, *args, **kwargs):
+        run = _active_lease
+        if run is not None and run.owner == owner:
+            with run.io_lock:
+                run.ensure()
+                return function(self, owner, *args, **kwargs)
+        return function(self, owner, *args, **kwargs)
+    return wrapped
+
+
 class PostgresStore:
     def __init__(self, alias='default'):
         from django.db import connections
@@ -105,17 +123,23 @@ class PostgresStore:
             cursor.execute('SELECT pg_try_advisory_xact_lock(1936946021)')
             if not cursor.fetchone()[0]:
                 raise StorageError('Another storage migration is running; try again after it completes')
+            cursor.execute("SELECT to_regclass('stream_sort_schema')")
+            existed = cursor.fetchone()[0] is not None
             cursor.execute('CREATE TABLE IF NOT EXISTS stream_sort_schema (singleton integer PRIMARY KEY CHECK (singleton = 1), version integer NOT NULL)')
             cursor.execute('SELECT version FROM stream_sort_schema WHERE singleton = 1 FOR UPDATE')
             row = cursor.fetchone()
             if row:
                 if row[0] == SCHEMA_VERSION:
                     return {'schema_version': row[0], 'initialized': False}
-                if row[0] == 1:
-                    self._initialize_v2(cursor)
+                if row[0] in (1, 2):
+                    if row[0] == 1:
+                        self._initialize_v2(cursor)
+                    self._initialize_v3(cursor)
                     cursor.execute('UPDATE stream_sort_schema SET version = %s', [SCHEMA_VERSION])
-                    return {'schema_version': SCHEMA_VERSION, 'initialized': False, 'upgraded_from': 1}
+                    return {'schema_version': SCHEMA_VERSION, 'initialized': False, 'upgraded_from': row[0]}
                 raise StorageError(f'Unsupported Stream Sort schema {row[0]}; expected {SCHEMA_VERSION}')
+            if existed:
+                raise StorageError('Missing Stream Sort schema version; initialization refused')
             for ddl in (
                 'CREATE TABLE stream_sort_lease (name text PRIMARY KEY, owner text NOT NULL, expires_at timestamptz NOT NULL)',
                 'CREATE TABLE stream_sort_current (stream_id bigint PRIMARY KEY, provider_id bigint, data jsonb NOT NULL)',
@@ -130,6 +154,7 @@ class PostgresStore:
             ):
                 cursor.execute(ddl)
             self._initialize_v2(cursor)
+            self._initialize_v3(cursor)
             cursor.execute('INSERT INTO stream_sort_schema VALUES (1, %s)', [SCHEMA_VERSION])
         return {'schema_version': SCHEMA_VERSION, 'initialized': True}
 
@@ -147,6 +172,38 @@ class PostgresStore:
             'CREATE TABLE stream_sort_sort_legacy_daily (day date PRIMARY KEY, data jsonb NOT NULL)',
         ):
             cursor.execute(ddl)
+
+    def _initialize_v3(self, cursor):
+        for ddl in (
+            'CREATE TABLE stream_sort_observation_run (run_id text PRIMARY KEY, provenance jsonb NOT NULL, metrics jsonb NOT NULL, state text NOT NULL, updated_at timestamptz NOT NULL DEFAULT clock_timestamp(), CHECK (octet_length(provenance::text) <= 524288))',
+            'CREATE TABLE stream_sort_observation (observation_id text PRIMARY KEY, run_id text NOT NULL REFERENCES stream_sort_observation_run(run_id), stream_id bigint, provider_id bigint, started_at timestamptz NOT NULL, data jsonb NOT NULL, encoded_bytes integer NOT NULL CHECK (encoded_bytes > 0 AND encoded_bytes <= 32768))',
+            'CREATE INDEX stream_sort_observation_lookup ON stream_sort_observation(stream_id, started_at)',
+            'CREATE INDEX stream_sort_observation_run_lookup ON stream_sort_observation(run_id)',
+        ):
+            cursor.execute(ddl)
+
+    @coordinate_lease_io
+    def observation_run(self, owner, provenance, metrics, state):
+        from .observations import encoded, PROVENANCE_BYTES
+        if len(encoded(provenance)) > PROVENANCE_BYTES:
+            raise StorageError('Observation run provenance exceeds bound')
+        with self.transaction() as cursor:
+            self.fence(cursor, owner)
+            cursor.execute('INSERT INTO stream_sort_observation_run (run_id, provenance, metrics, state) VALUES (%s, %s::jsonb, %s::jsonb, %s) ON CONFLICT (run_id) DO UPDATE SET metrics = EXCLUDED.metrics, state = EXCLUDED.state, updated_at = clock_timestamp()',
+                           [owner, encoded(provenance).decode(), _dump(metrics), state])
+            self.fence(cursor, owner)
+
+    @coordinate_lease_io
+    def observation_batch(self, owner, batch):
+        from .observations import PAYLOAD_BYTES
+        if len(batch) > BATCH_SIZE or any(row[5] > PAYLOAD_BYTES or row[5] != len(row[4].encode()) for row in batch):
+            raise StorageError('Observation batch exceeds bounds')
+        with self.transaction() as cursor:
+            self.fence(cursor, owner)
+            for oid, sid, provider, started, data, size in batch:
+                cursor.execute('INSERT INTO stream_sort_observation VALUES (%s, %s, %s, %s, %s, %s::jsonb, %s) ON CONFLICT (observation_id) DO NOTHING',
+                               [oid, owner, sid, provider, started, data, size])
+            self.fence(cursor, owner)
 
     def record_scan(self, owner, ids, result):
         with self.transaction() as cursor:
@@ -225,6 +282,7 @@ class PostgresStore:
         if not cursor.fetchone():
             raise LeaseLost('PostgreSQL analysis lease expired or changed owner; results were not committed')
 
+    @coordinate_lease_io
     def heartbeat(self, owner, seconds=LEASE_SECONDS):
         with self.transaction() as cursor:
             self.fence(cursor, owner)
@@ -385,7 +443,7 @@ class PostgresStore:
                 # Match importer order: lease fence, then playback serialization.
                 # Wait for prior writers before deleting any playback evidence.
                 cursor.execute('SELECT pg_advisory_xact_lock(1936946022)')
-            for table in ('stream_sort_current', 'stream_sort_component', 'stream_sort_rollup', 'stream_sort_import', 'stream_sort_scan', 'stream_sort_sort_channel', 'stream_sort_sort_run', 'stream_sort_sort_snapshot', 'stream_sort_sort_rollup', 'stream_sort_sort_legacy_daily'):
+            for table in ('stream_sort_observation', 'stream_sort_observation_run', 'stream_sort_current', 'stream_sort_component', 'stream_sort_rollup', 'stream_sort_import', 'stream_sort_scan', 'stream_sort_sort_channel', 'stream_sort_sort_run', 'stream_sort_sort_snapshot', 'stream_sort_sort_rollup', 'stream_sort_sort_legacy_daily'):
                 cursor.execute(f'DELETE FROM {table}')
             if include_history:
                 cursor.execute('DELETE FROM stream_sort_playback')
@@ -400,6 +458,7 @@ class RunLease:
         self.store = store
         self.owner = uuid.uuid4().hex
         self.lost = threading.Event()
+        self.io_lock = threading.RLock()
         self.stop = threading.Event()
         self.thread = None
 
@@ -443,14 +502,17 @@ def provider_work_allowed():
 
 
 def ensure_provider_work():
-    if _active_lease is not None:
-        _active_lease.ensure()
+    run = _active_lease
+    if run is not None:
+        run.ensure()
         # The heartbeat may not yet have noticed expiry after a process pause.
         try:
-            PostgresStore(_active_lease.store.alias).heartbeat(_active_lease.owner)
-        except Exception:
-            _active_lease.lost.set()
-            raise
+            PostgresStore(run.store.alias).heartbeat(run.owner)
+        except Exception as exc:
+            run.lost.set()
+            if isinstance(exc, StorageError):
+                raise
+            raise LeaseLost('PostgreSQL lease renewal failed; provider work stopped') from exc
 
 
 def postgres_scan(function):
@@ -462,10 +524,25 @@ def postgres_scan(function):
             return function(settings, *args, **kwargs)
         with RunLease(store) as lease:
             _active_lease = lease
+            result = None
+            failure = None
             try:
-                return function(settings, *args, **kwargs)
+                result = function(settings, *args, **kwargs)
+                return result
+            except BaseException as exc:
+                failure = exc
+                raise
             finally:
-                _active_lease = None
+                try:
+                    archive = getattr(lease, 'observations', None)
+                    if archive:
+                        state = 'canceled' if type(failure).__name__ == 'AnalysisCancelled' else 'failed' if failure else 'completed'
+                        archive.flush(force=True, state=state)
+                        output = result if isinstance(result, dict) else getattr(failure, 'result', None)
+                        if isinstance(output, dict):
+                            output['probe_observations'] = archive.snapshot()
+                finally:
+                    _active_lease = None
     return wrapped
 
 

@@ -34,7 +34,7 @@ from stream_sorter import storage
 from stream_sorter.reliability import record_runtime_event
 from stream_sorter.storage_import import import_analysis
 
-TABLES = ('scan', 'sort_channel', 'sort_run', 'sort_snapshot', 'sort_rollup', 'sort_legacy_daily', 'component', 'current', 'history', 'rollup', 'playback', 'import', 'lease', 'schema')
+TABLES = ('scan', 'sort_channel', 'sort_run', 'sort_snapshot', 'sort_rollup', 'sort_legacy_daily', 'observation', 'observation_run', 'component', 'current', 'history', 'rollup', 'playback', 'import', 'lease', 'schema')
 ITEM = {'id': 42, 'account_id': 7}
 NOW = datetime.now(timezone.utc).isoformat()
 
@@ -389,7 +389,7 @@ def test_pg_health_and_ttl_actions_read_scoped_current_and_retained_history(sort
 
 def test_explicit_schema_v1_upgrade_is_required_and_transactional(store):
     with store.connection.cursor() as cursor:
-        for name in TABLES[:6]:
+        for name in TABLES[:8]:
             cursor.execute(f'DROP TABLE stream_sort_{name}')
         cursor.execute('UPDATE stream_sort_schema SET version = 1')
     with pytest.raises(storage.StorageError, match='Unsupported'):
@@ -569,3 +569,238 @@ def test_content_recovery_obligation_survives_terminal_media_failure_and_phase_r
     store.release('content-passed')
     final = store.load([ITEM])['42']
     assert final['status'] == 'alive' and final['content_recovery_required'] is False
+
+
+def test_explicit_schema2_to3_upgrade_preserves_existing_data_and_is_idempotent(store):
+    seed(store)
+    with store.connection.cursor() as cursor:
+        cursor.execute("INSERT INTO stream_sort_playback VALUES ('streams', '42', clock_timestamp(), '{\"playback_starts\":5}'::jsonb)")
+        cursor.execute('DROP TABLE stream_sort_observation')
+        cursor.execute('DROP TABLE stream_sort_observation_run')
+        cursor.execute('UPDATE stream_sort_schema SET version = 2')
+    with pytest.raises(storage.StorageError, match='Unsupported'):
+        store.check_schema()
+    assert store.initialize() == {'schema_version': 3, 'initialized': False, 'upgraded_from': 2}
+    assert store.initialize() == {'schema_version': 3, 'initialized': False}
+    assert store.load([ITEM])['42']['status'] == 'dead'
+    assert store.playback([42])['streams']['42']['playback_starts'] == 5
+    assert count(store, 'observation') == count(store, 'observation_run') == 0
+
+
+def test_explicit_upgrade_rejects_missing_schema_version(store):
+    with store.connection.cursor() as cursor:
+        cursor.execute('DELETE FROM stream_sort_schema')
+    with pytest.raises(storage.StorageError, match='Unsupported'):
+        store.check_schema()
+    with pytest.raises(storage.StorageError, match='Missing'):
+        store.initialize()
+    assert count(store, 'schema') == 0
+
+
+def observation_archive(store, monkeypatch):
+    from stream_sorter import observations
+    monkeypatch.setattr(observations, 'provenance', lambda settings, scope: {
+        'archive_schema': 3, 'scope': scope})
+    store.acquire('observations')
+    return observations.Archive(store, 'observations', {}, [ITEM])
+
+
+def test_observation_inserts_are_immutable_idempotent_and_separate_from_health(store, monkeypatch):
+    archive = observation_archive(store, monkeypatch)
+    for _ in range(215):
+        archive.collect({'stream_id': 42, 'provider_id': 7, 'started_at': NOW, 'component': 'metadata'})
+    pending = list(archive.queue)
+    archive.flush(force=True, state='completed')
+    store.observation_batch('observations', pending[:100])
+    assert count(store, 'observation') == 215
+    assert count(store, 'history') == count(store, 'current') == 0
+    store.observation_run('observations', {'replacement': True}, {'batches': 3}, 'completed')
+    with store.connection.cursor() as cursor:
+        cursor.execute('SELECT provenance, metrics FROM stream_sort_observation_run')
+        provenance, metrics = cursor.fetchone()
+    assert 'replacement' not in storage._decode(provenance)
+    assert storage._decode(metrics) == {'batches': 3}
+    assert archive.snapshot()['batches'] == 3
+
+
+def test_observation_end_fence_rollback_keeps_pending_for_retry(store, monkeypatch):
+    archive = observation_archive(store, monkeypatch)
+    archive.collect({'stream_id': 42, 'provider_id': 7, 'started_at': NOW, 'component': 'content'})
+    # Persist only the run first; the second fence failure targets the insert batch.
+    store.observation_run(archive.owner, archive.provenance, {}, 'running')
+    archive.run_saved = True
+    fence = store.fence
+    calls = 0
+    def fail_second(cursor, owner):
+        nonlocal calls
+        calls += 1
+        fence(cursor, owner)
+        if calls == 2:
+            raise storage.LeaseLost('end fence')
+    monkeypatch.setattr(store, 'fence', fail_second)
+    with pytest.raises(storage.LeaseLost):
+        archive.flush(force=True)
+    assert count(store, 'observation') == 0 and len(archive.queue) == 1
+    monkeypatch.setattr(store, 'fence', fence)
+    archive.flush(force=True)
+    assert count(store, 'observation') == 1 and not archive.queue
+
+
+def test_observation_uncertain_commit_retry_and_expired_owner_fencing(store, monkeypatch):
+    archive = observation_archive(store, monkeypatch)
+    archive.collect({'stream_id': 42, 'provider_id': 7, 'started_at': NOW})
+    original = store.observation_batch
+    def uncertain(owner, batch):
+        original(owner, batch)
+        raise OSError('commit acknowledgement lost')
+    monkeypatch.setattr(store, 'observation_batch', uncertain)
+    with pytest.raises(storage.StorageError, match='unacknowledged'):
+        archive.flush(force=True)
+    assert count(store, 'observation') == len(archive.queue) == 1
+    monkeypatch.setattr(store, 'observation_batch', original)
+    archive.flush(force=True)
+    assert count(store, 'observation') == 1
+    archive.collect({'stream_id': 42, 'provider_id': 7, 'started_at': NOW})
+    expire(store)
+    store.acquire('takeover')
+    with pytest.raises(storage.LeaseLost):
+        archive.flush(force=True)
+    assert count(store, 'observation') == 1 and len(archive.queue) == 1
+    with pytest.raises(storage.LeaseLost):
+        store.observation_run(archive.owner, archive.provenance, {}, 'completed')
+
+
+@pytest.mark.parametrize('include_history', [False, True])
+def test_archive_not_age_pruned_but_manual_reset_follows_playback_scope(store, monkeypatch, include_history):
+    archive = observation_archive(store, monkeypatch)
+    archive.collect({'stream_id': 42, 'provider_id': 7, 'started_at': '2000-01-01T00:00:00+00:00'})
+    archive.flush(force=True)
+    with store.connection.cursor() as cursor:
+        cursor.execute("INSERT INTO stream_sort_playback VALUES ('streams', '42', clock_timestamp(), '{}'::jsonb)")
+    store.retain(archive.owner)
+    assert count(store, 'observation') == count(store, 'observation_run') == 1
+    store.reset(archive.owner, include_history=include_history)
+    assert count(store, 'observation') == count(store, 'observation_run') == 0
+    assert count(store, 'playback') == (0 if include_history else 1)
+
+
+def test_stored_observation_values_reject_credentials_and_bound_batch_size(store, monkeypatch):
+    from stream_sorter import analyzer, observations
+    archive = observation_archive(store, monkeypatch)
+    secret = 'archive-secret-marker'
+    data = {'streams': [{'index': 0, 'codec_type': 'video', 'codec_name': secret,
+                        'width': 1920, 'height': 1080, 'profile': 'http://' + secret,
+                        'tags': {'token': secret}, 'time_base': secret}],
+            'format': {'filename': secret}, 'packets': [{'stream_index': 0, 'data': secret}]}
+    monkeypatch.setattr(analyzer.subprocess, 'run', Mock(return_value=type('Completed', (), {
+        'stdout': json.dumps(data), 'stderr': secret, 'returncode': 0})()))
+    with observations.worker_context(archive, {'id': 42, 'account_id': 7, 'name': secret}, 'stream-sort-media', 1):
+        analyzer.analyze_stream('http://user:' + secret + '@provider.invalid/private',
+            stream_id=42, stream_name=secret, settings={}, include_content=False)
+    pending = list(archive.queue)
+    with pytest.raises(storage.StorageError, match='bounds'):
+        store.observation_batch(archive.owner, pending * 101)
+    archive.flush(force=True)
+    with store.connection.cursor() as cursor:
+        cursor.execute('SELECT data::text, encoded_bytes FROM stream_sort_observation')
+        raw, size = cursor.fetchone()
+    assert secret not in raw and size <= 32768
+    assert json.loads(raw)['tracks'][0]['codec_name'] is None
+
+
+def test_schema3_upgrade_failure_rolls_back_all_new_tables_and_version(store, monkeypatch):
+    with store.connection.cursor() as cursor:
+        cursor.execute('DROP TABLE stream_sort_observation')
+        cursor.execute('DROP TABLE stream_sort_observation_run')
+        cursor.execute('UPDATE stream_sort_schema SET version = 2')
+    initialize = store._initialize_v3
+    def fail_after_ddl(cursor):
+        initialize(cursor)
+        raise storage.StorageError('fixture migration failure')
+    monkeypatch.setattr(store, '_initialize_v3', fail_after_ddl)
+    with pytest.raises(storage.StorageError, match='fixture migration failure'):
+        store.initialize()
+    with store.connection.cursor() as cursor:
+        cursor.execute("SELECT version, to_regclass('stream_sort_observation'), to_regclass('stream_sort_observation_run') FROM stream_sort_schema")
+        assert cursor.fetchone() == (2, None, None)
+    monkeypatch.setattr(store, '_initialize_v3', initialize)
+    assert store.initialize()['upgraded_from'] == 2
+
+
+def test_mid_phase_archive_and_worker_renewal_serialize_before_database_lock_timeout(store, monkeypatch):
+    from stream_sorter import incremental, observations
+    batch_started, worker_renewing = threading.Event(), threading.Event()
+    background_renewing = threading.Event()
+    monkeypatch.setattr(storage, "HEARTBEAT_SECONDS", .05)
+    original_heartbeat = storage.PostgresStore.heartbeat
+    def heartbeat(instance, owner, *args, **kwargs):
+        if batch_started.is_set() and threading.current_thread().name == "stream-sort-db-lease":
+            background_renewing.set()
+        return original_heartbeat(instance, owner, *args, **kwargs)
+    monkeypatch.setattr(storage.PostgresStore, "heartbeat", heartbeat)
+    monkeypatch.setattr(observations, 'provenance', lambda *a: {'archive_schema': 3})
+    monkeypatch.setattr(incremental, 'analysis_cancel_requested', lambda: False)
+    items = [{'id': sid, 'account_id': 7} for sid in range(101)]
+    original_batch, original_fence = store.observation_batch, store.fence
+    delayed = False
+    in_batch = False
+    def fence(cursor, owner):
+        nonlocal delayed
+        original_fence(cursor, owner)
+        if in_batch and not delayed:
+            delayed = True
+            batch_started.set()
+            assert worker_renewing.wait(10)
+            assert background_renewing.wait(10)
+            # Longer than SET LOCAL lock_timeout=2s on the worker connection.
+            # The worker must wait in RAM, without opening its DB transaction.
+            cursor.execute('SELECT pg_sleep(2.3)')
+    def batch(owner, values):
+        nonlocal in_batch
+        in_batch = True
+        try:
+            return original_batch(owner, values)
+        finally:
+            in_batch = False
+    monkeypatch.setattr(store, 'fence', fence)
+    monkeypatch.setattr(store, 'observation_batch', batch)
+    with storage.RunLease(store) as lease:
+        monkeypatch.setattr(storage, '_active_lease', lease)
+        lease.observations = observations.Archive(store, lease.owner, {}, items)
+        @observations.probe('metadata', 'direct_ffprobe')
+        def actual():
+            # A provider operation owns no transaction on its worker connection.
+            assert not connections[store.alias].in_atomic_block
+            return {'status': 'alive'}
+        def worker(item):
+            if item['id'] == 0:
+                assert batch_started.wait(15)
+                worker_renewing.set()
+                storage.ensure_provider_work()
+            return actual()
+        results = [future.result() for _, future in incremental._fair_account_futures(
+            items, worker, max_workers=2, thread_name_prefix='stream-sort-media')]
+        assert results == [{'status': 'alive'}] * 101
+        assert not lease.lost.is_set()
+        with store.connection.cursor() as cursor:
+            cursor.execute('SELECT owner FROM stream_sort_lease')
+            assert cursor.fetchone()[0] == lease.owner
+        assert count(store, 'observation') == 101
+        assert count(store, 'history') == count(store, 'current') == 0
+
+
+def test_waiting_archive_write_still_rejects_expired_owner_after_local_guard(store, monkeypatch):
+    from stream_sorter import observations
+    monkeypatch.setattr(observations, 'provenance', lambda *a: {'archive_schema': 3})
+    lease = storage.RunLease(store)
+    store.acquire(lease.owner)
+    monkeypatch.setattr(storage, '_active_lease', lease)
+    archive = observations.Archive(store, lease.owner, {}, [ITEM])
+    archive.collect({'stream_id': 42, 'provider_id': 7, 'started_at': NOW})
+    expire(store)
+    store.acquire('takeover')
+    with pytest.raises(storage.LeaseLost):
+        archive.flush(force=True)
+    assert len(archive.queue) == 1
+    assert count(store, 'observation') == count(store, 'observation_run') == 0
+    store.heartbeat('takeover')

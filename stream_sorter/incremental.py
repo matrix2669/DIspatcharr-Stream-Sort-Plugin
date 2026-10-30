@@ -29,6 +29,7 @@ from .scoring import (
     classify_throughput,
 )
 from .reliability import RELIABILITY_PATH, load_reliability_cache
+from . import observations
 from .throughput import (
     DEFAULT_USER_AGENT,
     LEGACY_CACHE_PATH,
@@ -1476,6 +1477,7 @@ def _attach_capture_diagnostic(result, diagnostic):
     return result
 
 
+@observations.local_work
 def _analyze_local_capture(
     item: Mapping[str, Any],
     base_result: Mapping[str, Any],
@@ -1496,6 +1498,8 @@ def _analyze_local_capture(
                 local_source=True,
             )
         )
+    except storage.StorageError:
+        raise
     except Exception as exc:
         result = dict(base_result)
         result.update({"status": "dead", "error_type": "stream_unreachable", "error": str(exc)})
@@ -1548,7 +1552,19 @@ class _ProviderSlot:
                 if not acquired:
                     raise _ProviderDeferred('Fallback capacity is occupied')
                 self.reservation, self.held = reservation, True
-            return self.prepared()
+            prepared = self.prepared()
+            observations.selected_profile(prepared)
+            return prepared
+
+
+def _discard_combined_capture_result(result):
+    """Dispose only an unclaimed result from run_combined_capture's contract."""
+    _measurement, sample_path, _nominal = result
+    if sample_path:
+        try:
+            os.unlink(sample_path)
+        except FileNotFoundError:
+            pass
 
 
 def _fair_account_futures(
@@ -1559,8 +1575,13 @@ def _fair_account_futures(
     thread_name_prefix: str,
     capacity_manager=None,
     max_per_account: int | None = None,
+    discard_result=None,
 ):
-    """Yield completed work while balancing active slots across M3U accounts."""
+    """Yield completed work while balancing active slots across M3U accounts.
+
+    An explicit disposer owns capture results until their future is yielded.
+    Track only this worker-sized set, including completed but withheld results.
+    """
     queues: dict[tuple[str, Any], collections.deque] = {}
     account_order: list[tuple[str, Any]] = []
     for item in items:
@@ -1570,92 +1591,145 @@ def _fair_account_futures(
             account_order.append(key)
         queues[key].append(item)
 
+    archive = getattr(storage.active_run(), "observations", None)
+    wave = archive.wave(thread_name_prefix) if archive else 0
     running: collections.Counter = collections.Counter()
     launched: collections.Counter = collections.Counter()
     worker_count = max(1, int(max_workers))
-    with ThreadPoolExecutor(max_workers=worker_count, thread_name_prefix=thread_name_prefix) as executor:
-        futures = {}
-        while futures or any(queues[key] for key in account_order):
-            while len(futures) < worker_count:
-                if analysis_cancel_requested():
-                    break
-                pending = [
-                    key
-                    for key in account_order
-                    if queues[key]
-                    and (max_per_account is None or running[key] < max_per_account)
-                ]
-                if not pending:
-                    break
-                # Prefer an account with fewer active slots; lifetime launch
-                # counts make ties round-robin instead of favoring list order.
-                candidates = sorted(
-                    pending,
-                    key=lambda candidate: (
-                        running[candidate],
-                        launched[candidate],
-                        account_order.index(candidate),
-                    ),
-                )
-                submitted = False
-                for key in candidates:
-                    item = queues[key][0]
-                    acquired, reservation = (
-                        capacity_manager.try_acquire(item)
-                        if capacity_manager is not None
-                        else (True, None)
+    futures = {}
+    unconsumed = {}
+    try:
+        with ThreadPoolExecutor(max_workers=worker_count, thread_name_prefix=thread_name_prefix) as executor:
+            while futures or any(queues[key] for key in account_order):
+                while len(futures) < worker_count:
+                    if analysis_cancel_requested():
+                        break
+                    pending = [
+                        key
+                        for key in account_order
+                        if queues[key]
+                        and (max_per_account is None or running[key] < max_per_account)
+                    ]
+                    if not pending:
+                        break
+                    # Prefer an account with fewer active slots; lifetime launch
+                    # counts make ties round-robin instead of favoring list order.
+                    candidates = sorted(
+                        pending,
+                        key=lambda candidate: (
+                            running[candidate],
+                            launched[candidate],
+                            account_order.index(candidate),
+                        ),
                     )
-                    if not acquired:
-                        continue
-                    item = queues[key].popleft()
-                    slot = _ProviderSlot(capacity_manager, item, reservation)
-                    try:
-                        worker_item = slot.prepared()
-                        def guarded_work(prepared):
-                            run = storage.active_run()
-                            try:
-                                if analysis_cancel_requested():
-                                    raise AnalysisCancelled('Canceled before provider operation')
-                                storage.ensure_provider_work()
-                                return worker(prepared)
-                            finally:
-                                if run:
-                                    run.store.close_worker_connection()
-                        future = executor.submit(guarded_work, worker_item)
-                    except Exception:
-                        slot.release()
-                        raise
-                    futures[future] = (item, key, slot)
-                    running[key] += 1
-                    launched[key] += 1
-                    submitted = True
-                    break
-                if not submitted:
+                    submitted = False
+                    for key in candidates:
+                        item = queues[key][0]
+                        acquired, reservation = (
+                            capacity_manager.try_acquire(item)
+                            if capacity_manager is not None
+                            else (True, None)
+                        )
+                        if not acquired:
+                            continue
+                        item = queues[key].popleft()
+                        slot = _ProviderSlot(capacity_manager, item, reservation)
+                        try:
+                            worker_item = slot.prepared()
+                            item["_observation_profile_id"] = worker_item.get("m3u_profile_id")
+                            item["_observation_phase"] = thread_name_prefix
+                            item["_observation_wave"] = wave
+                            result_holder = [] if discard_result is not None else None
+                            def guarded_work(prepared, holder):
+                                run = storage.active_run()
+                                try:
+                                    if analysis_cancel_requested():
+                                        raise AnalysisCancelled('Canceled before provider operation')
+                                    storage.ensure_provider_work()
+                                    with observations.worker_context(archive, prepared, thread_name_prefix, wave):
+                                        result = worker(prepared)
+                                        if holder is not None:
+                                            # Keep ownership even if connection cleanup
+                                            # subsequently prevents a successful future.
+                                            holder.append(result)
+                                        return result
+                                finally:
+                                    if run:
+                                        try:
+                                            run.store.close_worker_connection()
+                                        except storage.StorageError:
+                                            raise
+                                        except Exception as exc:
+                                            raise storage.StorageError('PostgreSQL worker connection cleanup failed') from exc
+                            future = executor.submit(guarded_work, worker_item, result_holder)
+                        except Exception:
+                            slot.release()
+                            raise
+                        futures[future] = (item, key, slot)
+                        if result_holder is not None:
+                            unconsumed[future] = result_holder
+                        running[key] += 1
+                        launched[key] += 1
+                        submitted = True
+                        break
+                    if not submitted:
+                        break
+
+                if not futures:
+                    if analysis_cancel_requested():
+                        break
+                    # Every remaining limited source is currently occupied by
+                    # viewers or other reserved connections. Leave its cached
+                    # result unchanged and retry it on the next analysis run.
+                    for key in account_order:
+                        while queues[key]:
+                            yield queues[key].popleft(), None
                     break
 
-            if not futures:
-                if analysis_cancel_requested():
-                    break
-                # Every remaining limited source is currently occupied by
-                # viewers or other reserved connections. Leave its cached
-                # result unchanged and retry it on the next analysis run.
-                for key in account_order:
-                    while queues[key]:
-                        yield queues[key].popleft(), None
-                break
-
-            done, _pending = wait(futures, return_when=FIRST_COMPLETED)
-            completed_rows = []
-            for future in done:
-                item, key, slot = futures.pop(future)
-                running[key] -= 1
-                slot.release()
-                if isinstance(future.exception(), _ProviderDeferred):
-                    completed_rows.append((item, None))
-                elif not isinstance(future.exception(), AnalysisCancelled):
-                    completed_rows.append((item, future))
-            for item, future in completed_rows:
-                yield item, future
+                done, _pending = wait(futures, return_when=FIRST_COMPLETED)
+                completed_rows = []
+                storage_failure = None
+                for future in done:
+                    item, key, slot = futures.pop(future)
+                    running[key] -= 1
+                    slot.release()
+                    failure = future.exception()
+                    if failure is not None and not unconsumed.get(future):
+                        unconsumed.pop(future, None)
+                    if isinstance(failure, storage.StorageError):
+                        storage_failure = failure
+                    elif isinstance(failure, _ProviderDeferred):
+                        completed_rows.append((item, None))
+                    elif not isinstance(failure, AnalysisCancelled):
+                        completed_rows.append((item, future))
+                if storage_failure is not None:
+                    raise storage_failure
+                if archive:
+                    archive.flush()
+                for item, future in completed_rows:
+                    # Ownership transfers at yield, before the caller may start
+                    # a local decoder or close this generator. Never unlink it
+                    # again from scheduler shutdown.
+                    unconsumed.pop(future, None)
+                    yield item, future
+    finally:
+        # The executor has joined every worker. This includes both futures still
+        # pending at an abort and completed results withheld by a failed flush.
+        # A disposer is opt-in: never infer file ownership from generic results.
+        cleanup_error = None
+        for holder in unconsumed.values():
+            if holder:
+                try:
+                    discard_result(holder.pop())
+                except Exception as exc:
+                    cleanup_error = cleanup_error or exc
+        unconsumed.clear()
+        for _item, _key, slot in futures.values():
+            slot.release()
+        if cleanup_error is not None:
+            raise storage.StorageError('Unconsumed capture result cleanup failed') from cleanup_error
+    if archive:
+        archive.flush(force=True)
 
 
 def _item_from_stream(stream) -> dict[str, Any]:
@@ -2216,7 +2290,9 @@ def _append_throughput_history(item, entry, result) -> dict[str, Any]:
         "measured_mbps": result.get("measured_mbps"),
         "nominal_video_kbps": result.get("nominal_video_kbps"),
         "capacity_ratio": result.get("capacity_ratio"),
-        "duration_seconds": result.get("duration_seconds"),
+        "duration_seconds": result.get("elapsed_seconds") if result.get("elapsed_seconds") is not None else result.get("duration_seconds"),
+        "bytes": result.get("bytes"),
+        "measurement_source": result.get("measurement_source"),
         "error_type": str(result.get("error_type") or ""),
         "error": str(result.get("error") or ""),
         "m3u_account_id": item.get("account_id"),
@@ -2382,6 +2458,8 @@ def analyze_assigned_streams(
     total = len(items)
     run = storage.active_run()
     store = run.store if run else None
+    if store and analyzer._as_bool(settings.get("retain_probe_observations"), True):
+        run.observations = observations.Archive(store, run.owner, settings, items)
     cache = store.load(items) if store else analyzer.load_analysis_cache(cache_path)
     storage_start = copy.deepcopy(cache) if store else None
     for item in items:
@@ -2393,6 +2471,9 @@ def analyze_assigned_streams(
         return store.playback([item['id'] for item in selected]) if store else load_reliability_cache(RELIABILITY_PATH)
 
     def phase_flush(entries):
+        archive = getattr(run, "observations", None)
+        if archive:
+            archive.flush(force=True)
         if not store or not entries:
             return
         run.ensure()
@@ -2590,6 +2671,9 @@ def analyze_assigned_streams(
         for item, _ in media_due
     }
     reason_by_id = {int(item["id"]): reason for item, reason in media_due}
+    for item in items:
+        item["_observation_reasons"] = {"metadata": reason_by_id.get(int(item["id"])),
+            "content": content_reason_by_id.get(int(item["id"]))}
     limiter = analyzer._PerAccountStartLimiter(account_delay)
     media_started = time.monotonic()
 
@@ -2667,15 +2751,16 @@ def analyze_assigned_streams(
             return _attach_capture_diagnostic(result, diagnostic)
         probe_settings = dict(settings)
         probe_settings["analysis_duration_seconds"] = 1
-        result = analyzer.analyze_stream(
-            str(item.get("url") or ""),
-            stream_id=item.get("id"),
-            stream_name=str(item.get("name") or ""),
-            settings=probe_settings,
-            user_agent=str(item.get("user_agent") or DEFAULT_USER_AGENT),
-            logger=logger,
-            include_content=False,
-        )
+        with observations.mode("placeholder_confirm_1s"):
+            result = analyzer.analyze_stream(
+                str(item.get("url") or ""),
+                stream_id=item.get("id"),
+                stream_name=str(item.get("name") or ""),
+                settings=probe_settings,
+                user_agent=str(item.get("user_agent") or DEFAULT_USER_AGENT),
+                logger=logger,
+                include_content=False,
+            )
         details = dict(result.get("details") or {})
         details["probe_mode"] = "placeholder_confirm_1s"
         result["details"] = details
@@ -2949,6 +3034,10 @@ def analyze_assigned_streams(
     content_capacity_deferred_ids = set()
     item_by_id = {int(item["id"]): item for item in items}
     throughput_reason_by_id = {int(item["id"]): reason for item, reason in throughput_due}
+    for item in items:
+        item.setdefault("_observation_reasons", {}).update(
+            throughput=throughput_reason_by_id.get(int(item["id"])),
+            content=content_reason_by_id.get(int(item["id"])))
 
     def annotate_throughput_result(sid, result, nominal):
         annotated = dict(result)
@@ -3156,10 +3245,15 @@ def analyze_assigned_streams(
                 sid = int(item["id"])
                 try:
                     result = dict(local_future.result())
+                except storage.StorageError:
+                    raise
                 except Exception as exc:
                     sid = int(local_item["id"])
                     result = dict(effective_result(sid))
                     result.update({"status": "dead", "error_type": "stream_unreachable", "error": str(exc)})
+                archive = getattr(run, "observations", None)
+                if archive:
+                    archive.flush()
                 record_local_result(local_item, result, checked=True)
 
         with ThreadPoolExecutor(
@@ -3173,6 +3267,7 @@ def analyze_assigned_streams(
                     max_workers=workers,
                     thread_name_prefix="stream-sort-combined-capture",
                     capacity_manager=capacity_manager,
+                    discard_result=_discard_combined_capture_result,
                 ),
                 start=1,
             ):
@@ -3337,6 +3432,7 @@ def analyze_assigned_streams(
                     max_workers=workers,
                     thread_name_prefix="stream-sort-combined-retry",
                     capacity_manager=capacity_manager,
+                    discard_result=_discard_combined_capture_result,
                     max_per_account=1,
                 ),
                 start=1,
@@ -3796,6 +3892,10 @@ def analyze_assigned_streams(
         "analysis_health_report_path": None if store else health_report_path,
     }
     if store:
+        archive = getattr(run, "observations", None)
+        if archive:
+            archive.flush(force=True, state="canceled" if canceled else "completed")
+            result["probe_observations"] = archive.snapshot()
         store.record_scan(run.owner, [int(item['id']) for item in items], {**result, 'canceled': canceled})
     if canceled:
         raise AnalysisCancelled(

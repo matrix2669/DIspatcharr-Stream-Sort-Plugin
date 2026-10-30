@@ -70,6 +70,8 @@ def test_plugin_manifest_is_valid_and_matches_version():
     assert fields_by_id["analyze_only_filter"]["default"] == ""
     assert "Leave empty to include all channels" in fields_by_id["analyze_sort_filter"]["help_text"]
     assert "Leave both filters empty" in fields_by_id["analyze_only_filter"]["help_text"]
+    assert fields_by_id["retain_probe_observations"]["default"] is True
+    assert fields_by_id["retain_probe_observations"]["type"] == "boolean"
     assert fields_by_id["analysis_duration_seconds"]["default"] == 5
     assert fields_by_id["content_sample_seconds"]["default"] == 6
     assert fields_by_id["probe_duration_seconds"]["default"] == 6
@@ -96,6 +98,7 @@ def test_plugin_manifest_is_valid_and_matches_version():
     assert actions_by_id["schedule_status"]["description"] == "Show schedule configuration and the status of the latest scheduled run."
     assert [field["id"] for field in manifest["fields"]] == [
         "storage_backend",
+        "retain_probe_observations",
         "bounded_capture_reuse",
         "capture_max_mib",
         "scoring_info",
