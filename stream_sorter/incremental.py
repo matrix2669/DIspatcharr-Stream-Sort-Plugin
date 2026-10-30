@@ -7,6 +7,7 @@ import os
 import statistics
 import time
 import tempfile
+import threading
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from datetime import datetime, timedelta, timezone
 from typing import Any, Mapping
@@ -1328,6 +1329,43 @@ def _account_key(item: Mapping[str, Any]) -> tuple[str, Any]:
     return "unknown", str(item.get("account_name") or "unknown")
 
 
+class _ProviderDeferred(RuntimeError):
+    pass
+
+
+class _ProviderSlot:
+    """One exact reservation, with explicit reacquisition after local fallback."""
+    def __init__(self, manager, item, reservation):
+        self.manager, self.item, self.reservation = manager, item, reservation
+        self.held = True
+        self.lock = threading.Lock()
+
+    def release(self):
+        with self.lock:
+            if self.held:
+                self.held = False
+                if self.manager is not None:
+                    self.manager.release(self.reservation)
+
+    def prepared(self):
+        prepared = (self.manager.prepare_item(self.item, self.reservation)
+                    if self.manager is not None and hasattr(self.manager, 'prepare_item')
+                    else self.item)
+        return {**prepared, '_release_provider': self.release, '_reacquire_provider': self.reacquire}
+
+    def reacquire(self):
+        with self.lock:
+            if not self.held:
+                if analysis_cancel_requested():
+                    raise AnalysisCancelled('Canceled before fallback reservation')
+                acquired, reservation = (self.manager.try_acquire(self.item)
+                    if self.manager is not None else (True, None))
+                if not acquired:
+                    raise _ProviderDeferred('Fallback capacity is occupied')
+                self.reservation, self.held = reservation, True
+            return self.prepared()
+
+
 def _fair_account_futures(
     items,
     worker,
@@ -1385,13 +1423,9 @@ def _fair_account_futures(
                     if not acquired:
                         continue
                     item = queues[key].popleft()
-                    worker_item = (
-                        capacity_manager.prepare_item(item, reservation)
-                        if capacity_manager is not None
-                        and hasattr(capacity_manager, "prepare_item")
-                        else item
-                    )
+                    slot = _ProviderSlot(capacity_manager, item, reservation)
                     try:
+                        worker_item = slot.prepared()
                         def guarded_work(prepared):
                             run = storage.active_run()
                             try:
@@ -1404,10 +1438,9 @@ def _fair_account_futures(
                                     run.store.close_worker_connection()
                         future = executor.submit(guarded_work, worker_item)
                     except Exception:
-                        if capacity_manager is not None:
-                            capacity_manager.release(reservation)
+                        slot.release()
                         raise
-                    futures[future] = (item, key, reservation)
+                    futures[future] = (item, key, slot)
                     running[key] += 1
                     launched[key] += 1
                     submitted = True
@@ -1429,11 +1462,12 @@ def _fair_account_futures(
             done, _pending = wait(futures, return_when=FIRST_COMPLETED)
             completed_rows = []
             for future in done:
-                item, key, reservation = futures.pop(future)
+                item, key, slot = futures.pop(future)
                 running[key] -= 1
-                if capacity_manager is not None:
-                    capacity_manager.release(reservation)
-                if not isinstance(future.exception(), AnalysisCancelled):
+                slot.release()
+                if isinstance(future.exception(), _ProviderDeferred):
+                    completed_rows.append((item, None))
+                elif not isinstance(future.exception(), AnalysisCancelled):
                     completed_rows.append((item, future))
             for item, future in completed_rows:
                 yield item, future
@@ -2386,6 +2420,7 @@ def analyze_assigned_streams(
         )
         if not path:
             return None
+        item["_release_provider"]()
         try:
             metadata = analyzer.analyze_stream(
                 path, stream_id=item['id'], stream_name=str(item.get('name') or ''),
@@ -2436,6 +2471,7 @@ def analyze_assigned_streams(
                 return shared
             if analysis_cancel_requested():
                 raise AnalysisCancelled('Canceled after incomplete capture')
+            item = item['_reacquire_provider']()
             storage.ensure_provider_work()
         known_placeholder = sid in known_placeholder_ids and not force_full
         if force_full or not known_placeholder:
@@ -2672,7 +2708,10 @@ def analyze_assigned_streams(
     if store:
         for item in items:
             sid = int(item['id'])
-            if sid in known_placeholder_ids and sid not in placeholder_recovered_ids:
+            if sid in placeholder_recovered_ids:
+                content_reason_by_id[sid] = 'placeholder_recovered'
+                continue
+            if sid in known_placeholder_ids:
                 continue
             reason = content_check_reason(
                 cache.get(str(sid)), url_hash=analyzer._stream_url_hash(str(item.get('url') or '')),
@@ -3557,6 +3596,8 @@ def analyze_assigned_streams(
         "cache_path": None if store else cache_path,
         "analysis_health_report_path": None if store else health_report_path,
     }
+    if store:
+        store.record_scan(run.owner, [int(item['id']) for item in items], {**result, 'canceled': canceled})
     if canceled:
         raise AnalysisCancelled(
             "Stream analysis was canceled after saving completed probe results",

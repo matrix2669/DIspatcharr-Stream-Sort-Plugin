@@ -20,6 +20,7 @@ from .scoring import (
 )
 from .analyzer import _format_eta
 from .throughput import DEFAULT_CACHE_PATH, DEFAULT_USER_AGENT, load_cache, probe_stream, save_cache
+from . import storage
 from .reliability import RELIABILITY_PATH, load_reliability_cache
 
 
@@ -322,15 +323,17 @@ def _load_channel_candidates(
     throughput_cache: dict[str, dict[str, Any]],
     reliability_cache: dict[str, Any],
     channel_ids: set[int] | None = None,
+    *, rows=None, analysis_cache=None,
 ):
     from apps.channels.models import ChannelStream
 
-    queryset = ChannelStream.objects.select_related(
-        "channel", "stream", "stream__m3u_account"
-    ).order_by("channel_id", "order", "id")
-    if channel_ids is not None:
-        queryset = queryset.filter(channel_id__in=channel_ids)
-    rows = list(queryset)
+    if rows is None:
+        queryset = ChannelStream.objects.select_related(
+            "channel", "stream", "stream__m3u_account"
+        ).order_by("channel_id", "order", "id")
+        if channel_ids is not None:
+            queryset = queryset.filter(channel_id__in=channel_ids)
+        rows = list(queryset)
 
     grouped: dict[int, list[Any]] = {}
     for row in rows:
@@ -343,13 +346,24 @@ def _load_channel_candidates(
         for row in channel_rows:
             stream = row.stream
             account = stream.m3u_account
+            stats, updated_at = stream.stream_stats, stream.stream_stats_updated_at
+            if analysis_cache is not None:
+                from .analyzer import _stream_url_hash
+                entry = analysis_cache.get(str(stream.id)) or {}
+                if entry.get('url_hash') != _stream_url_hash(str(stream.url or '')):
+                    entry = {}
+                stats = entry.get('stats') if entry.get('status') == 'alive' else None
+                updated_at = _parse_report_datetime(entry.get('metadata_updated_at') or entry.get('ffprobe_checked_at'))
+                if entry.get('status') == 'dead':
+                    stats = {}
+                    updated_at = _parse_report_datetime(entry.get('health_checked_at') or entry.get('tested_at')) or datetime(1970, 1, 1, tzinfo=timezone.utc)
             candidates.append(
                 StreamCandidate(
                     stream_id=stream.id,
                     name=stream.name or "",
                     original_order=row.order,
-                    stats=stream.stream_stats,
-                    stats_updated_at=stream.stream_stats_updated_at,
+                    stats=stats,
+                    stats_updated_at=updated_at,
                     m3u_account_id=getattr(stream, "m3u_account_id", None),
                     m3u_account_name=getattr(account, "name", "") if account else "",
                     m3u_account_active=bool(getattr(account, "is_active", True)) if account else True,
@@ -571,6 +585,16 @@ def _merge_sort_history(previous_report: Mapping[str, Any], payload: dict[str, A
     return payload
 
 
+def scoped_rows(settings, *, purpose='analysis'):
+    from apps.channels.models import ChannelStream
+    channel_ids, summary = resolve_channel_scope(settings, purpose=purpose)
+    queryset = ChannelStream.objects.select_related('channel', 'stream', 'stream__m3u_account').order_by('channel_id', 'order', 'id')
+    if channel_ids is not None:
+        queryset = queryset.filter(channel_id__in=channel_ids)
+    return list(queryset), summary
+
+
+@storage.postgres_sort
 def sort_channels(
     settings: dict[str, Any],
     *,
@@ -579,18 +603,30 @@ def sort_channels(
     report_path: str = REPORT_PATH,
     cache_path: str = DEFAULT_CACHE_PATH,
 ) -> dict[str, Any]:
-    from .storage import reject_postgres
-    reject_postgres(settings, 'sort_channels')
     from django.db import transaction
     from apps.channels.models import ChannelStream
 
     run_started = time.monotonic()
-    previous_report = _load_sort_report(report_path)
+    run = storage.active_run() if storage.backend_name(settings) == "postgresql" else None
+    if storage.backend_name(settings) == "postgresql" and run is None:
+        raise storage.StorageError("PostgreSQL sorting requires its execution lease")
+    store = run.store if run else None
+    previous_report = _load_sort_report(report_path) if not store else {}
     cfg = _settings(settings)
     channel_ids, filter_summary = resolve_channel_scope(settings, purpose="sort")
-    cache = load_cache(cache_path)
-    reliability_cache = load_reliability_cache(RELIABILITY_PATH)
-    channels = _load_channel_candidates(cache, reliability_cache, channel_ids)
+    if store:
+        from .incremental import _unique_items_from_rows
+        rows, filter_summary = scoped_rows(settings, purpose='sort')
+        items = _unique_items_from_rows(rows, {})
+        unified = store.load(items)
+        cache = {sid: entry.get('throughput') for sid, entry in unified.items()}
+        reliability_cache = store.playback([item['id'] for item in items])
+        channels = _load_channel_candidates(cache, reliability_cache, rows=rows, analysis_cache=unified)
+        previous_snapshot = store.sort_snapshots(sorted({row.channel_id for row in rows}))
+    else:
+        cache = load_cache(cache_path)
+        reliability_cache = load_reliability_cache(RELIABILITY_PATH)
+        channels = _load_channel_candidates(cache, reliability_cache, channel_ids)
 
     changed_channels = 0
     changed_rows = 0
@@ -621,6 +657,7 @@ def sort_channels(
         if changed:
             changed_channels += 1
 
+        changed_rows_before_channel = changed_rows
         by_stream_id = {row.stream_id: row for row in channel_rows}
         for new_order, evaluation in enumerate(ranked):
             row = by_stream_id[evaluation.stream_id]
@@ -635,13 +672,14 @@ def sort_channels(
                 "channel_number": channel.channel_number,
                 "channel_name": channel.name,
                 "changed": changed,
+                "rows_changed": changed_rows - changed_rows_before_channel,
                 "current_stream_ids": old_ids,
                 "proposed_stream_ids": new_ids,
                 "streams": [_evaluation_json(item) for item in ranked],
             }
         )
 
-    if apply and rows_to_update:
+    if apply and rows_to_update and not store:
         with transaction.atomic():
             ChannelStream.objects.bulk_update(rows_to_update, ["order"])
 
@@ -658,8 +696,20 @@ def sort_channels(
         "total_runtime": _format_eta(runtime_seconds),
         "channels": channel_reports,
     }
-    payload = _merge_sort_history(previous_report, payload, now=now)
-    _write_json_atomic(payload, report_path)
+    if store:
+        payload.update({'storage_backend': 'postgresql', 'report_path': None})
+        if apply:
+            run.ensure()
+            with store.transaction() as cursor:
+                store.fence(cursor, run.owner)
+                if rows_to_update:
+                    ChannelStream.objects.bulk_update(rows_to_update, ['order'], batch_size=100)
+                store.save_sort(cursor, run.owner, payload, previous_snapshot)
+                run.ensure()
+                store.fence(cursor, run.owner)
+    else:
+        payload = _merge_sort_history(previous_report, payload, now=now)
+        _write_json_atomic(payload, report_path)
 
     logger.info(
         "Stream Sort %s: filter=%s selected=%s evaluated=%s changed_channels=%s changed_rows=%s report=%s runtime=%s",
@@ -669,7 +719,7 @@ def sort_channels(
         len(channel_reports),
         changed_channels,
         changed_rows,
-        report_path,
+        "PostgreSQL" if store else report_path,
         payload["total_runtime"],
     )
     return payload

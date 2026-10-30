@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+### Added
+
+- Add opt-in PostgreSQL schema version 2 through Django's existing connection, explicit initialization/upgrades, resumable legacy statistics import, and bounded history pruning.
+- Batch phase results and query affected stream IDs before downstream decisions, with separate terminal and intermediate state, owner-token fencing, heartbeat, and playback-owned evidence.
+- Support PostgreSQL Analyze + Sort, scoped sorting, health/sort history and TTL actions without rewriting historical JSON files.
+- Add optional bounded RAM capture reuse with local metadata/content analysis, live acquisition throughput measurement, direct fallback, and reservation release before local processing.
+- Add generated-media regression tests and a disposable restricted-role PostgreSQL16 CI job. Production migration and capture activation remain gated on actual database and integration results.
+
 ### Changed
 
 - Buffer startup analysis imports until the existing final checkpoint, avoiding repeated full-history rewrites while preserving completed work on cooperative cancellation.

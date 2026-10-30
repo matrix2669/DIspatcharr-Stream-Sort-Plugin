@@ -815,15 +815,34 @@ def _recommend_ttls(settings: dict, *, report: dict) -> dict:
     }
 
 
+def _postgres_health_report(settings):
+    from .incremental import _build_health_report, _channel_attachments_by_stream, _unique_items_from_rows
+    from .sorter import scoped_rows
+    store = storage.PostgresStore()
+    store.check_schema()
+    rows, filters = scoped_rows(settings)
+    items = _unique_items_from_rows(rows, _channel_attachments_by_stream(rows))
+    latest = store.latest_scan([item['id'] for item in items])
+    if latest is None:
+        return {}
+    cache = store.load(items, history=True)
+    report = _build_health_report(items, cache, now=datetime.now(timezone.utc),
+        media_reason_counts={}, throughput_reason_counts={},
+        channels_selected=len({row.channel_id for row in rows}))
+    report.update({'generated_at': latest[0].isoformat(), 'filters': filters,
+                   'storage_backend': 'postgresql'})
+    return report
+
+
 def _run_ttl_recommendation_action(settings: dict) -> dict:
-    report = _load_json(ANALYSIS_HEALTH_REPORT_PATH, {})
+    postgres = storage.backend_name(settings) == "postgresql"
+    report = _postgres_health_report(settings) if postgres else _load_json(ANALYSIS_HEALTH_REPORT_PATH, {})
     if not report:
         return {
             "status": "error",
-            "message": (
+            "message": ("No completed PostgreSQL scan covers the selected streams. Run Analyze Streams first." if postgres else
                 "No analysis health report found. Run Analyze Streams first so"
-                f" it writes {ANALYSIS_HEALTH_REPORT_PATH}."
-            ),
+                f" it writes {ANALYSIS_HEALTH_REPORT_PATH}."),
         }
 
     generated_at = _parse_datetime(report.get("generated_at"))
@@ -845,7 +864,10 @@ def _run_ttl_recommendation_action(settings: dict) -> dict:
         }
 
     result = _recommend_ttls(settings, report=report)
-    _save_json(TTL_RECOMMENDATION_PATH, result)
+    if postgres:
+        result.update({"health_report_path": None, "recommendation_file": None, "storage_backend": "postgresql"})
+    if not postgres:
+        _save_json(TTL_RECOMMENDATION_PATH, result)
 
     current = result["current_ttls"]
     recommended = result["recommended_ttls"]
@@ -867,13 +889,14 @@ def _run_ttl_recommendation_action(settings: dict) -> dict:
     return {
         "status": "ok",
         "message": message,
-        "recommendation_path": TTL_RECOMMENDATION_PATH,
+        "recommendation_path": None if postgres else TTL_RECOMMENDATION_PATH,
         "result": result,
     }
 
 
-def _run_health_report_action() -> dict:
-    report = _load_json(ANALYSIS_HEALTH_REPORT_PATH, {})
+def _run_health_report_action(settings=None) -> dict:
+    postgres = storage.backend_name(settings or {}) == "postgresql"
+    report = _postgres_health_report(settings) if postgres else _load_json(ANALYSIS_HEALTH_REPORT_PATH, {})
     if not report:
         return {
             "status": "error",
@@ -896,21 +919,27 @@ def _run_health_report_action() -> dict:
     return {
         "status": "ok",
         "message": message,
-        "report_path": ANALYSIS_HEALTH_REPORT_PATH,
+        "report_path": None if postgres else ANALYSIS_HEALTH_REPORT_PATH,
         "result": report,
     }
 
 
-def _run_sort_history_action() -> dict:
-    report = _load_json(REPORT_PATH, {})
+def _run_sort_history_action(settings=None) -> dict:
+    postgres = storage.backend_name(settings or {}) == 'postgresql'
+    if postgres:
+        from .sorter import scoped_rows
+        rows, _filters = scoped_rows(settings, purpose='sort')
+        report = storage.PostgresStore().sort_report(sorted({row.channel_id for row in rows}))
+    else:
+        report = _load_json(REPORT_PATH, {})
     history = report.get("sort_history") if isinstance(report.get("sort_history"), list) else []
-    if not history:
+    if not history and not report.get("legacy_unscoped_runs"):
         return {
             "status": "error",
             "message": "No applied sort history found. Run Sort Streams or Analyze + Sort first.",
         }
-    first_at = _parse_datetime(history[0].get("generated_at"))
-    last_at = _parse_datetime(history[-1].get("generated_at"))
+    first_at = _parse_datetime(history[0].get("generated_at")) if history else None
+    last_at = _parse_datetime(history[-1].get("generated_at")) if history else None
     span_hours = (
         max(0.0, (last_at - first_at).total_seconds() / 3600.0)
         if first_at is not None and last_at is not None
@@ -933,14 +962,17 @@ def _run_sort_history_action() -> dict:
         "stream_movements": movement_events,
         "sort_history": history,
         "daily_rollups": report.get("sort_daily_rollups") or {},
+        "legacy_unscoped_daily_rollups": report.get("legacy_unscoped_daily_rollups") or {},
+        "legacy_unscoped_runs": report.get("legacy_unscoped_runs") or [],
     }
     return {
         "status": "ok",
         "message": (
             f"Sort history: {len(history)} applied runs over {span_hours:.1f}h; "
             f"{changed_channels} changed-channel results; {movement_events} stream movements."
+            + (f" Legacy history also contains {len(report.get('legacy_unscoped_runs') or [])} runs without complete channel attribution." if report.get("legacy_unscoped_runs") else "")
         ),
-        "report_path": REPORT_PATH,
+        "report_path": None if postgres else REPORT_PATH,
         "result": result,
     }
 
@@ -1429,8 +1461,8 @@ def _start_background_job(
     sort_after: bool,
     schedule_generation: int | None = None,
 ) -> dict:
-    if kind != 'analyze' or sort_after:
-        storage.reject_postgres(settings, 'analysis with sort or throughput-only scan')
+    if kind != 'analyze':
+        storage.reject_postgres(settings, 'legacy throughput-only scan')
     if storage.backend_name(settings) == 'postgresql':
         storage.PostgresStore().check_schema()
     _channel_ids, scope = resolve_channel_scope(settings)
@@ -1640,6 +1672,7 @@ class Plugin:
         # persistent [IPTV Checker] filter on that shared object. A dedicated
         # logger keeps Stream Sort identity correct even when both plugins run.
         logger = LOGGER
+        report_location = "PostgreSQL response" if storage.backend_name(settings) == "postgresql" else REPORT_PATH
 
         try:
             if action == 'initialize_storage':
@@ -1647,14 +1680,14 @@ class Plugin:
             if action == 'retain_storage':
                 with analysis_maintenance_execution(), storage.RunLease(storage.PostgresStore()) as run:
                     removed = run.store.retain(run.owner)
-                return {'status': 'ok', 'removed_rows': removed, 'maximum_rows': 2000}
+                return {'status': 'ok', 'removed_rows': removed, 'maximum_rows': 7000}
             if action == 'import_storage':
-                from .storage_import import import_analysis
+                from .storage_import import import_legacy
                 with analysis_maintenance_execution():
-                    result = import_analysis(storage.PostgresStore(), ANALYSIS_CACHE_PATH)
+                    result = import_legacy(storage.PostgresStore(), ANALYSIS_CACHE_PATH, RELIABILITY_PATH, REPORT_PATH)
                 return {'status': 'ok', **result}
             if storage.backend_name(settings) == 'postgresql':
-                if action in {'recommend_ttls', 'health_report', 'sort_history', 'dry_run', 'sort_streams', 'analyze_and_sort', 'probe_throughput', 'probe_and_sort'}:
+                if action in {'probe_throughput', 'probe_and_sort'}:
                     storage.reject_postgres(settings, action)
                 if action in {'reset_scan_statistics', 'reset_all_statistics'}:
                     with analysis_maintenance_execution(), storage.RunLease(storage.PostgresStore()) as run:
@@ -1685,8 +1718,6 @@ class Plugin:
                     settings=settings,
                 )
             if action == "apply_schedule":
-                if _safe_bool(settings.get("stream_sort_apply_sort_after_scheduled_scan"), True):
-                    storage.reject_postgres(settings, "scheduled analysis with sorting; disable Apply sort after scheduled analysis")
                 return _apply_schedule_action(settings)
 
             if action == "remove_schedule":
@@ -1705,10 +1736,10 @@ class Plugin:
                 return _run_ttl_recommendation_action(settings)
 
             if action == "health_report":
-                return _run_health_report_action()
+                return _run_health_report_action(settings) if storage.backend_name(settings) == "postgresql" else _run_health_report_action()
 
             if action == "sort_history":
-                return _run_sort_history_action()
+                return _run_sort_history_action(settings) if storage.backend_name(settings) == "postgresql" else _run_sort_history_action()
 
             if action == "reset_scan_statistics":
                 return _run_reset_statistics_action(include_history=False)
@@ -1722,8 +1753,9 @@ class Plugin:
                     "status": "ok",
                     "message": (
                         f"Dry run complete: {result['channels_evaluated']} channels evaluated; "
-                        f"{result['channels_changed']} would change. Report: {REPORT_PATH}"
+                        f"{result['channels_changed']} would change. Report: {report_location}"
                     ),
+                    **({"result": result, "report_path": None} if storage.backend_name(settings) == "postgresql" else {}),
                     **{k: result[k] for k in ("channels_evaluated", "channels_changed", "rows_changed", "filters")},
                 }
 
@@ -1733,8 +1765,9 @@ class Plugin:
                     "status": "ok",
                     "message": (
                         f"Sort complete: {result['channels_changed']} channels changed; "
-                        f"{result['rows_changed']} order rows updated. Report: {REPORT_PATH}"
+                        f"{result['rows_changed']} order rows updated. Report: {report_location}"
                     ),
+                    **({"result": result, "report_path": None} if storage.backend_name(settings) == "postgresql" else {}),
                     **{k: result[k] for k in ("channels_evaluated", "channels_changed", "rows_changed", "filters")},
                 }
 

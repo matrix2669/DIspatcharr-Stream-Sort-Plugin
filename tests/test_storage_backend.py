@@ -22,6 +22,7 @@ class MemoryStore:
         self.calls = []
         self.playback_calls = 0
         self.new_playback = None
+        self.record_scan = Mock()
         self.persist_core = Mock()
         self.close_worker_connection = Mock()
     def acquire(self, owner):
@@ -275,7 +276,7 @@ def test_shared_capture_wired_cleanup_reservation_and_newly_due_throughput(pg_sc
     assert not any(path.exists() for path in paths)
     assert result['throughput_checked'] == result['throughput_attempted'] == 1
     assert result['content_checked'] == 1
-    assert context.capacity.release.call_count == (1 if playable == 8 else 3)
+    assert context.capacity.release.call_count == (1 if playable == 8 else 4)
     entry = context.store.current['42']
     assert entry['url_hash'] == analyzer._stream_url_hash('http://example.test/source')
     assert entry['throughput']['reason'] == 'media_changed'
@@ -375,3 +376,84 @@ def test_unchanged_fully_cached_pg_scan_has_no_state_or_history_writes(pg_scan, 
     assert not any(row[0] == 'flush' for row in context.store.calls)
     assert not any(row[0] == 'load' and row[3] for row in context.store.calls)
     context.capacity.try_acquire.assert_not_called()
+
+
+def test_pg_placeholder_recovery_keeps_forced_content_after_phase_requery(pg_scan, monkeypatch):
+    context = pg_scan
+    context.store.current['42'].update({'error_type': 'placeholder_file',
+        'content_checked_at': context.now.isoformat(), 'content_m3u_account_id': 7,
+        'throughput': {'status': 'healthy', 'checked_at': context.now.isoformat(),
+                       'm3u_account_id': 7, 'measured_mbps': 12}})
+    calls = []
+    def probe(*args, **kwargs):
+        calls.append(kwargs['settings'].get('analysis_duration_seconds', 5))
+        return {'status': 'alive', 'tested_at': context.now.isoformat(), 'stats': {}, 'details': {}}
+    monkeypatch.setattr(analyzer, 'analyze_stream', probe)
+    content = Mock(side_effect=lambda base, *a, **kw: {**base, 'details': {
+        'content': {'measured': True, 'tested_at': context.now.isoformat()}}})
+    monkeypatch.setattr(analyzer, 'apply_content_analysis', content)
+    result = context.run(bounded_capture_reuse=True)
+    assert calls == [1, 5]
+    assert result['content_checked'] == result['throughput_checked'] == 1
+    content.assert_called_once()
+    assert context.store.current['42']['health_check_history'][0]['reason'] == 'content_placeholder_recovered'
+
+
+@pytest.mark.parametrize('fallback,cancel', [(False, False), (True, False), (True, True)])
+def test_local_processors_observe_exact_reservation_release(pg_scan, monkeypatch, fallback, cancel):
+    context = pg_scan
+    held, released = set(), []
+    next_slot = iter(range(1, 20))
+    def acquire(item):
+        slot = next(next_slot)
+        held.add(slot)
+        return True, slot
+    def release(slot):
+        assert slot in held
+        held.remove(slot)
+        released.append(slot)
+    context.capacity.try_acquire.side_effect = acquire
+    context.capacity.release.side_effect = release
+    monkeypatch.setattr(incremental, '_select_capture_temp_directory', lambda *a, **kw: str(context.tmp_path))
+    monkeypatch.setattr(incremental, 'throughput_check_reason', lambda *a, **kw: None)
+    def capture(*args, **kwargs):
+        assert held == {1}
+        path = context.tmp_path / 'sample.ram'
+        path.write_bytes(b'sample')
+        return {'tested_at': context.now.isoformat(), 'measured_mbps': 12, 'complete': True}, str(path)
+    def metadata(source, **kwargs):
+        local = kwargs.get('local_source', False)
+        if local:
+            assert released == [1] and not held
+            if cancel:
+                execution_control.request_analysis_cancel()
+        else:
+            assert fallback and not cancel
+            assert held == {2}
+        return {'status': 'alive', 'tested_at': context.now.isoformat(), 'stats': {},
+                'details': {'sample_duration_seconds': .2 if fallback and local else 8}}
+    def content(base, source, **kwargs):
+        if kwargs.get('local_source'):
+            assert released == [1] and not held
+        return {**base, 'details': {'content': {'measured': True, 'tested_at': context.now.isoformat()}}}
+    monkeypatch.setattr(incremental, 'capture_bounded_sample', capture)
+    monkeypatch.setattr(analyzer, 'analyze_stream', metadata)
+    monkeypatch.setattr(analyzer, 'apply_content_analysis', content)
+    if cancel:
+        with pytest.raises(execution_control.AnalysisCancelled):
+            context.run(bounded_capture_reuse=True)
+        assert released == [1]
+    else:
+        context.run(bounded_capture_reuse=True)
+        assert len(released) == (3 if fallback else 1)
+    assert len(released) == len(set(released))
+    assert not held and not (context.tmp_path / 'sample.ram').exists()
+
+
+def test_auxiliary_import_parser_streams_nested_maps_and_history(tmp_path):
+    from stream_sorter.storage_import import iter_legacy_records
+    path = tmp_path / 'aux.json'
+    path.write_text(json.dumps({'streams': {'42': {'playback_starts': 5}}, 'channels': {'id:1': {'active_stream_id': 42}}}))
+    with path.open() as handle:
+        rows = list(iter_legacy_records(handle, 'reliability'))
+    assert rows == [('streams', '42', {'playback_starts': 5}), ('channels', 'id:1', {'active_stream_id': 42})]

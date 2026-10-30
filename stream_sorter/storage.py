@@ -12,7 +12,7 @@ import json
 import threading
 import uuid
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 BATCH_SIZE = 100
 LEASE_SECONDS = 120
 HEARTBEAT_SECONDS = 20
@@ -109,9 +109,13 @@ class PostgresStore:
             cursor.execute('SELECT version FROM stream_sort_schema WHERE singleton = 1 FOR UPDATE')
             row = cursor.fetchone()
             if row:
-                if row[0] != SCHEMA_VERSION:
-                    raise StorageError(f'Unsupported Stream Sort schema {row[0]}; expected {SCHEMA_VERSION}')
-                return {'schema_version': row[0], 'initialized': False}
+                if row[0] == SCHEMA_VERSION:
+                    return {'schema_version': row[0], 'initialized': False}
+                if row[0] == 1:
+                    self._initialize_v2(cursor)
+                    cursor.execute('UPDATE stream_sort_schema SET version = %s', [SCHEMA_VERSION])
+                    return {'schema_version': SCHEMA_VERSION, 'initialized': False, 'upgraded_from': 1}
+                raise StorageError(f'Unsupported Stream Sort schema {row[0]}; expected {SCHEMA_VERSION}')
             for ddl in (
                 'CREATE TABLE stream_sort_lease (name text PRIMARY KEY, owner text NOT NULL, expires_at timestamptz NOT NULL)',
                 'CREATE TABLE stream_sort_current (stream_id bigint PRIMARY KEY, provider_id bigint, data jsonb NOT NULL)',
@@ -125,8 +129,87 @@ class PostgresStore:
                 'CREATE TABLE stream_sort_import (source text PRIMARY KEY, fingerprint text NOT NULL, last_key text)',
             ):
                 cursor.execute(ddl)
+            self._initialize_v2(cursor)
             cursor.execute('INSERT INTO stream_sort_schema VALUES (1, %s)', [SCHEMA_VERSION])
         return {'schema_version': SCHEMA_VERSION, 'initialized': True}
+
+    def _initialize_v2(self, cursor):
+        for ddl in (
+            'CREATE TABLE stream_sort_scan (run_id text PRIMARY KEY, completed_at timestamptz NOT NULL, stream_ids bigint[] NOT NULL, data jsonb NOT NULL)',
+            'CREATE INDEX stream_sort_scan_time ON stream_sort_scan(completed_at)',
+            'CREATE TABLE stream_sort_sort_run (run_id text PRIMARY KEY, observed_at timestamptz NOT NULL, data jsonb NOT NULL)',
+            'CREATE INDEX stream_sort_sort_time ON stream_sort_sort_run(observed_at)',
+            'CREATE TABLE stream_sort_sort_channel (run_id text NOT NULL, channel_id bigint NOT NULL, data jsonb NOT NULL, PRIMARY KEY(run_id, channel_id))',
+            'CREATE INDEX stream_sort_sort_channel_lookup ON stream_sort_sort_channel(channel_id, run_id)',
+            'CREATE TABLE stream_sort_sort_snapshot (channel_id bigint PRIMARY KEY, data jsonb NOT NULL)',
+            'CREATE TABLE stream_sort_sort_rollup (run_id text NOT NULL, channel_id bigint NOT NULL, day date NOT NULL, changed integer NOT NULL, rows_changed integer NOT NULL, PRIMARY KEY(run_id, channel_id))',
+            'CREATE INDEX stream_sort_sort_rollup_lookup ON stream_sort_sort_rollup(channel_id, day)',
+            'CREATE TABLE stream_sort_sort_legacy_daily (day date PRIMARY KEY, data jsonb NOT NULL)',
+        ):
+            cursor.execute(ddl)
+
+    def record_scan(self, owner, ids, result):
+        with self.transaction() as cursor:
+            self.fence(cursor, owner)
+            cursor.execute('INSERT INTO stream_sort_scan VALUES (%s, clock_timestamp(), %s, %s::jsonb) ON CONFLICT DO NOTHING', [owner, ids, _dump(result)])
+            self.fence(cursor, owner)
+
+    def latest_scan(self, ids):
+        if not ids:
+            return None
+        with self.transaction() as cursor:
+            cursor.execute('SELECT completed_at, data FROM stream_sort_scan WHERE stream_ids && %s::bigint[] ORDER BY completed_at DESC LIMIT 1', [ids])
+            row = cursor.fetchone()
+            return (row[0], _decode(row[1])) if row else None
+
+    def sort_snapshots(self, ids):
+        result = []
+        for batch in _chunks(ids):
+            with self.transaction() as cursor:
+                cursor.execute('SELECT data FROM stream_sort_sort_snapshot WHERE channel_id = ANY(%s)', [batch])
+                result.extend(_decode(row[0]) for row in cursor.fetchall())
+        return result
+
+    def save_sort(self, cursor, owner, payload, previous):
+        """Called inside the SAME transaction as ChannelStream order changes."""
+        from .sorter import _applied_snapshot, _sort_movement
+        self.fence(cursor, owner)
+        cursor.execute('INSERT INTO stream_sort_sort_run VALUES (%s, %s, %s::jsonb) ON CONFLICT DO NOTHING', [owner, payload['generated_at'], _dump({k: v for k, v in payload.items() if k != 'channels'})])
+        if cursor.rowcount == 0:
+            return
+        by_id = {channel['channel_id']: channel for channel in previous}
+        for channel in payload['channels']:
+            detail = _sort_movement(channel, by_id.get(channel['channel_id']))
+            detail.update({'changed': channel['changed'], 'rows_changed': channel['rows_changed']})
+            cursor.execute('INSERT INTO stream_sort_sort_channel VALUES (%s, %s, %s::jsonb)', [owner, channel['channel_id'], _dump(detail)])
+            cursor.execute('INSERT INTO stream_sort_sort_snapshot VALUES (%s, %s::jsonb) ON CONFLICT (channel_id) DO UPDATE SET data = EXCLUDED.data', [channel['channel_id'], _dump(_applied_snapshot([channel])[0])])
+            cursor.execute('INSERT INTO stream_sort_sort_rollup VALUES (%s, %s, %s, %s, %s)', [owner, channel['channel_id'], payload['generated_at'][:10], int(channel['changed']), channel['rows_changed']])
+        self.fence(cursor, owner)
+
+    def sort_report(self, channel_ids):
+        self.check_schema()
+        with self.transaction() as cursor:
+            cursor.execute("SELECT r.run_id, r.observed_at, r.data, c.data FROM stream_sort_sort_run r JOIN stream_sort_sort_channel c USING (run_id) WHERE c.channel_id = ANY(%s) AND r.observed_at >= clock_timestamp() - interval '90 days' AND r.run_id IN (SELECT r2.run_id FROM stream_sort_sort_run r2 WHERE EXISTS (SELECT 1 FROM stream_sort_sort_channel c2 WHERE c2.run_id = r2.run_id AND c2.channel_id = ANY(%s)) ORDER BY r2.observed_at DESC LIMIT 5000) ORDER BY r.observed_at, r.run_id, c.channel_id", [channel_ids, channel_ids])
+            runs = {}
+            for run_id, observed, data, raw in cursor.fetchall():
+                detail = _decode(raw)
+                run = runs.setdefault(run_id, {'generated_at': observed.isoformat(), 'channels_evaluated': 0, 'channels_changed': 0, 'rows_changed': 0, 'changed_channels': []})
+                run['channels_evaluated'] += 1
+                run['channels_changed'] += int(detail.get('changed', True))
+                run['rows_changed'] += int(detail.get('rows_changed') or len(detail.get('movements') or []))
+                if detail.get('changed', True):
+                    run['changed_channels'].append(detail)
+            cursor.execute("SELECT day, count(DISTINCT run_id), count(*), sum(changed), sum(rows_changed) FROM stream_sort_sort_rollup WHERE channel_id = ANY(%s) AND day >= CURRENT_DATE - 365 GROUP BY day ORDER BY day", [channel_ids])
+            rollups = {str(day): {'applied_runs': applied, 'channels_evaluated': evaluated, 'channels_changed': changed, 'rows_changed': rows} for day, applied, evaluated, changed, rows in cursor.fetchall()}
+            cursor.execute('SELECT day, data FROM stream_sort_sort_legacy_daily WHERE day >= CURRENT_DATE - 365 ORDER BY day')
+            legacy = {str(day): _decode(data) for day, data in cursor.fetchall()}
+            cursor.execute("SELECT data FROM stream_sort_sort_run WHERE data->>'legacy_import' = 'true' AND observed_at >= clock_timestamp() - interval '90 days' ORDER BY observed_at LIMIT 5000")
+            legacy_runs = [_decode(row[0]) for row in cursor.fetchall()]
+        history = list(runs.values())
+        return {'generated_at': history[-1]['generated_at'] if history else None,
+                'sort_history': history, 'sort_daily_rollups': rollups,
+                'legacy_unscoped_daily_rollups': legacy, 'legacy_unscoped_runs': legacy_runs,
+                'sort_history_retention_days': 90, 'sort_rollup_retention_days': 365}
 
     def acquire(self, owner, seconds=LEASE_SECONDS):
         self.check_schema()
@@ -174,6 +257,8 @@ class PostgresStore:
                 if history:
                     cursor.execute("SELECT wanted.sid, h.kind, h.data FROM unnest(%s::bigint[]) wanted(sid) CROSS JOIN LATERAL (SELECT kind, data, observed_at, event_id FROM stream_sort_history WHERE stream_id = wanted.sid AND kind = 'health_check_history' AND observed_at >= clock_timestamp() - interval '90 days' ORDER BY observed_at DESC, event_id DESC LIMIT 10000) h UNION ALL SELECT wanted.sid, h.kind, h.data FROM unnest(%s::bigint[]) wanted(sid) CROSS JOIN LATERAL (SELECT kind, data, observed_at, event_id FROM stream_sort_history WHERE stream_id = wanted.sid AND kind = 'throughput_check_history' AND observed_at >= clock_timestamp() - interval '90 days' ORDER BY observed_at DESC, event_id DESC LIMIT 512) h", [ids, ids])
                     histories = cursor.fetchall()
+                    cursor.execute("SELECT wanted.sid, h.data FROM unnest(%s::bigint[]) wanted(sid) CROSS JOIN LATERAL (SELECT data FROM stream_sort_history WHERE stream_id = wanted.sid AND kind = 'playback_throughput_history' AND observed_at >= clock_timestamp() - interval '90 days' ORDER BY observed_at DESC LIMIT 1000) h", [ids])
+                    histories.extend((sid, 'playback_throughput_history', data) for sid, data in cursor.fetchall())
                     histories.sort(key=lambda row: str(_decode(row[2]).get('checked_at') or ''))
                     for sid, kind, data in histories:
                         result.setdefault(str(sid), {}).setdefault(kind, []).append(_decode(data))
@@ -258,6 +343,15 @@ class PostgresStore:
             removed = cursor.rowcount
             cursor.execute("DELETE FROM stream_sort_rollup WHERE (stream_id, day) IN (SELECT stream_id, day FROM stream_sort_rollup WHERE day < CURRENT_DATE - 365 ORDER BY day LIMIT %s)", [min(1000, max(1, limit))])
             total_removed = removed + cursor.rowcount
+            for sql in (
+                "DELETE FROM stream_sort_scan WHERE run_id IN (SELECT run_id FROM stream_sort_scan WHERE completed_at < clock_timestamp() - interval '90 days' LIMIT 1000)",
+                "DELETE FROM stream_sort_sort_channel WHERE (run_id, channel_id) IN (SELECT c.run_id, c.channel_id FROM stream_sort_sort_channel c JOIN stream_sort_sort_run r USING (run_id) WHERE r.observed_at < clock_timestamp() - interval '90 days' LIMIT 1000)",
+                "DELETE FROM stream_sort_sort_run WHERE run_id IN (SELECT r.run_id FROM stream_sort_sort_run r WHERE r.observed_at < clock_timestamp() - interval '90 days' AND NOT EXISTS (SELECT 1 FROM stream_sort_sort_channel c WHERE c.run_id = r.run_id) LIMIT 1000)",
+                "DELETE FROM stream_sort_sort_rollup WHERE (run_id, channel_id) IN (SELECT run_id, channel_id FROM stream_sort_sort_rollup WHERE day < CURRENT_DATE - 365 LIMIT 1000)",
+                "DELETE FROM stream_sort_sort_legacy_daily WHERE day IN (SELECT day FROM stream_sort_sort_legacy_daily WHERE day < CURRENT_DATE - 365 LIMIT 1000)",
+            ):
+                cursor.execute(sql)
+                total_removed += cursor.rowcount
             self.fence(cursor, owner)
             return total_removed
 
@@ -287,7 +381,7 @@ class PostgresStore:
     def reset(self, owner, *, include_history):
         with self.transaction() as cursor:
             self.fence(cursor, owner)
-            for table in ('stream_sort_current', 'stream_sort_component', 'stream_sort_rollup', 'stream_sort_import'):
+            for table in ('stream_sort_current', 'stream_sort_component', 'stream_sort_rollup', 'stream_sort_import', 'stream_sort_scan', 'stream_sort_sort_channel', 'stream_sort_sort_run', 'stream_sort_sort_snapshot', 'stream_sort_sort_rollup', 'stream_sort_sort_legacy_daily'):
                 cursor.execute(f'DELETE FROM {table}')
             if include_history:
                 cursor.execute('DELETE FROM stream_sort_playback')
@@ -373,3 +467,14 @@ def postgres_scan(function):
 
 def active_run():
     return _active_lease
+
+
+def postgres_sort(function):
+    @wraps(function)
+    def wrapped(settings, *args, **kwargs):
+        if backend_name(settings) == 'json':
+            return function(settings, *args, **kwargs)
+        from .execution_control import analysis_maintenance_execution
+        with analysis_maintenance_execution():
+            return postgres_scan(function)(settings, *args, **kwargs)
+    return wrapped

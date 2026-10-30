@@ -34,7 +34,7 @@ from stream_sorter import storage
 from stream_sorter.reliability import record_runtime_event
 from stream_sorter.storage_import import import_analysis
 
-TABLES = ('component', 'current', 'history', 'rollup', 'playback', 'import', 'lease', 'schema')
+TABLES = ('scan', 'sort_channel', 'sort_run', 'sort_snapshot', 'sort_rollup', 'sort_legacy_daily', 'component', 'current', 'history', 'rollup', 'playback', 'import', 'lease', 'schema')
 ITEM = {'id': 42, 'account_id': 7}
 NOW = datetime.now(timezone.utc).isoformat()
 
@@ -295,3 +295,153 @@ def test_expired_history_pruning_is_bounded_and_explicit(store):
     assert store.retain('maintenance') == 1000
     assert count(store, 'history') == 5
     assert store.retain('maintenance') == 5
+
+
+@pytest.fixture
+def sort_case(store, tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    import sys
+    import types
+    import uuid
+    from django.db import models, connection
+    from stream_sorter import analyzer, execution_control, sorter
+    for key in ('ANALYSIS_EXECUTION_LOCK_PATH', 'ANALYSIS_EXECUTION_STATE_PATH', 'ANALYSIS_CONTROL_LOCK_PATH', 'ANALYSIS_CANCEL_PATH'):
+        monkeypatch.setattr(execution_control, key, str(tmp_path / key))
+    Meta = type('Meta', (), {'app_label': 'stream_sort_test', 'db_table': 'stream_sort_test_order'})
+    row_model = type('SortRow' + uuid.uuid4().hex, (models.Model,), {
+        '__module__': __name__, 'Meta': Meta,
+        'order': models.IntegerField(), 'stream_id': models.IntegerField(), 'channel_id': models.IntegerField()})
+    with connection.cursor() as cursor:
+        cursor.execute('DROP TABLE IF EXISTS stream_sort_test_order')
+    with connection.schema_editor() as editor:
+        editor.create_model(row_model)
+    row_model.objects.bulk_create([row_model(order=0, stream_id=42, channel_id=10), row_model(order=1, stream_id=43, channel_id=10)])
+    account = SimpleNamespace(id=7, name='Provider', is_active=True)
+    channel = SimpleNamespace(id=10, channel_number=100, name='Selected')
+    rows = list(row_model.objects.order_by('order'))
+    for row in rows:
+        row.channel = channel
+        row.stream = SimpleNamespace(id=row.stream_id, name=str(row.stream_id),
+            url=f'http://example.test/{row.stream_id}', m3u_account_id=7, m3u_account=account,
+            stream_stats={'width': 3840, 'height': 2160}, stream_stats_updated_at=None,
+            is_stale=False)
+    store.acquire('seed')
+    now = datetime.now(timezone.utc).isoformat()
+    store.flush({str(row.stream_id): {'status': 'dead' if row.stream_id == 42 else 'alive',
+        'm3u_account_id': 7, 'url_hash': analyzer._stream_url_hash(row.stream.url),
+        'stats': {'width': 1280, 'height': 720}, 'metadata_updated_at': now,
+        'health_checked_at': now} for row in rows}, 'seed', terminal=True)
+    store.release('seed')
+    module = types.ModuleType('apps.channels.models')
+    module.ChannelStream = row_model
+    monkeypatch.setitem(sys.modules, 'apps', types.ModuleType('apps'))
+    monkeypatch.setitem(sys.modules, 'apps.channels', types.ModuleType('apps.channels'))
+    monkeypatch.setitem(sys.modules, 'apps.channels.models', module)
+    monkeypatch.setattr(sorter, 'scoped_rows', lambda *a, **kw: (rows, {'match_mode': 'all_channels', 'selected_channel_count': 1}))
+    monkeypatch.setattr(sorter, 'resolve_channel_scope', lambda *a, **kw: ({10}, {'match_mode': 'all_channels', 'selected_channel_count': 1}))
+    yield store, row_model, rows
+    with connection.schema_editor() as editor:
+        editor.delete_model(row_model)
+
+
+def test_pg_sort_commits_orders_and_history_together_and_dry_run_preserves_it(sort_case):
+    from stream_sorter import sorter
+    store, model, rows = sort_case
+    result = sorter.sort_channels({'storage_backend': 'postgresql'}, apply=True, logger=Mock())
+    assert result['channels'][0]['proposed_stream_ids'] == [43, 42]
+    assert list(model.objects.order_by('order').values_list('stream_id', flat=True)) == [43, 42]
+    report = store.sort_report([10])
+    assert len(report['sort_history']) == 1
+    assert report['sort_history'][0]['channels_changed'] == 1
+    assert len(report['sort_history'][0]['changed_channels'][0]['movements']) == 2
+    sorter.sort_channels({'storage_backend': 'postgresql'}, apply=False, logger=Mock())
+    assert count(store, 'sort_run') == 1
+    assert store.sort_report([999])['sort_history'] == []
+
+
+def test_pg_sort_rollback_reverts_core_orders_and_history(sort_case, monkeypatch):
+    from stream_sorter import sorter
+    store, model, rows = sort_case
+    original = storage.PostgresStore.save_sort
+    def fail_after_history(self, *args, **kwargs):
+        original(self, *args, **kwargs)
+        raise RuntimeError('simulated failed sort commit')
+    monkeypatch.setattr(storage.PostgresStore, 'save_sort', fail_after_history)
+    with pytest.raises(RuntimeError, match='failed sort'):
+        sorter.sort_channels({'storage_backend': 'postgresql'}, apply=True, logger=Mock())
+    assert list(model.objects.order_by('order').values_list('stream_id', flat=True)) == [42, 43]
+    assert count(store, 'sort_run') == count(store, 'sort_channel') == count(store, 'sort_snapshot') == 0
+
+
+def test_pg_health_and_ttl_actions_read_scoped_current_and_retained_history(sort_case, monkeypatch):
+    from stream_sorter import plugin
+    store, model, rows = sort_case
+    store.acquire('scan')
+    store.record_scan('scan', [42, 43], {'streams_selected': 2})
+    store.release('scan')
+    monkeypatch.setattr(plugin, '_load_json', Mock(side_effect=AssertionError('no stale JSON')))
+    settings = {'storage_backend': 'postgresql'}
+    health = plugin._run_health_report_action(settings)
+    assert health['status'] == 'ok' and health['result']['selected_streams'] == 2
+    assert health['result']['status_counts']['dead'] == 1
+    assert plugin._run_ttl_recommendation_action(settings)['status'] == 'ok'
+
+
+def test_explicit_schema_v1_upgrade_is_required_and_transactional(store):
+    with store.connection.cursor() as cursor:
+        for name in TABLES[:6]:
+            cursor.execute(f'DROP TABLE stream_sort_{name}')
+        cursor.execute('UPDATE stream_sort_schema SET version = 1')
+    with pytest.raises(storage.StorageError, match='Unsupported'):
+        store.check_schema()
+    assert store.initialize()['upgraded_from'] == 1
+    store.check_schema()
+
+
+def test_auxiliary_legacy_import_resumes_and_preserves_live_playback(store, tmp_path, monkeypatch):
+    from stream_sorter import storage_import
+    reliability = tmp_path / 'reliability.json'
+    original = json.dumps({'channels': {'id:1': {'active_stream_id': 42, 'updated_at': NOW}},
+        'streams': {'42': {'stream_id': 42, 'm3u_account_id': 7, 'playback_starts': 5,
+            'last_event_at': NOW, 'recent_events': [{'event': 'channel_start', 'timestamp': NOW}],
+            'playback_throughput_history': [{'observed_at': NOW, 'kind': 'clean_playback',
+                'eligible_for_throughput': True, 'runtime_seconds': 300, 'measured_mbps': 12,
+                'm3u_account_id': 7}]}}})
+    reliability.write_text(original)
+    advance = storage_import._advance
+    def interrupted(cursor, source, position):
+        if position == 1:
+            raise RuntimeError('simulated interrupted playback import')
+        advance(cursor, source, position)
+    monkeypatch.setattr(storage_import, '_advance', interrupted)
+    with pytest.raises(RuntimeError):
+        storage_import.import_auxiliary(store, reliability, kind='reliability')
+    assert count(store, 'history') == 2
+    monkeypatch.setattr(storage_import, '_advance', advance)
+    storage_import.import_auxiliary(store, reliability, kind='reliability')
+    storage_import.import_auxiliary(store, reliability, kind='reliability')
+    assert count(store, 'history') == 2
+    assert store.playback([42])['streams']['42']['playback_starts'] == 5
+    assert reliability.read_text() == original
+
+
+def test_legacy_sort_import_deduplicates_and_keeps_unattributed_rollups(store, tmp_path):
+    from stream_sorter.storage_import import import_auxiliary
+    path = tmp_path / 'sort.json'
+    now = datetime.now(timezone.utc)
+    payload = {'mode': 'apply', 'sort_history': [
+        {'generated_at': now.isoformat(), 'channels_evaluated': 10, 'channels_changed': 1,
+         'changed_channels': [{'channel_id': 10, 'movements': [{'stream_id': 42, 'old_position': 1, 'new_position': 2}]}]},
+        {'generated_at': (now + timedelta(seconds=1)).isoformat(), 'channels_evaluated': 10, 'channels_changed': 0, 'changed_channels': []}],
+        'last_applied_snapshot': [{'channel_id': 10, 'stream_ids': [43, 42], 'streams': []}],
+        'sort_daily_rollups': {now.date().isoformat(): {'applied_runs': 2, 'channels_evaluated': 20}}}
+    original = json.dumps(payload)
+    path.write_text(original)
+    import_auxiliary(store, path, kind='sort')
+    import_auxiliary(store, path, kind='sort')
+    assert count(store, 'sort_run') == 2 and count(store, 'sort_snapshot') == 1
+    report = store.sort_report([10])
+    assert report['sort_daily_rollups'] == {}
+    assert report['legacy_unscoped_daily_rollups'][now.date().isoformat()]['applied_runs'] == 2
+    assert len(report['legacy_unscoped_runs']) == 2
+    assert path.read_text() == original
