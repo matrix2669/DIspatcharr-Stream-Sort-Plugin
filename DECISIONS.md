@@ -860,6 +860,7 @@ Installed Dispatcharr image sha256:96bc548978c68e684677da7895692eeeefb7f0b2edfa3
 
 - Keep network-phase results and startup imports in RAM; remove redundant initial whole-analysis saves. Persist completed results through the existing final path, including cooperative cancellation. Abrupt process/power failure may lose uncommitted current-run observations; preserve the prior completed snapshot.
 - Keep all per-stream system logs. Persist UI progress every ten seconds at most within a phase, immediately on phase transitions, and publish final job status immediately. This is UI status throttling, not system-log suppression.
+- Treat interleaved combined-capture/local-content messages as one logical combined phase. Combined retry and throughput retry are recognized phases; changing retry-round labels within a phase does not bypass the ten-second interval. These semantics close the two independent review findings recorded in the owning branch ledger.
 - Continue existing atomic JSON replacement and provider/cancellation semantics until a replacement backend has passed migration and crash tests. Do not introduce timed full-history checkpoint writes merely to buffer data already in RAM.
 
 ## Proposed PostgreSQL design
