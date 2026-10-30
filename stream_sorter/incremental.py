@@ -34,6 +34,8 @@ from .throughput import (
     LEGACY_CACHE_PATH,
     capture_stream_sample,
     capture_bounded_sample,
+    _CAPTURE_FAILURE_CODES,
+    _capture_number,
     load_cache as load_throughput_cache,
     probe_stream,
 )
@@ -1326,6 +1328,154 @@ def _select_capture_temp_directory(
     return shared_memory_root
 
 
+_CAPTURE_SKIP_CODES = frozenset({
+    'reuse_disabled', 'reuse_ram_unavailable', 'reuse_metadata_only',
+    'reuse_placeholder', 'reuse_forced_direct', 'reuse_window_exceeds_bound',
+})
+_CAPTURE_LOCAL_CODES = frozenset({
+    'local_metadata_rejected', 'local_sample_too_short',
+    'local_content_unmeasured', 'local_validation_failed',
+})
+_CAPTURE_VALIDATION_ERRORS = frozenset({
+    'low_bitrate', 'no_video_stream', 'invalid_video_dimensions', 'timeout',
+    'ffprobe_missing', 'invalid_probe_json', 'content_tool_unavailable',
+    'content_sample_incomplete', 'stream_unreachable', 'rate_limited',
+    'black_screen', 'frozen_video', 'silent_audio', 'other',
+})
+
+
+def _capture_diagnostic(measured=None, *, required_playable_seconds=None):
+    """A fixed-size allowlist, independent of tool/provider error text."""
+    measured = measured or {}
+    code = measured.get('capture_code')
+    if not isinstance(code, str) or code not in _CAPTURE_FAILURE_CODES | {'capture_ok'}:
+        code = 'capture_worker_failed'
+    elapsed_source = measured.get('elapsed_source')
+    source = measured.get('measurement_source')
+    diagnostic = {
+        'outcome': 'acquisition_failed', 'reason': code, 'capture_code': code,
+        'attempted': True, 'bytes': _capture_number(measured.get('bytes')),
+        'elapsed_seconds': _capture_number(measured.get('elapsed_seconds')),
+        'elapsed_source': elapsed_source if elapsed_source in ('acquisition', 'parent_wall') else None,
+        'measurement_source': source if source in ('raw_http_capture', 'ffmpeg_stream_copy') else None,
+        'capture_mbps': _capture_number(measured.get('measured_mbps')),
+        'required_playable_seconds': _capture_number(required_playable_seconds),
+        # This is FFprobe's sample duration, not a claim of decoded duration.
+        # Content's decoder currently exposes only measured/incomplete.
+        'actual_playable_seconds': None, 'playable_duration_source': None,
+        'validation_error': None,
+    }
+    if (diagnostic['capture_mbps'] is None and diagnostic['bytes']
+            and diagnostic['elapsed_seconds'] and diagnostic['elapsed_source'] == 'acquisition'):
+        diagnostic['capture_mbps'] = _capture_number(
+            diagnostic['bytes'] * 8 / diagnostic['elapsed_seconds'] / 1_000_000)
+    return diagnostic
+
+
+def _capture_skip(reason):
+    diagnostic = _capture_diagnostic()
+    diagnostic.update(outcome='skipped', reason=reason, attempted=False, capture_code=None)
+    return diagnostic
+
+
+class _CaptureTelemetry:
+    """RAM-only counters: constant key space, no per-stream event history."""
+    def __init__(self, enabled):
+        self.enabled = enabled
+        self.lock = threading.Lock()
+        self.attempts = 0
+        self.outcomes = collections.Counter()
+        self.reasons = collections.Counter()
+        self.validation_errors = collections.Counter()
+
+    def record(self, sid, diagnostic, logger):
+        # All callers construct diagnostics through the allowlist above. Only
+        # finite outcome/reason keys may contribute to the bounded counters.
+        outcome, reason = diagnostic['outcome'], diagnostic['reason']
+        assert outcome in {'reused', 'acquisition_failed', 'validation_rejected', 'skipped'}
+        assert reason in _CAPTURE_FAILURE_CODES | _CAPTURE_SKIP_CODES | _CAPTURE_LOCAL_CODES | {'reuse_ok'}
+        with self.lock:
+            self.attempts += int(diagnostic['attempted'])
+            self.outcomes[outcome] += 1
+            self.reasons[reason] += 1
+            if diagnostic['validation_error']:
+                self.validation_errors[diagnostic['validation_error']] += 1
+        logger.info('[Analyze Capture] stream=%s %s', int(sid),
+                    json.dumps(diagnostic, sort_keys=True, allow_nan=False))
+
+    def snapshot(self):
+        with self.lock:
+            return {'enabled': self.enabled, 'attempts': self.attempts,
+                    'no_attempts': self.attempts == 0,
+                    'outcome_counts': dict(self.outcomes),
+                    'reason_counts': dict(self.reasons),
+                    'validation_error_counts': dict(self.validation_errors)}
+
+
+def _validate_shared_capture(item, measured, path, *, settings, logger,
+                             sample_seconds, needs_content):
+    """Validate locally after releasing the source; always remove the sample."""
+    diagnostic = _capture_diagnostic(measured, required_playable_seconds=sample_seconds)
+    diagnostic.update(outcome='validation_rejected', reason='local_validation_failed')
+    try:
+        item['_release_provider']()
+        try:
+            metadata = analyzer.analyze_stream(
+                path, stream_id=item['id'], stream_name=str(item.get('name') or ''),
+                settings=settings, logger=logger, include_content=False, local_source=True,
+            )
+            playable = (metadata.get('details') or {}).get('sample_duration_seconds', 0)
+            diagnostic['actual_playable_seconds'] = _capture_number(
+                (metadata.get('details') or {}).get('sample_duration_seconds'))
+            if diagnostic['actual_playable_seconds'] is not None:
+                diagnostic['playable_duration_source'] = 'ffprobe_sample_duration'
+            if metadata.get('status') != 'alive':
+                error = metadata.get('error_type')
+                diagnostic.update(reason='local_metadata_rejected', validation_error=(
+                    error if isinstance(error, str) and error in _CAPTURE_VALIDATION_ERRORS else 'other'))
+                return None, diagnostic
+            if playable < sample_seconds:
+                diagnostic['reason'] = 'local_sample_too_short'
+                return None, diagnostic
+            stats = metadata.get('stats') or {}
+            _, height = parse_resolution(stats)
+            nominal = estimate_nominal_throughput_kbps(height, parse_fps(stats))
+            measured.update({'status': classify_throughput(measured['measured_mbps'], nominal),
+                             'nominal_video_kbps': nominal})
+            shared = {'throughput': measured}
+            if needs_content:
+                content = analyzer.apply_content_analysis(metadata, path, settings=settings,
+                            logger=logger, local_source=True)
+                details = content.get('details') or {}
+                if not (details.get('content') or {}).get('measured'):
+                    error = (details.get('content') or {}).get('error_type')
+                    diagnostic.update(reason='local_content_unmeasured', validation_error=(
+                        error if isinstance(error, str) and error in _CAPTURE_VALIDATION_ERRORS else 'other'))
+                    return None, diagnostic
+                shared['content'] = content
+            diagnostic.update(outcome='reused', reason='reuse_ok')
+            metadata['_shared_capture'] = shared
+            return metadata, diagnostic
+        except Exception:
+            # Keep partial numeric evidence, never exception text or the local path.
+            return None, diagnostic
+    finally:
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+
+
+def _attach_capture_diagnostic(result, diagnostic):
+    result['details'] = {**(result.get('details') or {}), 'capture_reuse': dict(diagnostic)}
+    # Content can replace metadata details later; retain the same last sample
+    # diagnostic in that existing result rather than maintaining an event list.
+    content = (result.get('_shared_capture') or {}).get('content')
+    if content is not None:
+        content['details'] = {**(content.get('details') or {}), 'capture_reuse': dict(diagnostic)}
+    return result
+
+
 def _analyze_local_capture(
     item: Mapping[str, Any],
     base_result: Mapping[str, Any],
@@ -2371,7 +2521,10 @@ def analyze_assigned_streams(
         total, len(media_due), len(content_reason_by_id), initial_throughput_due, initial_fully_cached, playback_health_refreshed, dispatcharr_metadata_refreshed,
         ffprobe_ttl_hours, dead_ttl_hours, content_ttl_hours, throughput_ttl_hours, degraded_throughput_ttl_hours, unknown_throughput_ttl_hours, analysis_ttl_jitter_percent, workers,
     )
+    reuse_captures = analyzer._as_bool(settings.get('bounded_capture_reuse'), False)
+    capture_telemetry = _CaptureTelemetry(reuse_captures)
     if not items:
+        logger.info('[Analyze Capture] summary=%s', json.dumps(capture_telemetry.snapshot(), sort_keys=True))
         runtime_seconds = max(0.0, time.monotonic() - run_started)
         health_summary = _overall_health_text(collections.Counter(), placeholder_count=0)
         logger.info(
@@ -2393,6 +2546,7 @@ def analyze_assigned_streams(
                 ),
             )
         return {
+            "capture_reuse": capture_telemetry.snapshot(),
             "streams_analyzed": 0,
             "streams_selected": 0,
             "media_checked": 0,
@@ -2417,7 +2571,6 @@ def analyze_assigned_streams(
             "analysis_health_report_path": None if store else health_report_path,
         }
 
-    reuse_captures = analyzer._as_bool(settings.get('bounded_capture_reuse'), False)
     capture_bytes = max(1024 * 1024, min(64 * 1024 * 1024,
         analyzer._as_int(settings.get('capture_max_mib'), 32) * 1024 * 1024))
     reuse_temp_directory = (_select_capture_temp_directory(workers, bytes_per_worker=capture_bytes, logger=logger)
@@ -2460,7 +2613,9 @@ def analyze_assigned_streams(
         duration = max(throughput_duration, sample_seconds + 2,
                        analyzer._as_int(settings.get('analysis_duration_seconds'), 5) + 2)
         if duration > 30:
-            return None
+            diagnostic = _capture_skip('reuse_window_exceeds_bound')
+            diagnostic['required_playable_seconds'] = sample_seconds
+            return None, diagnostic
         measured, path = capture_bounded_sample(
             str(item.get('url') or ''), duration_seconds=duration,
             timeout_seconds=max(throughput_timeout, duration + 2),
@@ -2469,43 +2624,10 @@ def analyze_assigned_streams(
             stop_requested=analysis_cancel_requested,
         )
         if not path:
-            return None
-        item["_release_provider"]()
-        try:
-            metadata = analyzer.analyze_stream(
-                path, stream_id=item['id'], stream_name=str(item.get('name') or ''),
-                settings=settings, logger=logger, include_content=False, local_source=True,
-            )
-            # A manifest, corrupt/truncated sample or incomplete local decode is
-            # not evidence that the provider stream is invalid. Reserve fallback.
-            if metadata.get('status') != 'alive':
-                return None
-            playable = (metadata.get('details') or {}).get('sample_duration_seconds', 0)
-            if playable < sample_seconds:
-                return None
-            stats = metadata.get('stats') or {}
-            _, height = parse_resolution(stats)
-            nominal = estimate_nominal_throughput_kbps(height, parse_fps(stats))
-            measured.update({'status': classify_throughput(measured['measured_mbps'], nominal),
-                             'nominal_video_kbps': nominal})
-            shared = {'throughput': measured}
-            if int(item['id']) in content_reason_by_id:
-                content = analyzer.apply_content_analysis(metadata, path, settings=settings,
-                            logger=logger, local_source=True)
-                details = content.get('details') or {}
-                if not (details.get('content') or {}).get('measured'):
-                    return None
-                shared['content'] = content
-            metadata['_shared_capture'] = shared
-            return metadata
-        except Exception:
-            logger.warning('[Analyze] Local shared sample unusable; retaining reserved direct fallback')
-            return None
-        finally:
-            try:
-                os.unlink(path)
-            except OSError:
-                pass
+            return None, _capture_diagnostic(measured, required_playable_seconds=sample_seconds)
+        return _validate_shared_capture(item, measured, path, settings=settings,
+            logger=logger, sample_seconds=sample_seconds,
+            needs_content=int(item['id']) in content_reason_by_id)
 
     def run_media(item, *, force_full: bool = False):
         analyzer._RATE_LIMIT_GUARD.wait_if_throttled()
@@ -2516,19 +2638,33 @@ def analyze_assigned_streams(
         sid = int(item["id"])
         # Metadata-only and known-placeholder gates keep their lightweight path.
         if reuse_temp_directory and (sid in content_reason_by_id or sid in initial_throughput_due_ids) and sid not in known_placeholder_ids and not force_full:
-            shared = shared_media_probe(item)
+            shared, diagnostic = shared_media_probe(item)
+            capture_telemetry.record(sid, diagnostic, logger)
             if shared is not None:
-                return shared
+                return _attach_capture_diagnostic(shared, diagnostic)
             if analysis_cancel_requested():
                 raise AnalysisCancelled('Canceled after incomplete capture')
             item = item['_reacquire_provider']()
             storage.ensure_provider_work()
+        else:
+            if not reuse_captures:
+                reason = 'reuse_disabled'
+            elif not reuse_temp_directory:
+                reason = 'reuse_ram_unavailable'
+            elif force_full:
+                reason = 'reuse_forced_direct'
+            elif sid in known_placeholder_ids:
+                reason = 'reuse_placeholder'
+            else:
+                reason = 'reuse_metadata_only'
+            diagnostic = _capture_skip(reason)
+            capture_telemetry.record(sid, diagnostic, logger)
         known_placeholder = sid in known_placeholder_ids and not force_full
         if force_full or not known_placeholder:
             result = full_media_probe(item)
             if result.get("error_type") == "rate_limited":
                 analyzer._RATE_LIMIT_GUARD.record_hit(logger)
-            return result
+            return _attach_capture_diagnostic(result, diagnostic)
         probe_settings = dict(settings)
         probe_settings["analysis_duration_seconds"] = 1
         result = analyzer.analyze_stream(
@@ -2556,7 +2692,7 @@ def analyze_assigned_streams(
             result["placeholder_confirmation"] = True
         if result.get("error_type") == "rate_limited":
             analyzer._RATE_LIMIT_GUARD.record_hit(logger)
-        return result
+        return _attach_capture_diagnostic(result, diagnostic)
 
     def run_media_retry(item):
         return run_media(item, force_full=True)
@@ -3632,7 +3768,10 @@ def analyze_assigned_streams(
         )
         report["filters"] = filter_summary
         _save_json(health_report_path, report)
+    capture_summary = capture_telemetry.snapshot()
+    logger.info('[Analyze Capture] summary=%s', json.dumps(capture_summary, sort_keys=True))
     result = {
+        'capture_reuse': capture_summary,
         "streams_analyzed": total,
         "streams_selected": total,
         "media_checked": len(media_checked_ids),

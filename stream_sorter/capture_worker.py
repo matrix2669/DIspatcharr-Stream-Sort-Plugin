@@ -19,32 +19,49 @@ def capture(config, *, now=None, opener=None):
     started = config['started']
     response = None
     total = 0
+    code = 'capture_setup_failed'
     try:
         request = urllib.request.Request(config['url'], headers=config['headers'])
+        code = 'capture_open_failed'
         response = opener(request, timeout=min(2.0, config['timeout_seconds']))
         if response.headers.get('Content-Length') or response.headers.get('Content-Range'):
-            raise RuntimeError('Finite object requires direct validation')
+            code = 'capture_finite_object'
+            raise RuntimeError
         deadline = started + config['duration_seconds']
+        code = 'capture_write_failed'
         with open(config['path'], 'wb') as output:
             while now() < deadline:
                 remaining = config['max_bytes'] - total
                 if remaining <= 0:
-                    raise RuntimeError('Byte bound reached')
+                    code = 'capture_byte_limit'
+                    raise RuntimeError
+                code = 'capture_read_failed'
                 chunk = response.read1(min(65536, remaining))
                 if not chunk:
-                    raise RuntimeError('Premature EOF')
+                    code = 'capture_eof'
+                    raise RuntimeError
+                code = 'capture_write_failed'
                 output.write(chunk)
                 total += len(chunk)
         elapsed = max(now() - started, .001)
         if total < 65536:
-            raise RuntimeError('Insufficient live data')
-        return {'complete': True, 'bytes': total, 'elapsed_seconds': elapsed}
+            code = 'capture_too_little_data'
+            raise RuntimeError
+        result = {'complete': True, 'bytes': total, 'elapsed_seconds': elapsed,
+                'capture_code': 'capture_ok'}
     except Exception:
         # Neither provider error messages nor configuration may reach stdout.
-        return {'complete': False, 'bytes': total}
+        result = {'complete': False, 'bytes': total, 'capture_code': code,
+                'elapsed_seconds': max(now() - started, 0.0)}
     finally:
         if response is not None:
-            response.close()
+            try:
+                response.close()
+            except Exception:
+                # Preserve partial measurements without accepting a child that
+                # could not close normally. Never expose the close exception.
+                result.update(complete=False, capture_code='capture_close_failed')
+    return result
 
 
 def main():
@@ -66,7 +83,7 @@ def main():
         result = capture(config)
         print(json.dumps(result, separators=(',', ':')), flush=True)
     except Exception:
-        print('{"complete":false,"bytes":0}', flush=True)
+        print('{"complete":false,"bytes":0,"capture_code":"capture_setup_failed"}', flush=True)
     finally:
         if timer is not None:
             timer.cancel()

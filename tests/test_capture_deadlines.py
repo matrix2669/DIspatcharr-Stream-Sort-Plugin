@@ -64,7 +64,7 @@ def track_children(monkeypatch):
     return children
 
 
-@pytest.mark.parametrize('mode,cancel', [('headers', False), ('chunk', False), ('chunk', True)])
+@pytest.mark.parametrize('mode,cancel', [('headers', False), ('chunk', False), ('chunk', True), ('body', True)])
 def test_total_deadline_or_cancel_closes_dripping_client_and_releases_exact_slot(tmp_path, monkeypatch, mode, cancel):
     monkeypatch.setenv('NO_PROXY', '127.0.0.1')
     monkeypatch.setattr(incremental, 'analysis_cancel_requested', lambda: False)
@@ -99,6 +99,14 @@ def test_total_deadline_or_cancel_closes_dripping_client_and_releases_exact_slot
         assert disconnected.wait(1.5), 'the killed acquisition must close its active provider socket'
         assert path is None and measured['complete'] is False
         assert measured['error_type'] == 'capture_incomplete'
+        assert measured['capture_code'] == ('capture_canceled' if cancel else 'capture_deadline')
+        assert measured['elapsed_source'] == 'parent_wall'
+        assert measured['elapsed_seconds'] > 0
+        assert measured['measurement_source'] == 'raw_http_capture'
+        assert 'controlled-token' not in str(measured)
+        if mode == 'body':
+            assert measured['bytes'] > 0
+        assert 'measured_mbps' not in measured
         assert released == ['exact-slot']
         assert all(child.returncode is not None for child in children)
         assert not list(tmp_path.iterdir())
@@ -123,6 +131,9 @@ def test_total_deadline_reaps_blocked_setup_without_contacting_provider(tmp_path
         duration_seconds=1, timeout_seconds=1.3, temp_directory=str(tmp_path))
     assert time.monotonic() - started < 3
     assert path is None and measured['complete'] is False
+    assert measured['capture_code'] == 'capture_deadline'
+    assert measured['elapsed_seconds'] >= 1
+    assert 'controlled-token' not in str(measured)
     assert len(children) == 1 and children[0].poll() is not None
     assert list(tmp_path.iterdir()) == [blocked_worker]
 
@@ -134,7 +145,9 @@ def test_success_measures_live_capture_elapsed_not_shutdown_or_local_read_speed(
         measured, path = throughput.capture_bounded_sample(url, duration_seconds=1,
             timeout_seconds=2, temp_directory=str(tmp_path), max_bytes=16 * 1024 * 1024)
         try:
-            assert measured['complete'] is True
+            assert measured['complete'] is True, measured
+            assert measured['capture_code'] == 'capture_ok'
+            assert measured['elapsed_source'] == 'acquisition'
             assert 1 <= measured['elapsed_seconds'] < 2
             assert measured['bytes'] == os.path.getsize(path)
             assert measured['measured_mbps'] == measured['bytes'] * 8 / measured['elapsed_seconds'] / 1_000_000

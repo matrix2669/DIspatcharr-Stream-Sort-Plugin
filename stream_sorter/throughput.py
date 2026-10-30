@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import signal
 import shutil
@@ -348,6 +349,31 @@ def _capture_config(raw_url, *, duration_seconds, timeout_seconds, user_agent,
             'path': path, 'started': started}
 
 
+# Treat the child boundary as untrusted diagnostics: never forward arbitrary
+# strings or extra fields into a result, a log, or the scan summary.
+_CAPTURE_CHILD_CODES = frozenset({
+    'capture_ok', 'capture_setup_failed', 'capture_open_failed',
+    'capture_finite_object', 'capture_byte_limit', 'capture_eof',
+    'capture_too_little_data', 'capture_read_failed', 'capture_write_failed',
+    'capture_close_failed',
+})
+_CAPTURE_FAILURE_CODES = (_CAPTURE_CHILD_CODES - {'capture_ok'}) | frozenset({
+    'capture_canceled', 'capture_deadline', 'capture_invalid_config',
+    'capture_unsupported_protocol', 'capture_storage_failed',
+    'capture_start_failed', 'capture_worker_failed', 'capture_invalid_result',
+})
+
+
+def _capture_number(value):
+    """Only actual finite nonnegative numbers cross the diagnostic boundary."""
+    if type(value) not in (int, float):
+        return None
+    try:
+        return value if math.isfinite(value) and value >= 0 else None
+    except (OverflowError, ValueError):
+        return None
+
+
 def capture_bounded_sample(raw_url, *, duration_seconds, timeout_seconds, temp_directory,
                            user_agent=DEFAULT_USER_AGENT, max_bytes=32 * 1024 * 1024,
                            stop_requested=lambda: False):
@@ -361,47 +387,83 @@ def capture_bounded_sample(raw_url, *, duration_seconds, timeout_seconds, temp_d
     started = time.monotonic()
     path = None
     process = None
-    total = 0
     accepted = False
+    code = 'capture_invalid_config'
+    child_elapsed = None
+    child_bytes = None
     failure = {'tested_at': tested, 'status': 'unknown', 'complete': False,
-               'bytes': 0, 'error_type': 'capture_incomplete',
+               'bytes': 0, 'elapsed_seconds': None,
+               'measurement_source': 'raw_http_capture',
+               'elapsed_source': 'parent_wall', 'error_type': 'capture_incomplete',
                'error': 'Bounded sample incomplete; direct reserved fallback required'}
     try:
         if stop_requested():
-            raise RuntimeError('Capture canceled')
+            code = 'capture_canceled'
+            raise RuntimeError
+        if isinstance(raw_url, str) and not raw_url.lower().startswith(('http://', 'https://')):
+            code = 'capture_unsupported_protocol'
+            raise ValueError
         config = _capture_config(raw_url, duration_seconds=duration_seconds,
             timeout_seconds=timeout_seconds, user_agent=user_agent, max_bytes=max_bytes,
             path=None, started=started)
+        code = 'capture_storage_failed'
         fd, path = tempfile.mkstemp(prefix='stream-sort-bounded-', suffix='.sample', dir=temp_directory)
         os.close(fd)
         config['path'] = path
         # No URL/headers in argv, stderr, or exception messages. -I/-S avoids
         # loading plugin/app startup hooks in the acquisition child.
+        code = 'capture_start_failed'
         command = [_capture_python(), '-I', '-S', _CAPTURE_WORKER_PATH]
         process = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                    stderr=subprocess.DEVNULL, text=True)
         deadline = started + min(30.0, timeout_seconds)
         payload = json.dumps(config)
+        code = 'capture_worker_failed'
         while True:
             remaining = deadline - time.monotonic()
-            if stop_requested() or remaining <= 0:
-                raise RuntimeError('Capture canceled or total deadline exceeded')
+            if stop_requested():
+                code = 'capture_canceled'
+                raise RuntimeError
+            if remaining <= 0:
+                code = 'capture_deadline'
+                raise RuntimeError
             try:
                 output, _ = process.communicate(input=payload, timeout=min(.05, remaining))
                 break
             except subprocess.TimeoutExpired:
                 payload = None
+        # The child's independent watchdog uses 124 if the parent disappears or
+        # loses the race to the deadline. Its unflushed byte count is unknown.
+        if process.returncode == 124:
+            code = 'capture_deadline'
+            raise RuntimeError
+        code = 'capture_invalid_result'
         measured = json.loads(output)
+        if not isinstance(measured, dict):
+            raise ValueError
+        child_elapsed = _capture_number(measured.get('elapsed_seconds'))
+        child_bytes = _capture_number(measured.get('bytes'))
+        if type(child_bytes) is not int or child_bytes > max_bytes:
+            child_bytes = None
         total = os.path.getsize(path)
-        elapsed = float(measured.get('elapsed_seconds') or 0)
+        elapsed = child_elapsed or 0
+        if not measured.get('complete'):
+            child_code = measured.get('capture_code')
+            code = child_code if isinstance(child_code, str) and child_code in _CAPTURE_CHILD_CODES - {'capture_ok'} else 'capture_worker_failed'
+            raise RuntimeError
         if (process.returncode or not measured.get('complete') or not 65536 <= total <= max_bytes
                 or measured.get('bytes') != total or elapsed < duration_seconds):
             raise RuntimeError('Incomplete live acquisition')
         accepted = True
         return {'tested_at': tested, 'bytes': total, 'elapsed_seconds': elapsed,
                 'measured_mbps': total * 8 / elapsed / 1_000_000,
-                'measurement_source': 'raw_http_capture', 'complete': True}, path
+                'measurement_source': 'raw_http_capture', 'complete': True,
+                'elapsed_source': 'acquisition', 'capture_code': 'capture_ok'}, path
     except Exception:
+        failure['capture_code'] = code
+        failure['elapsed_seconds'] = (child_elapsed if child_elapsed is not None
+                                      else max(time.monotonic() - started, 0.0))
+        failure['elapsed_source'] = 'acquisition' if child_elapsed is not None else 'parent_wall'
         return failure, None
     finally:
         try:
@@ -414,8 +476,15 @@ def capture_bounded_sample(raw_url, *, duration_seconds, timeout_seconds, temp_d
                     process.wait(timeout=1.0)
         finally:
             if path and not accepted:
+                failure['bytes'] = child_bytes
                 try:
-                    failure['bytes'] = os.path.getsize(path)
-                    os.unlink(path)
-                except FileNotFoundError:
+                    on_disk = os.path.getsize(path)
+                    if failure['bytes'] is None:
+                        failure['bytes'] = on_disk
+                except OSError:
                     pass
+                finally:
+                    try:
+                        os.unlink(path)
+                    except FileNotFoundError:
+                        pass

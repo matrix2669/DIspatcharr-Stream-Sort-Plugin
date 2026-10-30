@@ -244,6 +244,26 @@ For an approved migration rehearsal, disable the schedule and ensure no scan is 
 
 Capture reuse uses bounded RAM samples for streams needing multiple checks. `capture_max_mib` starts at 32 MiB per worker and accepts 1–64 MiB. Metadata-only and known-placeholder checks retain their lightweight direct probes. Live bytes and acquisition time measure throughput; local sample reads do not. Unsupported or incomplete reusable samples require a normal capacity-reserved fallback, and incomplete checks never refresh their TTLs. Controlled-fixture results do not establish compatibility with every provider or protocol.
 
+Shared-capture diagnostics use fixed reason codes in `[Analyze Capture]` system-log entries and the existing result details. Acquisition reasons distinguish setup/open/read/write failures, finite files, byte limits, early EOF, insufficient data, deadline and cancellation. Local validation distinguishes rejected metadata, short playable samples and unmeasured content. Available byte counts, elapsed time, rate and required/observed sample duration accompany the reason; unavailable measurements stay unknown. Duration is labeled as FFprobe sample duration, not exact decoded duration. URLs, headers, local paths and raw provider/tool exception messages are excluded. Each scan returns bounded `capture_reuse` counters (`enabled`, `attempts`, `no_attempts`, outcome/reason/validation-error counts), including an explicit disabled/no-attempt state. These diagnostics add no provider checks or separate telemetry files. They do not enable capture reuse.
+
+#### PostgreSQL cutover and recovery
+
+The 2026-10-30 isolated rehearsal verified migration, repeat import, ranking parity, cooperative cancellation and restoration through Dispatcharr's built-in backup code on Dispatcharr 0.33.0/PostgreSQL 17.11. Production is still JSON-backed. The paired capture trial did not establish equivalence or fewer provider openings; keep **Bounded capture reuse** disabled during PostgreSQL cutover and until separately accepted.
+
+Before a separately authorized production cutover:
+
+1. Pause Stream Sort's schedule and let active scans finish or stop cooperatively. Preserve native viewer reservations and active playback.
+2. Retain a current full database backup, legacy analysis/reliability/sort JSON snapshots, saved settings and the exact plugin source/archive. Verify the backup in a disposable database; a successful restore message alone is insufficient.
+3. Install only the accepted exact plugin archive, explicitly initialize/upgrade schema version 2, import legacy records, and verify current-state identity/counts, repeatability and sorting parity before selecting PostgreSQL. Initialization/import do not select the backend automatically.
+4. Select PostgreSQL with capture reuse disabled, run a bounded serial check, verify saved results, lease release, reports and pending-retry behavior, then restore the intended schedule. Confirm the next scheduled database backup includes the plugin tables. Keep original JSON files through acceptance.
+
+The installed built-in backup task is enabled daily at **03:00 America/New_York**, retaining three archives under `/data/backups`. It uses an unfiltered custom-format PostgreSQL dump, so plugin-owned tables are included. The rehearsal restored all plugin table fingerprints, including newly completed content/throughput and an unfinished dead retry. The operator also reports daily Proxmox LXC backups to PBS. `/data/db` and built-in backup archives are on the LXC's persistent root RBD volume; the PBS restore itself has not been tested here. Built-in archives on the same volume are not an independent storage-failure recovery layer.
+
+For recovery, pause scheduling, cooperatively drain work and preserve the latest PostgreSQL database plus source/settings before changing versions. Prefer a known-good PostgreSQL-capable revision that supports the current schema. Older JSON-only plugins cannot read PostgreSQL-only observations, and there is **no tested lossless PostgreSQL-to-JSON export**. An archived database preserves those observations for later recovery; it does not make a stale JSON file current. Do not automatically switch back to JSON, downgrade the schema or delete tables.
+
+Returning to a pre-cutover database/JSON pair is a deliberate wider recovery: it can discard later Dispatcharr changes and requires separate approval, instance-wide quiescence and verified restoration. If no safe recovery is selected, leave scheduling disabled and retain the PostgreSQL data for repair. The clone-only backend-switch check proves archive recoverability, not a transparent older-plugin downgrade.
+
+
 - `/data/dispatcharr_stream_sort_analysis.json`: unified current analysis and throughput state.
 - `/data/dispatcharr_stream_sort_status.json`: current or latest analysis status.
 - `/data/dispatcharr_stream_sort_schedule_state.json`: schedule claim state.

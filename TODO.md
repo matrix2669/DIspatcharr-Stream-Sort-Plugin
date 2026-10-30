@@ -8,9 +8,11 @@
 
 ## Storage/capture adoption follow-up after the 2026-10-30 rehearsal
 
-- [ ] Add bounded, credential-free telemetry for reusable-capture rejection causes (acquisition failure, insufficient playable duration, local metadata/content failure), received bytes, elapsed acquisition, playable duration and measured peak memory. Five of eight samples fell back without sufficient rejection detail.
+- [x] Add bounded, credential-free acquisition/local-validation rejection telemetry, available bytes/time/rate and required/FFprobe sample duration with explicit unknowns. Diagnostics do not enable reuse.
+- [ ] Measure actual decoded playable duration and peak memory separately; FFprobe sample-duration diagnostics are not those measurements.
 - [ ] Validate raw-capture vs existing remux/direct metadata, video bitrate and content/throughput results with controlled repeated fixtures, separating PostgreSQL-only performance from capture reuse. Instrument actual provider openings: the completed sequential trial counted 23 logical helper attempts in each arm and two throughput statuses differed. Capture reuse remains off pending acceptance.
-- [ ] Before production cutover, verify operational cooperative cancellation, actual automated backup coverage and a deliberate cutover/rollback plan preserving PostgreSQL-only observations; the restored-database rehearsal does not migrate production or validate an older-plugin downgrade.
+- [x] Verify operational cooperative cancellation, the installed automatic-backup path and a deliberate recovery plan preserving PostgreSQL-only observations in an archive. Native create/restore and table fingerprints pass in clones; PBS coverage is operator-confirmed.
+- [ ] Separately authorize and execute production installation/cutover with capture reuse off, then verify the next scheduled archive. Keep the explicit no-lossless-JSON-export limitation and deliberate recovery boundary; the clone rehearsal is not an older-plugin downgrade.
 
 ## Draft: Event Channel Stream Monitor supplement
 

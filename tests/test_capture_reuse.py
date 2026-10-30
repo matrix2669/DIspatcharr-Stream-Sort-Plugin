@@ -151,6 +151,8 @@ def test_finite_http_object_keeps_direct_placeholder_gate(tmp_path, monkeypatch)
     result, path = _run_capture_worker('http://fake.test/fixed.ts',
         duration_seconds=6, timeout_seconds=8, temp_directory=str(tmp_path))
     assert path is None and result['complete'] is False
+    assert result['capture_code'] == 'capture_finite_object'
+    assert result['elapsed_seconds'] >= 0
     assert response.reads == 0 and response.closed
     assert list(tmp_path.iterdir()) == []
 
