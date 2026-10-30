@@ -95,6 +95,7 @@ Behavior affecting provider connections also requires controlled Dispatcharr int
 - If a container import reports `ModuleNotFoundError: No module named 'plugins'`, add `/data/plugins` to `sys.path` and import `stream_sorter`.
 - If an obsolete analysis owns the probe lock, identify and stop only that worker, then verify any stale profile counters are released.
 - Treat cached branch, registry, deployment, and provider-capacity observations as stale until refreshed.
+- Before backend cutover, verify old scheduler retirement across workers; module unload/reload tokens alone do not prove background threads stopped. Check active DVR input routing before a web-worker restart: a Celery-owned recording may still consume the web proxy. Preserve explicit operator viewer/recording coordination.
 
 ## Scheduler and Health-State Contracts
 

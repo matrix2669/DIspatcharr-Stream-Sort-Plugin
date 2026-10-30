@@ -14,6 +14,14 @@
 - [x] Verify operational cooperative cancellation, the installed automatic-backup path and a deliberate recovery plan preserving PostgreSQL-only observations in an archive. Native create/restore and table fingerprints pass in clones; PBS coverage is operator-confirmed.
 - [ ] Separately authorize and execute production installation/cutover with capture reuse off, then verify the next scheduled archive. Keep the explicit no-lossless-JSON-export limitation and deliberate recovery boundary; the clone rehearsal is not an older-plugin downgrade.
 
+## Richer PostgreSQL observation archive — proposed after cutover
+
+- [ ] Retain immutable normalized metadata/details per actual FFprobe attempt beyond the seven-observation smoothing window, including declared/calculated bitrate provenance, rational FPS and allowlisted track/color/interlace metadata. Do not alter the smoothing/scoring window.
+- [ ] Retain numeric content observations and available black/freeze markers/decoder-progress duration per actual attempt, including retries. Preserve terminal-health semantics and distinguish unavailable from measured values.
+- [ ] Copy throughput bytes, `elapsed_seconds`, measurement source and sanitized edge attribution into historical observations; reconcile the current `duration_seconds`/`elapsed_seconds` history gap.
+- [ ] Link attempts to run/stream/provider/profile identities and historical channel attachments; retain effective numeric configuration/tool/source provenance once per run. Add queue/capacity timing only through explicit instrumentation, without extra probes.
+- [ ] Decide archive bounds and retention independently from report/scoring eligibility. Keep phase-boundary inserts, short transactions, targeted reads, credential redaction and measured database/WAL/backup costs. Do not enable raw media/full packet/unredacted output retention by default.
+
 ## Draft: Event Channel Stream Monitor supplement
 
 Status: Draft and deferred until Stream Sort's base analysis, retry, TTL, reporting, scheduling, and sorting behavior has accumulated clean operational evidence.

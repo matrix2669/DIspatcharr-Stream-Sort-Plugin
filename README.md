@@ -264,6 +264,23 @@ For recovery, pause scheduling, cooperatively drain work and preserve the latest
 Returning to a pre-cutover database/JSON pair is a deliberate wider recovery: it can discard later Dispatcharr changes and requires separate approval, instance-wide quiescence and verified restoration. If no safe recovery is selected, leave scheduling disabled and retain the PostgreSQL data for repair. The clone-only backend-switch check proves archive recoverability, not a transparent older-plugin downgrade.
 
 
+#### Telemetry coverage and evaluation backlog
+
+PostgreSQL stores what Stream Sort explicitly emits; it does not automatically archive every probe output or every previous value. Current component records are updated in place, and the historical rows contain selected fields. The following audit describes the accepted `222141a` runtime; expanded observation storage is proposed and is not included in the prepared deployment.
+
+| Evidence | Currently retained | Useful evidence not retained as a complete history |
+|---|---|---|
+| FFprobe metadata | Latest normalized codecs, resolution, FPS, bitrates and details; rolling seven metadata observations | Older metadata/details, original rational frame rates, declared vs packet-calculated bitrate provenance, additional tracks/programs and color/interlace/time-base metadata |
+| Content checks | Latest black/frozen/silence result and mean audio level; terminal health/error history | Numeric content results for every check, exact black intervals/freeze markers and local decoder progress duration; parser currently reduces intervals/markers to booleans |
+| Throughput | Latest complete measurement; historical status, Mbps, nominal rate, reason and media-change cause | Per-observation bytes, acquisition elapsed time, measurement source and sanitized edge attribution. History reads `duration_seconds`, while direct probes emit `elapsed_seconds`, so direct acquisition duration is not copied into that historical field |
+| Retries and scheduling | Terminal health/retry summaries, per-stream system logs, component state and full-scan summaries | Immutable result/timing per initial attempt and retry; queue/capacity-wait timeline and the full effective numeric settings/tool/source versions used for each run |
+| Capture reuse diagnostics | Latest result detail, per-attempt system logs and bounded scan counters | A dedicated immutable per-attempt diagnostic history; exact decoded playable duration and peak memory are not presently measured/retained |
+| Channel/provider context | Current stream/provider identity, scoped report associations and applied-sort movement history | Channel/profile attachment snapshots at every observation, rather than reconstructing past membership from current assignments |
+
+Prefer immutable structured observations linked to run, stream and provider identities, with effective numeric settings/provenance once per run and packet/timing summaries where useful. Keep the existing scoring/TTL windows separate from that evaluation archive. Extra tracks/metadata can be allowlisted without storing provider URLs, credentials or arbitrary tags. New instrumentation would be needed for measurements not currently exposed, such as time to first byte or exact phase timing; do not infer them from media timestamps.
+
+Saving more data also creates WAL, index/TOAST work, larger backups and potentially more expensive queries on the Ceph-backed database. Preserve phase-boundary batching, targeted reads and short transactions. Raw captured media, complete packet dumps and unredacted subprocess output are not part of the proposed default archive. Existing detailed 90-day/daily 365-day reporting windows and explicit pruning remain unchanged until the archive/retention design is settled; no additional automatic pruning was enabled.
+
 - `/data/dispatcharr_stream_sort_analysis.json`: unified current analysis and throughput state.
 - `/data/dispatcharr_stream_sort_status.json`: current or latest analysis status.
 - `/data/dispatcharr_stream_sort_schedule_state.json`: schedule claim state.
