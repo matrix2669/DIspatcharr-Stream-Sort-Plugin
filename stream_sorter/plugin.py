@@ -399,9 +399,10 @@ class _ProgressLogger:
             text = str(msg) % args if args else str(msg)
             if text.startswith("[Analyze Media]"):
                 phase = "media_analysis"
-            elif text.startswith("[Analyze Combined Content]"):
-                phase = "content_analysis"
-            elif text.startswith("[Analyze Combined]"):
+            elif text.startswith("[Analyze Combined Retry "):
+                phase = "combined_retry"
+            elif text.startswith(("[Analyze Combined]", "[Analyze Combined Content]")):
+                # Capture and local decoding are one interleaved logical phase.
                 phase = "combined_analysis"
             elif text.startswith("[Analyze Content Retry"):
                 phase = "content_retry"
@@ -409,6 +410,8 @@ class _ProgressLogger:
                 phase = "content_analysis"
             elif text.startswith("[Analyze Throughput]"):
                 phase = "throughput_analysis"
+            elif text.startswith("[Analyze Throughput Retry "):
+                phase = "throughput_retry"
             elif text.startswith("[Analyze Retry"):
                 phase = "media_retry"
             else:

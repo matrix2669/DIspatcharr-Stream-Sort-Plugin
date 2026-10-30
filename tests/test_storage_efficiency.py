@@ -56,10 +56,82 @@ def test_progress_persists_phase_changes_immediately_and_resets_interval(monkeyp
         progress.info("[%s] %d%% (%d/10)", prefix, completed * 10, completed)
 
     assert [call.kwargs["phase"] for call in persist.call_args_list] == [
-        "media_analysis", "media_retry", "combined_analysis", "content_analysis",
+        "media_analysis", "media_retry", "combined_analysis",
         "content_retry", "content_analysis", "throughput_analysis", "throughput_analysis",
     ]
     assert persist.call_args.kwargs["progress_completed"] == 9
+
+
+def test_interleaved_combined_capture_and_content_share_one_throttle(monkeypatch):
+    system_logger = Mock()
+    persist = Mock()
+    monkeypatch.setattr(plugin, "LOGGER", system_logger)
+    monkeypatch.setattr(plugin, "_update_status", persist)
+    ticks = iter([100.0, 101.0, 102.0, 109.999, 110.0])
+    monkeypatch.setattr(plugin, "time", SimpleNamespace(monotonic=lambda: next(ticks)))
+    progress = plugin._ProgressLogger("job-1")
+    # The pipeline logs remote capture and local decoding results interleaved.
+    messages = [
+        ("[Analyze Combined] %d%% (%d/%d) stream=%s content=pending throughput=healthy", 10, 1, 10, 42),
+        ("[Analyze Combined Content] %d%% (%d/%d) stream=%s health=alive", 10, 1, 10, 42),
+        ("[Analyze Combined] %d%% (%d/%d) stream=%s content=pending throughput=healthy", 20, 2, 10, 43),
+        ("[Analyze Combined Content] %d%% (%d/%d) stream=%s health=alive", 20, 2, 10, 43),
+    ]
+    for args in messages:
+        progress.info(*args)
+
+    persist.assert_called_once_with(
+        "job-1", phase="combined_analysis", progress_percent=10,
+        progress_completed=1, progress_total=10,
+    )
+    assert [call.args for call in system_logger.info.call_args_list] == messages
+
+    progress.info("[Analyze Combined] 30% (3/10) stream=44")
+    assert persist.call_count == 2
+    assert persist.call_args.kwargs == {
+        "phase": "combined_analysis", "progress_percent": 30,
+        "progress_completed": 3, "progress_total": 10,
+    }
+
+
+@pytest.mark.parametrize(
+    "analysis_prefix,retry_prefixes,phase",
+    [
+        (
+            "Analyze Combined",
+            ["Analyze Combined Retry 1/3", "Analyze Combined Retry 1/3 Content",
+             "Analyze Combined Retry 2/3", "Analyze Combined Retry 2/3 Content"],
+            "combined_retry",
+        ),
+        (
+            "Analyze Throughput",
+            ["Analyze Throughput Retry 1/3", "Analyze Throughput Retry 2/3",
+             "Analyze Throughput Retry 3/3", "Analyze Throughput Retry 3/3"],
+            "throughput_retry",
+        ),
+    ],
+)
+def test_retry_prefixes_share_stable_phase_and_normal_throttle(
+    monkeypatch, analysis_prefix, retry_prefixes, phase,
+):
+    system_logger = Mock()
+    persist = Mock()
+    monkeypatch.setattr(plugin, "LOGGER", system_logger)
+    monkeypatch.setattr(plugin, "_update_status", persist)
+    ticks = iter([100.0, 101.0, 102.0, 110.999, 111.0])
+    monkeypatch.setattr(plugin, "time", SimpleNamespace(monotonic=lambda: next(ticks)))
+    progress = plugin._ProgressLogger("job-1")
+    progress.info("[%s] 100%% (10/10)", analysis_prefix)
+    for completed, prefix in enumerate(retry_prefixes, 1):
+        progress.info("[%s] %d%% (%d/4)", prefix, completed * 25, completed)
+        assert persist.call_count == (3 if completed == 4 else 2)
+
+    assert [call.kwargs["phase"] for call in persist.call_args_list] == [
+        "combined_analysis" if phase == "combined_retry" else "throughput_analysis",
+        phase, phase,
+    ]
+    assert [call.kwargs["progress_completed"] for call in persist.call_args_list] == [10, 1, 4]
+    assert system_logger.info.call_count == 5
 
 
 def test_progress_failure_is_throttled_without_interrupting_logs(monkeypatch):
