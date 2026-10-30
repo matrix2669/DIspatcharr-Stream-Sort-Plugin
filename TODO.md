@@ -6,6 +6,12 @@
 - [ ] Consider an optional scheduler pause while streams are actively playing.
 - [ ] Evaluate provider-aware TTL spreading only if stream-level concentration reports show specific accounts are being hammered.
 
+## Storage/capture adoption follow-up after the 2026-10-30 rehearsal
+
+- [ ] Add bounded, credential-free telemetry for reusable-capture rejection causes (acquisition failure, insufficient playable duration, local metadata/content failure), received bytes, elapsed acquisition, playable duration and measured peak memory. Five of eight samples fell back without sufficient rejection detail.
+- [ ] Validate raw-capture vs existing remux/direct metadata, video bitrate and content/throughput results with controlled repeated fixtures, separating PostgreSQL-only performance from capture reuse. Instrument actual provider openings: the completed sequential trial counted 23 logical helper attempts in each arm and two throughput statuses differed. Capture reuse remains off pending acceptance.
+- [ ] Before production cutover, verify operational cooperative cancellation, actual automated backup coverage and a deliberate cutover/rollback plan preserving PostgreSQL-only observations; the restored-database rehearsal does not migrate production or validate an older-plugin downgrade.
+
 ## Draft: Event Channel Stream Monitor supplement
 
 Status: Draft and deferred until Stream Sort's base analysis, retry, TTL, reporting, scheduling, and sorting behavior has accumulated clean operational evidence.

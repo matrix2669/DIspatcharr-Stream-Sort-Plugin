@@ -28,3 +28,9 @@ The disposable PostgreSQL16 CI service validates table ownership under a restric
 
 - Re-review these contracts against the exact Dispatcharr revision before raising the minimum supported version or changing scheduling, capacity, event, or playback-health behavior.
 - Validate background ORM connection cleanup, multi-worker claims, profile reservations, retries, URL rewriting, and plugin lifecycle in a controlled Dispatcharr instance before release.
+
+### Installed-platform rehearsal, 2026-10-30
+
+Accepted source `db1834501c912a083737537d3e7d2a51766b5cb2` passed the controlled schema-v2 legacy import, idempotence, full custom-dump/restore fingerprints, 188-channel ranking parity, normal analysis/sort/report checks in restored databases on Dispatcharr 0.33.0 with PostgreSQL 17.11. The live `dispatch` role has superuser/CREATEDB privileges, so this proves available permissions, not least privilege; restricted-role coverage remains the PostgreSQL16 CI job. Production has no plugin-owned PostgreSQL tables and remains JSON-backed. Explicit dumps were validated; automatic backup coverage is still unverified. See the owning branch ledger for measurements and capture-equivalence limitations.
+
+The installed custom `dispatcharr.db.backends.postgresql_psycopg3` backend uses django-db-geventpool's alias-keyed class-level connection pools. Merely replacing Django's default database NAME/wrapper can reuse the old database connection. A rehearsal that changes database routing must first close and remove the default alias pool in its own isolated process, replace the wrapper/configuration, then assert `SELECT current_database()` before any DDL/import. Never clear service-worker pools or route a production worker to a rehearsal database. The routing guard stopped the first attempt before migration or probes; corrected isolation passed. This is a rehearsal-harness dependency constraint, not a plugin requirement to switch production databases.
