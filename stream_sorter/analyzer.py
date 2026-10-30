@@ -31,6 +31,7 @@ RETRYABLE_ERROR_TYPES = {
     'black_screen',
     'frozen_video',
     'silent_audio',
+    'content_sample_incomplete',
 }
 
 def _utc_now_iso() -> str:

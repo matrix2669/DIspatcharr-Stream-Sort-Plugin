@@ -956,7 +956,7 @@ def test_shared_memory_capture_directory_falls_back_when_runtime_user_cannot_wri
     assert "falling back" in warnings[0][0]
 
 
-def _run_single_combined_scan(tmp_path, monkeypatch, capture_stream_sample):
+def _run_single_combined_scan(tmp_path, monkeypatch, capture_stream_sample, *, real_local_capture=False, saved_cache=None):
     class QuerySet(list):
         def select_related(self, *_args):
             return self
@@ -1005,19 +1005,20 @@ def _run_single_combined_scan(tmp_path, monkeypatch, capture_stream_sample):
         }
     }
     monkeypatch.setattr(incremental.analyzer, "load_analysis_cache", lambda _path: cache)
-    monkeypatch.setattr(incremental.analyzer, "save_analysis_cache", lambda *_args: None)
+    monkeypatch.setattr(incremental.analyzer, "save_analysis_cache", lambda cache, *_args: saved_cache.update(cache) if saved_cache is not None else None)
     monkeypatch.setattr(incremental.analyzer, "_persist_dispatcharr_result", lambda *_args: None)
     monkeypatch.setattr(incremental, "load_throughput_cache", lambda _path: {})
     monkeypatch.setattr(incremental, "capture_stream_sample", capture_stream_sample)
-    monkeypatch.setattr(
-        incremental,
-        "_analyze_local_capture",
-        lambda _item, base, _path, **_kwargs: {
-            **dict(base),
-            "status": "alive",
-            "details": {"content": {"measured": True, "tested_at": now}},
-        },
-    )
+    if not real_local_capture:
+        monkeypatch.setattr(
+            incremental,
+            "_analyze_local_capture",
+            lambda _item, base, _path, **_kwargs: {
+                **dict(base),
+                "status": "alive",
+                "details": {"content": {"measured": True, "tested_at": now}},
+            },
+        )
     monkeypatch.setattr(
         incremental,
         "probe_stream",
@@ -1585,3 +1586,56 @@ def test_runtime_playback_never_clears_confirmed_dead_health():
         now=now,
     ) == 0
     assert cache["42"]["status"] == "dead"
+
+
+@pytest.mark.parametrize('cancel', [False, True])
+def test_incomplete_local_sample_runs_reserved_retries_and_persists_honest_health(tmp_path, monkeypatch, cancel):
+    from stream_sorter import execution_control
+    for name in ('ANALYSIS_EXECUTION_LOCK_PATH', 'ANALYSIS_EXECUTION_STATE_PATH',
+                 'ANALYSIS_CANCEL_PATH', 'ANALYSIS_CONTROL_LOCK_PATH'):
+        monkeypatch.setattr(execution_control, name, str(tmp_path / name))
+    checked = datetime.now(timezone.utc).isoformat()
+    attempts = []
+    def incomplete(*args, **kwargs):
+        attempts.append(kwargs.get('local_source'))
+        if cancel and len(attempts) == 1:
+            assert execution_control.request_analysis_cancel()['status'] == 'ok'
+        return {'measured': False, 'error_type': 'content_sample_incomplete',
+                'error': 'Playable sample shorter than required duration', 'tested_at': checked}
+    monkeypatch.setattr(analyzer, '_analyze_content', incomplete)
+    def capture(*args, **kwargs):
+        path = tmp_path / 'bounded.ts'
+        path.write_bytes(b'finite controlled fixture')
+        return {'status': 'healthy', 'tested_at': checked, 'measured_mbps': 12}, str(path)
+    phases = []
+    fair = incremental._fair_account_futures
+    def tracked(*args, **kwargs):
+        phases.append((kwargs['thread_name_prefix'], kwargs.get('max_per_account')))
+        yield from fair(*args, **kwargs)
+    monkeypatch.setattr(incremental, '_fair_account_futures', tracked)
+    saved = {}
+    if cancel:
+        with pytest.raises(execution_control.AnalysisCancelled):
+            _run_single_combined_scan(tmp_path, monkeypatch, capture, real_local_capture=True, saved_cache=saved)
+    else:
+        result, cache, _ = _run_single_combined_scan(tmp_path, monkeypatch, capture, real_local_capture=True)
+    if cancel:
+        entry = saved['42']
+    else:
+        entry = cache['42']
+    assert len(attempts) == (1 if cancel else 4)
+    assert entry['status'] == 'dead' and entry['error_type'] == 'content_sample_incomplete'
+    assert entry.get('content_checked_at') is None
+    assert entry['retry_pending'] is cancel
+    telemetry = entry['retry_telemetry']
+    assert telemetry['retries_exhausted'] is (not cancel)
+    assert telemetry['current_retry_attempts'] == (0 if cancel else 3)
+    assert entry['health_check_history'][0]['terminal'] is (not cancel)
+    assert len(entry['health_check_history']) == 1
+    retry_phases = [limit for prefix, limit in phases if prefix == 'stream-sort-content-retry']
+    assert retry_phases == ([] if cancel else [1, 1, 1])
+    if cancel:
+        assert incremental.content_check_reason(entry, url_hash=entry['url_hash'],
+            ttl_hours=168, dead_ttl_hours=1, provider_id=10,
+            now=datetime.now(timezone.utc)) == 'dead_retry_pending'
+    assert not (tmp_path / 'bounded.ts').exists()

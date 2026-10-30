@@ -445,3 +445,88 @@ def test_legacy_sort_import_deduplicates_and_keeps_unattributed_rollups(store, t
     assert report['legacy_unscoped_daily_rollups'][now.date().isoformat()]['applied_runs'] == 2
     assert len(report['legacy_unscoped_runs']) == 2
     assert path.read_text() == original
+
+
+def test_reset_all_waits_for_inflight_playback_before_deleting_prior_counters(store):
+    import time
+    record_runtime_event('channel_start', {'channel_id': 1, 'stream_id': 42},
+        settings={'storage_backend': 'postgresql'}, resolver=lambda sid, _: {'stream_id': sid})
+    store.acquire('reset-owner')
+    loaded, allow_commit, resetting, reset_done = (threading.Event() for _ in range(4))
+    failures, reset_pid = [], []
+    def writer():
+        worker_store = storage.PostgresStore()
+        try:
+            with worker_store.playback_event({'channel_id': 1, 'stream_id': 42},
+                    lambda sid, _: {'stream_id': sid}) as data:
+                entry = data['streams']['42']
+                assert entry['playback_starts'] == 1
+                entry['playback_starts'] = 2
+                entry['last_event_at'] = datetime.now(timezone.utc).isoformat()
+                loaded.set()
+                assert allow_commit.wait(5)
+        except Exception as exc:
+            failures.append(exc)
+        finally:
+            connections['default'].close()
+    def resetter():
+        worker_store = storage.PostgresStore()
+        try:
+            with worker_store.connection.cursor() as cursor:
+                cursor.execute('SELECT pg_backend_pid()')
+                reset_pid.append(cursor.fetchone()[0])
+            resetting.set()
+            worker_store.reset('reset-owner', include_history=True)
+        except Exception as exc:
+            failures.append(exc)
+        finally:
+            reset_done.set()
+            connections['default'].close()
+    writer_thread = threading.Thread(target=writer)
+    reset_thread = threading.Thread(target=resetter)
+    writer_thread.start()
+    try:
+        assert loaded.wait(3)
+        reset_thread.start()
+        assert resetting.wait(3)
+        deadline = time.monotonic() + 1.2
+        waiting = False
+        while time.monotonic() < deadline and not reset_done.is_set():
+            with store.connection.cursor() as cursor:
+                cursor.execute("SELECT EXISTS(SELECT 1 FROM pg_locks WHERE pid = %s AND locktype = 'advisory' AND NOT granted)", [reset_pid[0]])
+                waiting = cursor.fetchone()[0]
+            if waiting:
+                break
+            time.sleep(.01)
+        assert waiting, 'reset must serialize behind the already-loaded playback writer'
+        assert not reset_done.is_set()
+    finally:
+        allow_commit.set()
+        writer_thread.join(5)
+        if reset_thread.ident is not None:
+            reset_thread.join(5)
+    assert not failures
+    assert not writer_thread.is_alive() and not reset_thread.is_alive()
+    assert count(store, 'playback') == count(store, 'history') == 0
+    store.release('reset-owner')
+
+
+def test_scope_freshness_requires_successful_superset_scan_not_overlap_or_cancel(sort_case):
+    from stream_sorter import plugin
+    store, model, rows = sort_case
+    old = datetime.now(timezone.utc) - timedelta(days=10)
+    for owner, ids, canceled in (('old-ab', [42, 43], False),
+                                ('new-a', [42], False),
+                                ('canceled-ab', [42, 43], True)):
+        store.acquire(owner)
+        store.record_scan(owner, ids, {'canceled': canceled, 'streams_selected': len(ids)})
+        store.release(owner)
+    with store.connection.cursor() as cursor:
+        cursor.execute('UPDATE stream_sort_scan SET completed_at = %s WHERE run_id = %s', [old, 'old-ab'])
+    assert store.latest_scan([42, 43])[0] == old
+    assert store.latest_scan([43])[0] == old
+    assert store.latest_scan([42])[0] > old
+    assert store.latest_scan([999]) is None
+    result = plugin._run_ttl_recommendation_action({'storage_backend': 'postgresql'})
+    assert result['status'] == 'error'
+    assert 'older than seven days' in result['message']

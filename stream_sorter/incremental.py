@@ -1247,11 +1247,12 @@ def _select_capture_temp_directory(
     worker_count: int,
     *,
     shared_memory_root: str = _SHARED_MEMORY_CAPTURE_ROOT,
+    bytes_per_worker: int = _CAPTURE_BYTES_PER_WORKER,
     logger=None,
 ) -> str | None:
     """Use shared memory only when it has safe headroom and is writable."""
     parent = os.path.dirname(shared_memory_root) or shared_memory_root
-    required = _CAPTURE_HEADROOM_BYTES + max(1, int(worker_count)) * _CAPTURE_BYTES_PER_WORKER
+    required = _CAPTURE_HEADROOM_BYTES + max(1, int(worker_count)) * max(1, int(bytes_per_worker))
     probe_fd = None
     probe_path = None
     try:
@@ -2244,6 +2245,10 @@ def analyze_assigned_streams(
         int(item["id"]): str((cache.get(str(item["id"])) or {}).get("status") or "unknown").lower()
         for item in items
     }
+    scan_start_health_source_by_id = {
+        int(item['id']): (cache.get(str(item['id'])) or {}).get('health_source')
+        for item in items
+    }
     known_placeholder_ids = {
         int(item["id"])
         for item in items
@@ -2252,6 +2257,7 @@ def analyze_assigned_streams(
     now = datetime.now(timezone.utc)
     media_due = []
     content_reason_by_id = {}
+    required_content_recovery_ids = set()
     for item in items:
         sid = int(item["id"])
         entry = cache.get(str(sid))
@@ -2280,6 +2286,10 @@ def analyze_assigned_streams(
             )
         if content_reason:
             content_reason_by_id[sid] = content_reason
+            if (str((entry or {}).get('status') or '').lower() == 'dead'
+                    and ((entry or {}).get('health_source') == 'stream_sort_content'
+                         or (entry or {}).get('error_type') in {'black_screen', 'frozen_video', 'silent_audio', 'content_sample_incomplete'})):
+                required_content_recovery_ids.add(sid)
         if reason:
             media_due.append((item, reason))
 
@@ -2365,13 +2375,10 @@ def analyze_assigned_streams(
         }
 
     reuse_captures = analyzer._as_bool(settings.get('bounded_capture_reuse'), False)
-    reuse_temp_directory = _select_capture_temp_directory(workers, logger=logger) if reuse_captures else None
     capture_bytes = max(1024 * 1024, min(64 * 1024 * 1024,
         analyzer._as_int(settings.get('capture_max_mib'), 32) * 1024 * 1024))
-    if reuse_temp_directory:
-        ram = os.statvfs(reuse_temp_directory)
-        if ram.f_bavail * (ram.f_frsize or ram.f_bsize) < workers * capture_bytes + _CAPTURE_HEADROOM_BYTES:
-            reuse_temp_directory = None
+    reuse_temp_directory = (_select_capture_temp_directory(workers, bytes_per_worker=capture_bytes, logger=logger)
+                            if reuse_captures else None)
     capacity_manager = build_capacity_manager(items, logger=logger)
 
     canceled = False
@@ -2711,7 +2718,7 @@ def analyze_assigned_streams(
             if sid in placeholder_recovered_ids:
                 content_reason_by_id[sid] = 'placeholder_recovered'
                 continue
-            if sid in known_placeholder_ids:
+            if sid in known_placeholder_ids or sid in required_content_recovery_ids:
                 continue
             reason = content_check_reason(
                 cache.get(str(sid)), url_hash=analyzer._stream_url_hash(str(item.get('url') or '')),
@@ -3355,9 +3362,13 @@ def analyze_assigned_streams(
         canceled = analysis_cancel_requested()
 
     canceled = canceled or analysis_cancel_requested()
-    if store and canceled:
-        for sid, result in media_results.items():
-            if scan_start_status_by_id.get(sid) == 'dead' and sid in content_reason_by_id and sid not in content_results:
+    if store:
+        for sid in media_results:
+            result = content_results.get(sid) or media_results[sid]
+            content = (result.get('details') or {}).get('content') or {}
+            recovery_incomplete = (sid in required_content_recovery_ids or sid in placeholder_recovered_ids) and not content.get('measured')
+            canceled_content = canceled and scan_start_status_by_id.get(sid) == 'dead' and sid in content_reason_by_id and sid not in content_results
+            if (recovery_incomplete or canceled_content) and result.get('status') == 'alive':
                 original = terminal_base.get(str(sid)) or {}
                 result.update({'status': 'dead', 'error_type': original.get('error_type'),
                                'error': original.get('error', ''), 'retry_pending': True})
@@ -3408,6 +3419,10 @@ def analyze_assigned_streams(
             record_history=sid not in content_results,
             history_previous_status=scan_start_status_by_id.get(sid, "unknown"),
         )
+        if store and sid in required_content_recovery_ids and media_results[sid].get('retry_pending'):
+            # Metadata-only completion has not replaced the terminal content
+            # failure. Preserve its ownership for the next recovery attempt.
+            cache[str(sid)]['health_source'] = scan_start_health_source_by_id.get(sid) or 'stream_sort_content'
 
     for sid, result in content_results.items():
         item = item_by_id[sid]

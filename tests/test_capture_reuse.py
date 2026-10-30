@@ -11,7 +11,27 @@ from unittest.mock import Mock
 
 import pytest
 
-from stream_sorter import analyzer, incremental, throughput
+from stream_sorter import analyzer, capture_worker, incremental, throughput
+
+
+def _run_capture_worker(raw_url, *, duration_seconds, timeout_seconds, temp_directory,
+                        user_agent=throughput.DEFAULT_USER_AGENT, max_bytes=32 * 1024 * 1024,
+                        stop_requested=lambda: False):
+    """Unit adapter only; total deadlines are tested with actual children below."""
+    import tempfile
+    if stop_requested():
+        return {'complete': False, 'bytes': 0}, None
+    fd, path = tempfile.mkstemp(dir=temp_directory)
+    os.close(fd)
+    config = throughput._capture_config(raw_url, duration_seconds=duration_seconds,
+        timeout_seconds=timeout_seconds, user_agent=user_agent, max_bytes=max_bytes,
+        path=path, started=throughput.time.monotonic())
+    measured = capture_worker.capture(config, now=throughput.time.monotonic)
+    if not measured['complete']:
+        os.unlink(path)
+        return measured, None
+    measured['measured_mbps'] = measured['bytes'] * 8 / measured['elapsed_seconds'] / 1_000_000
+    return measured, path
 
 
 class Clock:
@@ -33,7 +53,7 @@ class Response:
 
 
 @pytest.mark.parametrize('failure', ['limit', 'eof', 'cancel', 'read_error'])
-def test_bounded_capture_never_retains_incomplete_file(tmp_path, monkeypatch, failure):
+def test_capture_worker_never_retains_incomplete_file(tmp_path, monkeypatch, failure):
     clock = Clock()
     response = Response(clock, eof=failure == 'eof')
     if failure == 'read_error':
@@ -41,7 +61,7 @@ def test_bounded_capture_never_retains_incomplete_file(tmp_path, monkeypatch, fa
     monkeypatch.setattr(throughput, 'time', SimpleNamespace(monotonic=clock))
     opened = Mock(return_value=response)
     monkeypatch.setattr(throughput.urllib.request, 'urlopen', opened)
-    measured, path = throughput.capture_bounded_sample('http://fake.test/live',
+    measured, path = _run_capture_worker('http://fake.test/live',
         duration_seconds=6, timeout_seconds=8, temp_directory=str(tmp_path),
         max_bytes=65536, stop_requested=lambda: failure == 'cancel')
     assert path is None
@@ -55,7 +75,7 @@ def test_bounded_capture_never_retains_incomplete_file(tmp_path, monkeypatch, fa
     assert list(tmp_path.iterdir()) == []
 
 
-def test_bounded_capture_counts_live_bytes_wall_time_and_profile_headers(tmp_path, monkeypatch):
+def test_capture_worker_counts_live_bytes_wall_time_and_profile_headers(tmp_path, monkeypatch):
     clock = Clock()
     response = Response(clock)
     requests = []
@@ -65,7 +85,7 @@ def test_bounded_capture_counts_live_bytes_wall_time_and_profile_headers(tmp_pat
         return response
     monkeypatch.setattr(throughput, 'time', SimpleNamespace(monotonic=clock))
     monkeypatch.setattr(throughput.urllib.request, 'urlopen', opened)
-    measured, path = throughput.capture_bounded_sample(
+    measured, path = _run_capture_worker(
         'http://fake.test/native-rewrite|User-Agent=embedded-agent&Referer=approved',
         duration_seconds=2, timeout_seconds=8, temp_directory=str(tmp_path),
         user_agent='profile-agent', max_bytes=1024 * 1024)
@@ -128,7 +148,7 @@ def test_finite_http_object_keeps_direct_placeholder_gate(tmp_path, monkeypatch)
     response = Response(Clock())
     response.headers = {'Content-Length': '12345678'}
     monkeypatch.setattr(throughput.urllib.request, 'urlopen', Mock(return_value=response))
-    result, path = throughput.capture_bounded_sample('http://fake.test/fixed.ts',
+    result, path = _run_capture_worker('http://fake.test/fixed.ts',
         duration_seconds=6, timeout_seconds=8, temp_directory=str(tmp_path))
     assert path is None and result['complete'] is False
     assert response.reads == 0 and response.closed

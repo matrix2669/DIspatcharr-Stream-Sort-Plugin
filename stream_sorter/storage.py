@@ -158,7 +158,7 @@ class PostgresStore:
         if not ids:
             return None
         with self.transaction() as cursor:
-            cursor.execute('SELECT completed_at, data FROM stream_sort_scan WHERE stream_ids && %s::bigint[] ORDER BY completed_at DESC LIMIT 1', [ids])
+            cursor.execute("SELECT completed_at, data FROM stream_sort_scan WHERE stream_ids @> %s::bigint[] AND COALESCE(data->'canceled', 'false'::jsonb) = 'false'::jsonb ORDER BY completed_at DESC LIMIT 1", [ids])
             row = cursor.fetchone()
             return (row[0], _decode(row[1])) if row else None
 
@@ -381,6 +381,10 @@ class PostgresStore:
     def reset(self, owner, *, include_history):
         with self.transaction() as cursor:
             self.fence(cursor, owner)
+            if include_history:
+                # Match importer order: lease fence, then playback serialization.
+                # Wait for prior writers before deleting any playback evidence.
+                cursor.execute('SELECT pg_advisory_xact_lock(1936946022)')
             for table in ('stream_sort_current', 'stream_sort_component', 'stream_sort_rollup', 'stream_sort_import', 'stream_sort_scan', 'stream_sort_sort_channel', 'stream_sort_sort_run', 'stream_sort_sort_snapshot', 'stream_sort_sort_rollup', 'stream_sort_sort_legacy_daily'):
                 cursor.execute(f'DELETE FROM {table}')
             if include_history:

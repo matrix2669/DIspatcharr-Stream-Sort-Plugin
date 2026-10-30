@@ -141,8 +141,9 @@ def test_phase_flush_requeries_only_affected_stream_and_keeps_terminal_dead(pg_s
     assert context.capacity.release.call_count == 2
 
 
-def test_fresh_playback_after_phase_avoids_due_content_and_never_promotes_aggregate(pg_scan, monkeypatch):
+def test_fresh_playback_after_phase_avoids_due_content_for_previously_alive_stream(pg_scan, monkeypatch):
     context = pg_scan
+    context.store.current['42'].update({'status': 'alive', 'error_type': None})
     fresh = (context.now + timedelta(seconds=1)).isoformat()
     context.store.new_playback = {'streams': {'42': {
         'last_clean_playback_at': fresh, 'last_clean_playback_seconds': 300,
@@ -155,7 +156,7 @@ def test_fresh_playback_after_phase_avoids_due_content_and_never_promotes_aggreg
     result = context.run()
     assert result['content_checked'] == 0
     assert context.store.current['42']['content_checked_at'] == fresh
-    assert context.store.current['42']['health_check_history'][0]['previous_status'] == 'dead'
+    assert context.store.current['42']['health_check_history'][0]['previous_status'] == 'alive'
 
 
 def test_cancel_flushes_completed_metadata_without_recovering_dead_pending_content(pg_scan, monkeypatch):
@@ -457,3 +458,52 @@ def test_auxiliary_import_parser_streams_nested_maps_and_history(tmp_path):
     with path.open() as handle:
         rows = list(iter_legacy_records(handle, 'reliability'))
     assert rows == [('streams', '42', {'playback_starts': 5}), ('channels', 'id:1', {'active_stream_id': 42})]
+
+
+@pytest.mark.parametrize('error_type', ['black_screen', 'frozen_video', 'silent_audio', 'content_sample_incomplete', 'timeout'])
+@pytest.mark.parametrize('outcome', ['negative', 'deferred', 'unmeasured'])
+def test_confirmed_content_recovery_survives_pg_requery_and_requires_completion(
+    pg_scan, monkeypatch, error_type, outcome,
+):
+    context = pg_scan
+    old = (context.now - timedelta(hours=2)).isoformat()
+    context.store.current['42'].update({'status': 'dead', 'error_type': error_type,
+        'health_source': 'stream_sort_content', 'health_checked_at': old, 'dead_checked_at': old, 'content_checked_at': old,
+        'content_m3u_account_id': 7, 'consecutive_dead_results': 1})
+    monkeypatch.setattr(analyzer, 'analyze_stream', lambda *a, **kw: {
+        'status': 'alive', 'tested_at': context.now.isoformat(), 'stats': {}, 'details': {}})
+    monkeypatch.setattr(incremental, 'throughput_check_reason', lambda *a, **kw: None)
+    def content(base, *args, **kwargs):
+        assert context.store.current['42']['status'] == 'dead'
+        assert context.store.staged['42']['status'] == 'alive'
+        return {**base, 'status': 'dead' if outcome == 'negative' else 'alive',
+            'error_type': error_type if outcome == 'negative' else None,
+            'details': {'content': {'measured': outcome == 'negative', 'tested_at': context.now.isoformat()}}}
+    check = Mock(side_effect=content)
+    monkeypatch.setattr(analyzer, 'apply_content_analysis', check)
+    if outcome == 'deferred':
+        context.capacity.try_acquire.side_effect = [(True, 'metadata-slot'), (False, None)]
+    result = context.run()
+    entry = context.store.current['42']
+    assert entry['status'] == 'dead'
+    assert len(entry['health_check_history']) == 1
+    assert entry['health_check_history'][0]['previous_status'] == 'dead'
+    if outcome != 'deferred':
+        assert entry['health_check_history'][0]['reason'] == 'content_dead_ttl_expired'
+    assert check.call_count == (0 if outcome == 'deferred' else 1)
+    if outcome != 'negative':
+        assert entry['retry_pending'] is True
+        assert entry['health_source'] == 'stream_sort_content'
+        assert entry['content_checked_at'] == old
+        assert entry['health_check_history'][0]['terminal'] is False
+
+
+
+def test_bounded_ram_admission_uses_configured_cap_not_legacy_remux_budget(tmp_path, monkeypatch):
+    root = tmp_path / 'ram'
+    available = incremental._CAPTURE_HEADROOM_BYTES + 2 * 32 * 1024 * 1024
+    monkeypatch.setattr(incremental.os, 'statvfs', lambda path: SimpleNamespace(
+        f_frsize=1, f_bsize=1, f_bavail=available))
+    assert incremental._select_capture_temp_directory(2, shared_memory_root=str(root),
+        bytes_per_worker=32 * 1024 * 1024) == str(root)
+    assert incremental._select_capture_temp_directory(2, shared_memory_root=str(root)) is None

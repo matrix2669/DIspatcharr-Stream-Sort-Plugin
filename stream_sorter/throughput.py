@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 import os
 import signal
+import shutil
+import sys
 import subprocess
 import tempfile
 import time
@@ -17,6 +19,7 @@ from .scoring import classify_throughput
 DEFAULT_CACHE_PATH = "/data/dispatcharr_stream_sort_analysis.json"
 LEGACY_CACHE_PATH = "/data/dispatcharr_stream_sort_throughput.json"
 DEFAULT_USER_AGENT = "VLC/3.0.20 LibVLC/3.0.20"
+_CAPTURE_WORKER_PATH = os.path.join(os.path.dirname(__file__), "capture_worker.py")
 
 
 def capture_stream_sample(
@@ -318,66 +321,101 @@ def probe_stream(
     }
 
 
+def _capture_python():
+    # Embedded Python hosts such as uWSGI may put their own binary in
+    # sys.executable. Prefer the actual interpreter in that environment.
+    candidates = [sys.executable, os.path.join(sys.prefix, 'bin', 'python3'),
+                  shutil.which('python3')]
+    for candidate in candidates:
+        if candidate and os.path.basename(candidate).startswith('python') and os.access(candidate, os.X_OK):
+            return candidate
+    raise RuntimeError('Python interpreter unavailable for bounded acquisition')
+
+
+def _capture_config(raw_url, *, duration_seconds, timeout_seconds, user_agent,
+                    max_bytes, path, started):
+    if not 1 <= duration_seconds <= 30 or timeout_seconds < duration_seconds:
+        raise ValueError('Shared capture requires 1-30 seconds and a sufficient timeout')
+    if not 0 < max_bytes <= 64 * 1024 * 1024:
+        raise ValueError('Shared capture byte bound must not exceed 64 MiB')
+    url, headers = _split_url_headers(raw_url)
+    headers.setdefault('User-Agent', user_agent)
+    headers.setdefault('Accept', '*/*')
+    if not url.lower().startswith(('http://', 'https://')):
+        raise ValueError('Shared RAM capture supports HTTP(S) only')
+    return {'url': url, 'headers': headers, 'duration_seconds': duration_seconds,
+            'timeout_seconds': timeout_seconds, 'max_bytes': max_bytes,
+            'path': path, 'started': started}
+
+
 def capture_bounded_sample(raw_url, *, duration_seconds, timeout_seconds, temp_directory,
                            user_agent=DEFAULT_USER_AGENT, max_bytes=32 * 1024 * 1024,
                            stop_requested=lambda: False):
-    """Raw HTTP sample: exact byte bound, bounded read deadlines, no remux.
+    """Killable raw acquisition with one TOTAL deadline, including DNS/HTTP.
 
-    Only a completed wall-time sample measures throughput. EOF, cancellation,
-    byte-cap exhaustion, and read errors leave components due. The caller must
-    delete a returned path immediately after local processing.
+    The process is killed and reaped before return on timeout or cancellation.
+    Successful elapsed time is the live acquisition wall time, including setup;
+    local analysis and parent shutdown/cleanup never contribute to throughput.
     """
     tested = datetime.now(timezone.utc).isoformat()
     started = time.monotonic()
     path = None
-    response = None
+    process = None
     total = 0
+    accepted = False
+    failure = {'tested_at': tested, 'status': 'unknown', 'complete': False,
+               'bytes': 0, 'error_type': 'capture_incomplete',
+               'error': 'Bounded sample incomplete; direct reserved fallback required'}
     try:
-        if not 1 <= duration_seconds <= 30 or timeout_seconds < duration_seconds:
-            raise ValueError('Shared capture requires 1-30 seconds and a sufficient timeout')
-        if not 0 < max_bytes <= 64 * 1024 * 1024:
-            raise ValueError('Shared capture byte bound must not exceed 64 MiB')
         if stop_requested():
             raise RuntimeError('Capture canceled')
-        url, headers = _split_url_headers(raw_url)
-        headers.setdefault('User-Agent', user_agent)
-        headers.setdefault('Accept', '*/*')
-        if not url.lower().startswith(('http://', 'https://')):
-            raise ValueError('Shared RAM capture supports HTTP(S) only')
-        response = urllib.request.urlopen(urllib.request.Request(url, headers=headers),
-                                          timeout=min(2.0, timeout_seconds))
-        if response.headers.get('Content-Length') or response.headers.get('Content-Range'):
-            raise RuntimeError('Finite HTTP object requires direct placeholder validation')
+        config = _capture_config(raw_url, duration_seconds=duration_seconds,
+            timeout_seconds=timeout_seconds, user_agent=user_agent, max_bytes=max_bytes,
+            path=None, started=started)
         fd, path = tempfile.mkstemp(prefix='stream-sort-bounded-', suffix='.sample', dir=temp_directory)
-        deadline = started + min(duration_seconds, timeout_seconds)
-        with os.fdopen(fd, 'wb') as output:
-            while time.monotonic() < deadline:
-                if stop_requested():
-                    raise RuntimeError('Capture canceled')
-                remaining = max_bytes - total
-                if remaining <= 0:
-                    raise RuntimeError('Capture byte limit reached')
-                # read1 returns available data instead of waiting for a full block.
-                chunk = response.read1(min(64 * 1024, remaining))
-                if not chunk:
-                    raise RuntimeError('Source ended before a sustained live sample completed')
-                output.write(chunk)
-                total += len(chunk)
-        elapsed = max(time.monotonic() - started, 0.001)
-        if total < 64 * 1024:
-            raise RuntimeError('Sample too small')
+        os.close(fd)
+        config['path'] = path
+        # No URL/headers in argv, stderr, or exception messages. -I/-S avoids
+        # loading plugin/app startup hooks in the acquisition child.
+        command = [_capture_python(), '-I', '-S', _CAPTURE_WORKER_PATH]
+        process = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                   stderr=subprocess.DEVNULL, text=True)
+        deadline = started + min(30.0, timeout_seconds)
+        payload = json.dumps(config)
+        while True:
+            remaining = deadline - time.monotonic()
+            if stop_requested() or remaining <= 0:
+                raise RuntimeError('Capture canceled or total deadline exceeded')
+            try:
+                output, _ = process.communicate(input=payload, timeout=min(.05, remaining))
+                break
+            except subprocess.TimeoutExpired:
+                payload = None
+        measured = json.loads(output)
+        total = os.path.getsize(path)
+        elapsed = float(measured.get('elapsed_seconds') or 0)
+        if (process.returncode or not measured.get('complete') or not 65536 <= total <= max_bytes
+                or measured.get('bytes') != total or elapsed < duration_seconds):
+            raise RuntimeError('Incomplete live acquisition')
+        accepted = True
         return {'tested_at': tested, 'bytes': total, 'elapsed_seconds': elapsed,
                 'measured_mbps': total * 8 / elapsed / 1_000_000,
                 'measurement_source': 'raw_http_capture', 'complete': True}, path
     except Exception:
-        if path:
-            try:
-                os.unlink(path)
-            except OSError:
-                pass
-        return {'tested_at': tested, 'status': 'unknown', 'complete': False,
-                'bytes': total, 'error_type': 'capture_incomplete',
-                'error': 'Bounded sample incomplete; direct reserved fallback required'}, None
+        return failure, None
     finally:
-        if response is not None:
-            response.close()
+        try:
+            if process is not None:
+                if process.poll() is None:
+                    process.kill()
+                    # No reservation release while its child consumes a source.
+                    process.communicate(timeout=1.0)
+                else:
+                    process.wait(timeout=1.0)
+        finally:
+            if path and not accepted:
+                try:
+                    failure['bytes'] = os.path.getsize(path)
+                    os.unlink(path)
+                except FileNotFoundError:
+                    pass
