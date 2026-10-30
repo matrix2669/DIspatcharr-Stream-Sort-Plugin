@@ -302,6 +302,38 @@ def ffprobe_check_reason(
     return None
 
 
+def _content_recovery_required(entry: Mapping[str, Any] | None) -> bool:
+    """Recover legacy content failures once; thereafter the flag is durable.
+
+    Media errors/source and playback freshness are independent of this debt.
+    Only the content-result merger may discharge it after direct validation.
+    """
+    if not entry:
+        return False
+    return bool(entry.get('content_recovery_required')) or (
+        str(entry.get('status') or '').lower() == 'dead'
+        and (entry.get('health_source') == 'stream_sort_content'
+             or entry.get('error_type') in {'black_screen', 'frozen_video', 'silent_audio', 'content_sample_incomplete'})
+    )
+
+
+def _successful_content_validation(result: Mapping[str, Any]) -> bool:
+    content = (result.get('details') or {}).get('content') or {}
+    return (str(result.get('status') or '').lower() == 'alive'
+            and bool(content.get('measured')) and not content.get('skipped')
+            and not content.get('error'))
+
+
+def _hold_content_recovery(previous, result):
+    if (_content_recovery_required(previous) and result.get('status') == 'alive'
+            and not _successful_content_validation(result)):
+        result = dict(result)
+        result.update({'status': 'dead', 'retry_pending': True,
+                       'error_type': (previous or {}).get('error_type') or 'content_recovery_required',
+                       'error': 'Outstanding content recovery requires completed applicable validation'})
+    return result
+
+
 def content_check_reason(
     entry: Mapping[str, Any] | None,
     *,
@@ -334,6 +366,8 @@ def content_check_reason(
         return "dead_ttl_expired"
     if status != "alive":
         return "health_revalidation"
+    if _content_recovery_required(entry):
+        return "content_recovery_required"
     checked_at = entry.get("content_checked_at")
     age = _age_hours(checked_at, now)
     if age is None:
@@ -1636,7 +1670,7 @@ def _sync_runtime_playback_health(
             ),
             default=None,
         )
-        if str(entry.get("status") or "").lower() == "dead":
+        if str(entry.get("status") or "").lower() == "dead" or _content_recovery_required(previous):
             continue
         if latest_health_observation is not None and latest_health_observation >= observed_at:
             continue
@@ -1694,6 +1728,8 @@ def _sync_runtime_playback_evidence(
         current_hash = analyzer._stream_url_hash(str(item.get("url") or ""))
         previous = cache.get(key)
         entry = dict(previous) if isinstance(previous, Mapping) and str(previous.get("url_hash") or "") == current_hash else {}
+        if _content_recovery_required(previous):
+            entry['content_recovery_required'] = True
         changed = False
 
         clean_at = _parse_datetime(telemetry.get("last_clean_playback_at"))
@@ -1827,6 +1863,8 @@ def _merge_media_result(
     previous_url_hash = str(merged.get("url_hash") or "")
     previous_provider = merged.get("m3u_account_id")
     merged.update(dict(result))
+    if _content_recovery_required(previous) or 'content_recovery_required' in (previous or {}):
+        merged['content_recovery_required'] = _content_recovery_required(previous)
     checked = result.get("tested_at") or analyzer._utc_now_iso()
     merged["health_checked_at"] = checked
     merged["media_checked_at"] = checked
@@ -1953,7 +1991,14 @@ def _merge_content_result(
     analysis_reason: str | None = None,
     history_previous_status: str | None = None,
 ) -> dict[str, Any]:
+    result = _hold_content_recovery(previous, result)
     merged = dict(previous or {})
+    recovery_required = _content_recovery_required(previous)
+    if result.get('status') == 'dead':
+        recovery_required = True
+    elif _successful_content_validation(result):
+        recovery_required = False
+    merged['content_recovery_required'] = recovery_required
     previous_status = str(
         history_previous_status
         if history_previous_status is not None
@@ -1969,7 +2014,7 @@ def _merge_content_result(
     merged["tested_at"] = checked
     merged["health_source"] = "stream_sort_content"
     merged["content_validation_separated"] = True
-    if content.get("measured"):
+    if content.get("measured") and not (recovery_required and content.get("skipped")):
         merged["content_checked_at"] = checked
         merged["content_source"] = "stream_sort_content"
         merged["content_m3u_account_id"] = item.get("account_id")
@@ -2189,6 +2234,10 @@ def analyze_assigned_streams(
     store = run.store if run else None
     cache = store.load(items) if store else analyzer.load_analysis_cache(cache_path)
     storage_start = copy.deepcopy(cache) if store else None
+    for item in items:
+        entry = cache.get(str(item['id']))
+        if _content_recovery_required(entry):
+            entry['content_recovery_required'] = True
 
     def playback_snapshot(selected):
         return store.playback([item['id'] for item in selected]) if store else load_reliability_cache(RELIABILITY_PATH)
@@ -2245,10 +2294,6 @@ def analyze_assigned_streams(
         int(item["id"]): str((cache.get(str(item["id"])) or {}).get("status") or "unknown").lower()
         for item in items
     }
-    scan_start_health_source_by_id = {
-        int(item['id']): (cache.get(str(item['id'])) or {}).get('health_source')
-        for item in items
-    }
     known_placeholder_ids = {
         int(item["id"])
         for item in items
@@ -2284,12 +2329,10 @@ def analyze_assigned_streams(
                 ttl_jitter_percent=analysis_ttl_jitter_percent,
                 now=now,
             )
+        if _content_recovery_required(entry):
+            required_content_recovery_ids.add(sid)
         if content_reason:
             content_reason_by_id[sid] = content_reason
-            if (str((entry or {}).get('status') or '').lower() == 'dead'
-                    and ((entry or {}).get('health_source') == 'stream_sort_content'
-                         or (entry or {}).get('error_type') in {'black_screen', 'frozen_video', 'silent_audio', 'content_sample_incomplete'})):
-                required_content_recovery_ids.add(sid)
         if reason:
             media_due.append((item, reason))
 
@@ -3362,16 +3405,22 @@ def analyze_assigned_streams(
         canceled = analysis_cancel_requested()
 
     canceled = canceled or analysis_cancel_requested()
-    if store:
-        for sid in media_results:
-            result = content_results.get(sid) or media_results[sid]
-            content = (result.get('details') or {}).get('content') or {}
-            recovery_incomplete = (sid in required_content_recovery_ids or sid in placeholder_recovered_ids) and not content.get('measured')
-            canceled_content = canceled and scan_start_status_by_id.get(sid) == 'dead' and sid in content_reason_by_id and sid not in content_results
-            if (recovery_incomplete or canceled_content) and result.get('status') == 'alive':
-                original = terminal_base.get(str(sid)) or {}
-                result.update({'status': 'dead', 'error_type': original.get('error_type'),
-                               'error': original.get('error', ''), 'retry_pending': True})
+    for sid in set(media_results) | set(content_results):
+        result = content_results.get(sid) or media_results[sid]
+        previous = ((terminal_base if store else cache).get(str(sid)) or {})
+        held = _hold_content_recovery(previous, result)
+        # Preserve the existing PostgreSQL placeholder/cancellation guard too.
+        content = (held.get('details') or {}).get('content') or {}
+        placeholder_incomplete = store and sid in placeholder_recovered_ids and not content.get('measured')
+        canceled_content = store and canceled and scan_start_status_by_id.get(sid) == 'dead' and sid in content_reason_by_id and sid not in content_results
+        if (placeholder_incomplete or canceled_content) and held.get('status') == 'alive':
+            held = dict(held)
+            held.update({'status': 'dead', 'error_type': previous.get('error_type'),
+                         'error': previous.get('error', ''), 'retry_pending': True})
+        if sid in content_results:
+            content_results[sid] = held
+        else:
+            media_results[sid] = held
     terminal_result_ids = set(media_results) | set(content_results)
     for sid in terminal_result_ids:
         result = effective_result(sid)
@@ -3419,10 +3468,6 @@ def analyze_assigned_streams(
             record_history=sid not in content_results,
             history_previous_status=scan_start_status_by_id.get(sid, "unknown"),
         )
-        if store and sid in required_content_recovery_ids and media_results[sid].get('retry_pending'):
-            # Metadata-only completion has not replaced the terminal content
-            # failure. Preserve its ownership for the next recovery attempt.
-            cache[str(sid)]['health_source'] = scan_start_health_source_by_id.get(sid) or 'stream_sort_content'
 
     for sid, result in content_results.items():
         item = item_by_id[sid]

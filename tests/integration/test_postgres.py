@@ -530,3 +530,42 @@ def test_scope_freshness_requires_successful_superset_scan_not_overlap_or_cancel
     result = plugin._run_ttl_recommendation_action({'storage_backend': 'postgresql'})
     assert result['status'] == 'error'
     assert 'older than seven days' in result['message']
+
+
+def test_content_recovery_obligation_survives_terminal_media_failure_and_phase_roundtrips(store):
+    from stream_sorter import analyzer, incremental
+    item = {'id': 42, 'account_id': 7, 'url': 'http://example.test/source'}
+    checked = (datetime.now(timezone.utc) - timedelta(hours=2)).isoformat()
+    legacy = {'status': 'dead', 'error_type': 'black_screen', 'health_source': 'stream_sort_content',
+              'content_checked_at': checked, 'content_m3u_account_id': 7,
+              'url_hash': analyzer._stream_url_hash(item['url']), 'm3u_account_id': 7}
+    timeout = {'status': 'dead', 'error_type': 'timeout', 'retry_pending': False,
+               'tested_at': NOW, 'stats': {}, 'details': {}}
+    failed = incremental._merge_media_result(item, legacy, timeout)
+    store.acquire('media-failed')
+    store.flush({'42': failed}, 'media-failed', terminal=True)
+    store.release('media-failed')
+    previous = store.load([ITEM])['42']
+    assert previous['error_type'] == 'timeout' and previous['health_source'] == 'stream_sort_analyzer'
+    assert previous['content_recovery_required'] is True and previous['retry_pending'] is False
+    alive = {'status': 'alive', 'error_type': None, 'tested_at': NOW, 'stats': {}, 'details': {}}
+    store.acquire('content-incomplete')
+    component = incremental._merge_media_result(item, previous, alive, record_history=False)
+    store.flush({'42': component}, 'content-incomplete')
+    own = store.load([ITEM], owner='content-incomplete')['42']
+    assert own['status'] == 'alive' and own['content_recovery_required'] is True
+    assert store.load([ITEM])['42']['status'] == 'dead'
+    unmeasured = {**alive, 'details': {'content': {'measured': False}}}
+    incomplete = incremental._merge_content_result(item, own, unmeasured, history_previous_status='dead')
+    store.flush({'42': incomplete}, 'content-incomplete', terminal=True)
+    store.release('content-incomplete')
+    persisted = store.load([ITEM])['42']
+    assert persisted['status'] == 'dead' and persisted['content_recovery_required'] is True
+    assert persisted['content_checked_at'] == checked
+    passed = {**alive, 'details': {'content': {'measured': True, 'skipped': False, 'black': False}}}
+    recovered = incremental._merge_content_result(item, persisted, passed, history_previous_status='dead')
+    store.acquire('content-passed')
+    store.flush({'42': recovered}, 'content-passed', terminal=True)
+    store.release('content-passed')
+    final = store.load([ITEM])['42']
+    assert final['status'] == 'alive' and final['content_recovery_required'] is False

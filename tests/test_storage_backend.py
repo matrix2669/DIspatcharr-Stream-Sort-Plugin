@@ -493,7 +493,7 @@ def test_confirmed_content_recovery_survives_pg_requery_and_requires_completion(
     assert check.call_count == (0 if outcome == 'deferred' else 1)
     if outcome != 'negative':
         assert entry['retry_pending'] is True
-        assert entry['health_source'] == 'stream_sort_content'
+        assert entry['content_recovery_required'] is True
         assert entry['content_checked_at'] == old
         assert entry['health_check_history'][0]['terminal'] is False
 
