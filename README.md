@@ -240,6 +240,8 @@ Pruning is explicit and removes at most 1,000 expired rows from each of seven ta
 
 Schema initialization, legacy import and retention are explicit actions. Schema operations never run during plugin import, and removing the plugin does not automatically delete its tables. Original JSON files remain available during migration verification; older plugin versions cannot read the new database state. Do not downgrade or switch back to an older file snapshot without a deliberate recovery plan.
 
+For an approved migration rehearsal, disable the schedule and ensure no scan is active, verify backups, initialize/upgrade storage, import legacy statistics and compare the reported counts before selecting PostgreSQL. Start with a controlled scope and capture reuse disabled. Validate the provider's reusable-capture path separately before enabling it, then restore the schedule after the results and cancellation behavior are accepted. This source checkpoint does not perform those operational steps automatically.
+
 Capture reuse uses bounded RAM samples for streams needing multiple checks. `capture_max_mib` starts at 32 MiB per worker and accepts 1–64 MiB. Metadata-only and known-placeholder checks retain their lightweight direct probes. Live bytes and acquisition time measure throughput; local sample reads do not. Unsupported or incomplete reusable samples require a normal capacity-reserved fallback, and incomplete checks never refresh their TTLs. Controlled-fixture results do not establish compatibility with every provider or protocol.
 
 - `/data/dispatcharr_stream_sort_analysis.json`: unified current analysis and throughput state.

@@ -25,9 +25,12 @@ This repository owns the Dispatcharr Stream Sort plugin. The plugin analyzes str
 - `stream_sorter/reliability.py` stores URL-attributed playback evidence and produces conservative, decayed reliability scores.
 - `stream_sorter/scoring.py` and `stream_sorter/sorter.py` calculate ordering and apply only the selected channel scope.
 - `stream_sorter/throughput.py` measures delivery capacity and maintains compatibility with the legacy throughput cache.
+- `stream_sorter/storage.py` owns the opt-in PostgreSQL adapter, explicit schema versions, run fencing, phase/current/history records, playback isolation and database-backed reports/sorting evidence.
+- `stream_sorter/storage_import.py` owns resumable legacy JSON import; retain source files and never overwrite newer playback rows with imported snapshots.
+- `stream_sorter/capture_worker.py` is a stdlib acquisition child supervised by a total parent deadline and cancellation; keep URLs/headers off process arguments and error output, and kill/reap it before releasing provider capacity.
 - `stream_sorter/plugin.json` is the runtime plugin manifest. Its version must match `pyproject.toml` and `VERSION`.
 
-Runtime state belongs under `/data`:
+JSON-mode runtime state belongs under `/data`; PostgreSQL mode uses plugin-owned tables through Django's existing connection and explicit initialization:
 
 - `dispatcharr_stream_sort_analysis.json` — unified analysis and throughput cache;
 - `dispatcharr_stream_sort_reliability.json` — runtime reliability history;
@@ -98,6 +101,7 @@ Behavior affecting provider connections also requires controlled Dispatcharr int
 - In JSON mode accumulate scan imports and observations in RAM until the completion/cooperative-cancellation save. PostgreSQL mode follows ADR-024's bounded phase transactions and targeted re-query; do not add per-stream whole-cache or whole-history rewrites.
 - Keep individual system log entries. Persist UI progress no more often than every ten seconds within an unchanged phase, immediately on phase changes, and always publish terminal job status.
 - PostgreSQL implementation follows ADR-024 and must remain explicitly initialized/selected behind its validation gates. Do not register dynamic Django applications, run global migrations, create tables during module import, or mutate Dispatcharr-owned schemas to enable it. Phase component persistence cannot publish provisional aggregate health as terminal; fence every scan batch and separate playback field ownership.
+- Preserve `content_recovery_required` through all media results, imports and phase re-queries. Exhausted metadata failures must not erase an earlier content failure. Only successful measured non-skipped applicable content recovery clears the obligation; metadata/playback, skipped or unmeasured evidence cannot promote it to alive.
 
 - Scheduled analysis state is `/data/dispatcharr_stream_sort_schedule_state.json`; configuration is versioned, every due minute is atomically claimed through Django cache, and every run loads current `PluginConfig.settings`.
 - Every long-lived scheduler cycle that can use the ORM must call `close_old_connections()` before and after work.
