@@ -2147,7 +2147,6 @@ def analyze_assigned_streams(
             min_throughput_playback_seconds=playback_health_min_seconds,
         )
         if playback_health_refreshed:
-            analyzer.save_analysis_cache(cache, cache_path)
             logger.info(
                 "[Analyze] Imported Dispatcharr playback content/throughput evidence for %d streams",
                 playback_health_refreshed,
@@ -2155,7 +2154,6 @@ def analyze_assigned_streams(
 
     migrated = _migrate_legacy_throughput(items, cache)
     if migrated:
-        analyzer.save_analysis_cache(cache, cache_path)
         logger.info("[Analyze] Migrated %d matching legacy throughput measurements into the unified cache", migrated)
 
     dispatcharr_metadata_refreshed, dispatcharr_metadata_changed_ids = _sync_dispatcharr_metadata(
@@ -2164,7 +2162,6 @@ def analyze_assigned_streams(
         media_bitrate_relative_tolerance=media_bitrate_relative_tolerance,
     )
     if dispatcharr_metadata_refreshed:
-        analyzer.save_analysis_cache(cache, cache_path)
         logger.info("[Analyze] Refreshed basic metadata for %d streams from newer Dispatcharr stream_stats", dispatcharr_metadata_refreshed)
 
     scan_start_status_by_id = {

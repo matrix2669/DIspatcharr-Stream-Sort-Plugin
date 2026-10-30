@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+### Changed
+
+- Buffer startup analysis imports until the existing final checkpoint, avoiding repeated full-history rewrites while preserving completed work on cooperative cancellation.
+- Throttle persistent UI progress to ten seconds within a phase while retaining immediate phase/final status and all individual system log entries.
+
+### Documentation
+
+- Evaluate PostgreSQL table ownership, migration lifecycle, batched observations, fenced run leases, concurrent playback writes, and a shared-memory media capture experiment in ADR-023. Database migration and provider-connection changes remain pending evaluation and acceptance.
+
 ## 0.3.7-beta.1 - 2026-09-02
 
 ### Added

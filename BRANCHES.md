@@ -10,12 +10,22 @@ Before deleting a branch, record user-visible results in `CHANGELOG.md` and dura
 |---|---|---|---|---|---|
 | `main` | long-lived | active | historical repository root | approved stable releases | Reserved stable-release branch; currently carries the released `0.3.6` baseline. |
 | `dev` | long-lived | active | `main` | `main` | Integrates and validates the next beta and stable release. |
+| `feature/storage-efficiency-review` | short-lived | active | `dev` at `8d3afff` | `dev` | Reduce avoidable persistence and evaluate PostgreSQL storage and shared captures. |
 | `feature/analysis-telemetry-retention` | short-lived | integrated | `dev` | `dev` | Retain direct throughput/media-change evidence and applied-sort movement history. |
 | `feature/issue-7-settings-controls` | short-lived | active | `dev` | `dev` | Simplify settings/action layout, bound M3U scores, and add comma-separated name rules. |
 | `fix/v0.3.6-beta.6-analysis-control` | short-lived | active | `dev` | `dev` | Prevent overlapping analysis entry points, add safe cancellation, and publish immutable beta.6. |
 | `fix/v0.3.6-beta.10-telemetry-integrity` | short-lived | active | `dev` | `dev` | Preserve scan-boundary health transitions and distinguish attempted throughput probes from completed measurements. |
 
 ## Branch Records
+
+### `feature/storage-efficiency-review`
+
+- Base: `dev` at `8d3afff3bdd0bc0dbc780f211065d81f4da75149`.
+- Scope: ten-second UI status persistence, RAM accumulation of startup imports, tests, standards reconciliation, and PostgreSQL/shared-capture design evaluation under ADR-023.
+- Ownership: one bounded implementation worker owns plugin/incremental changes and focused tests; coordinator owns documentation and integration; independent review follows completed implementation.
+- Delivery: isolated checkpoint only; no schema initialization, live migration, provider-policy change, deployment, tag, registry update, or integration authorized by this phase.
+- Acceptance: focused and full test suites, compilation, documentation checks, standards reconciliation, finished independent review, exact remote checkpoint. Database permissions, migration/backup behavior, crash-fencing tests, and capture equivalence remain future acceptance work.
+- Validation: 74 focused/status/control tests and the 171-test full suite pass; warning-as-error compilation, diff checks, project validation and standards reconciliation pass. Independent review and exact-commit GitHub CI remain pending at this checkpoint.
 
 ### `feature/analysis-telemetry-retention`
 

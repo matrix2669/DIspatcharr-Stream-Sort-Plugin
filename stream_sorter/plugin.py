@@ -382,10 +382,13 @@ def _update_status(job_id: str, **changes) -> None:
 
 
 class _ProgressLogger:
-    """Mirror analysis logs while persisting progress for the status action."""
+    """Mirror every log, limiting status writes to phase changes or ten seconds."""
 
     def __init__(self, job_id: str):
         self.job_id = job_id
+        self._last_phase = None
+        self._last_persisted_at = None
+        self._progress_lock = threading.Lock()
 
     def __getattr__(self, name):
         return getattr(LOGGER, name)
@@ -412,13 +415,24 @@ class _ProgressLogger:
                 return
             match = re.search(r"\]\s+(\d+)%\s+\((\d+)/(\d+)\)", text)
             if match:
-                _update_status(
-                    self.job_id,
-                    phase=phase,
-                    progress_percent=int(match.group(1)),
-                    progress_completed=int(match.group(2)),
-                    progress_total=int(match.group(3)),
-                )
+                with self._progress_lock:
+                    now = time.monotonic()
+                    if (
+                        phase == self._last_phase
+                        and self._last_persisted_at is not None
+                        and now - self._last_persisted_at < 10.0
+                    ):
+                        return
+                    # Also throttle failed persistence attempts; logs always continue.
+                    self._last_phase = phase
+                    self._last_persisted_at = now
+                    _update_status(
+                        self.job_id,
+                        phase=phase,
+                        progress_percent=int(match.group(1)),
+                        progress_completed=int(match.group(2)),
+                        progress_total=int(match.group(3)),
+                    )
         except Exception:
             # Status persistence must never interrupt the analyzer.
             pass

@@ -837,3 +837,60 @@ The same review confirmed that known-placeholder probes average about 2.51 secon
 
 - Operator review of six days of scheduled Stream Sort evidence on 2026-09-02.
 - Operator clarification that 500 Kbps is the bitrate floor and 30 percent is the media-change trigger.
+
+---
+
+# ADR-023: Reduce Ceph writes and evaluate PostgreSQL persistence before migration
+
+## Status
+
+Accepted for bounded JSON write reductions and evaluation requirements. PostgreSQL backend, schema initialization, run-lease replacement, metadata bulk updates, and shared-capture implementation are proposed pending the compatibility and equivalence gates below.
+
+## Date and provenance
+
+2026-10-30. Operator accepted RAM accumulation, completion/cancellation persistence, ten-second UI updates plus phase/completion changes, incremental history, metadata batching evaluation, and shared-capture evaluation. Operator explicitly required PostgreSQL ownership/migration review before implementation. This supplements ADR-008/009/022; it does not yet supersede their installed storage or execution backend.
+
+## Findings
+
+The installed plugin keeps working scan results in memory but can rewrite the complete analysis JSON three times during initial evidence imports and again at completion. The retained analysis file was approximately 233 MB, the sort file 47 MB, and reliability file 1.4 MB. Progress persists on individual result logs and reliability rewrites on events. Combined content/throughput samples already use /dev/shm/stream-sorter when writable. FFprobe still opens the provider independently. File sizes and logical writes are not physical Ceph IOPS measurements or proof of database-outage causation.
+
+Installed Dispatcharr image sha256:96bc548978c68e684677da7895692eeeefb7f0b2edfa38311dac2b702c61d236 imports plugin modules through apps/plugins/loader.py and constructs Plugin instances. Its plugin app post_migrate hook discovers plugins; archive migrations are not installed Django app migrations. Review covered loader.py, apps.py, models.py, plugin API installation/deletion, and INSTALLED_APPS. Existing role DDL privileges and backup coverage have not been tested.
+
+## Accepted immediate behavior
+
+- Keep network-phase results and startup imports in RAM; remove redundant initial whole-analysis saves. Persist completed results through the existing final path, including cooperative cancellation. Abrupt process/power failure may lose uncommitted current-run observations; preserve the prior completed snapshot.
+- Keep all per-stream system logs. Persist UI progress every ten seconds at most within a phase, immediately on phase transitions, and publish final job status immediately. This is UI status throttling, not system-log suppression.
+- Continue existing atomic JSON replacement and provider/cancellation semantics until a replacement backend has passed migration and crash tests. Do not introduce timed full-history checkpoint writes merely to buffer data already in RAM.
+
+## Proposed PostgreSQL design
+
+- Reuse Django's configured PostgreSQL connection; do not introduce a second database server, separate credential files, global INSTALLED_APPS edits, or changes to Dispatcharr-owned table schemas. PostgreSQL still writes WAL/data on Ceph; improvement must be measured, not described as disk-free storage.
+- Own a namespaced set of tables: schema version, scan run/lease, stream component current state, health/throughput observations, playback events/current reliability, sort runs/movements, and daily rollups. Stream/provider identity remains authoritative; no credential-bearing URL in observations. Separate component timestamps and field ownership explicitly.
+- Query selected stream/provider records at scan start, operate in RAM, and flush bounded batches at phase boundaries, completion, and cooperative cancellation. Use incremental historical inserts with unique event/run identifiers for idempotence. Do not serialize the entire history into a JSONB row.
+- Use short transactions only around batch persistence and lease acquisition/renewal. Never hold a transaction, row lock, or migration lock while doing network probes or local media processing.
+- Lease ownership requires an unpredictable owner token, database-time expiry, and heartbeat. Every state/history commit must verify the current unexpired token atomically; stale owners must stop new probes and cannot commit or release another owner's lease. A paused process may resume after takeover; expiry alone is insufficient. Heartbeat intervals and expiry remain unset until worst-case probe deadlines and failover behavior are tested.
+- Connection loss releases transaction locks once PostgreSQL detects and closes the lost session; it is not instant process-death detection. On heartbeat loss fail closed for new provider work, release reservations when possible, and reconcile already-started probes without allowing a stale owner to write.
+- Scan flushes update scan-owned columns only. Playback writers insert attributed events and update their own reliability/component state with conditional freshness/version checks; a scan-start snapshot must never replace later playback events. Define conflicts for reused playback evidence and component freshness before implementation.
+- Core stream_stats updates may be batched only after preserving applicable model/signal semantics, confirmed terminal-health policy, and field-specific writes. Sorting keeps its existing batched order transaction.
+- Incremental retention deletes/rollups must be bounded and indexed by observation time and stream/provider identity, separate from scanning. Initial detailed retention remains 90 days and rollups 365 days; do not change expiry policy merely to change storage.
+
+## Required schema lifecycle before adoption
+
+- Operator selected evaluation of a plugin-owned versioned migration runner on 2026-10-30; upstream migration support is not a prerequisite for that evaluation. Current installed loader provides no native facility. Do not execute DDL on import or every worker startup. This selection authorizes evaluation/prototyping, not production schema migration.
+- If plugin-owned runner is accepted, provide explicit serialized initialization/upgrade with version ledger, transactional migrations where supported, bounded lock and statement timeouts, and idempotent multi-worker startup checks. Ordinary scans reject unavailable or incompatible schema with a clear message.
+- Prove least-required DDL privileges using a disposable database, not production schema writes. Confirm host backup/restore includes plugin tables. Keep tables by default on plugin removal; deletion requires an explicit reset/purge decision. Reset actions retain their existing scan-only versus all-history distinctions.
+- Migrate legacy files in bounded chunks with resumable checkpoints, deduplication, counts and identity checks. Keep original files until migration/restore validation. Define compatibility with older plugin versions and refuse unsupported downgrade rather than silently diverging file and database stores.
+- Test database outage, failed flush/retry, crash before/after commit, cancellation, lease takeover, delayed stale worker, simultaneous playback events, retention, partial migration/restart, upgrade/downgrade, and backup restoration. Measure batch bytes, transactions, WAL, latency, memory, and total scan runtime against baseline.
+
+## Shared-capture evaluation
+
+Retain fast direct probes for metadata-only and placeholder checks. When multiple checks are due, evaluate one wall-clock-bounded provider capture in RAM followed by local FFprobe and content analysis. Throughput comes from provider capture bytes/time, never local file-read speed. The existing MPEG-TS remux changes container/packet metadata and selects video/audio; it is not raw byte preservation. Compare original-source metadata, video bitrate/floor, FPS, resolution, timestamps, stream selection, placeholder detection, and content classification before adoption. Preserve native profile URL resolution, user agent, headers, viewer capacity, reservation release, retries and due-component TTL decisions. Incomplete or too-short samples cannot refresh completed-component TTLs. Measure required playable duration and capture memory bounds for low-throughput streams; avoid silently converting wall-clock sampling into media-duration sampling.
+
+## Delivery order
+
+1. Implement/review/test bounded write reductions and record this compatibility evaluation.
+2. Close schema-ownership choice, then implement a disposable PostgreSQL prototype with explicit concurrency/migration tests and measured I/O before selecting the backend.
+3. Compare shared-capture paths on controlled fixtures before authorizing live-provider tests or replacing probes.
+4. Resume telemetry corrections, transition audit, sorting-history replay/stability, event classification, dead-feed investigation, storage/scheduler monitoring, TTL interval analysis, and notification qualification in the previously accepted order. Those are tracked work, not delivered by the write-reduction phase.
+
+A shared-capture planner must account for FFprobe discovering a new media-change cause after initial due decisions. It must either retain a sufficient measured capture for newly due throughput/content or explicitly perform a capacity-reserved fallback check; it must never claim those components complete from metadata-only data. Controlled comparisons must report actual provider opens, received bytes, capture wall time, usable media duration, metadata/content equivalence, and peak memory. Keep immutable fixtures and all sample data outside the repository; do not store provider credentials in reports.

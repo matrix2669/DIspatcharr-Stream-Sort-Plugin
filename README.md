@@ -224,6 +224,10 @@ Separate `Probe Throughput` actions are no longer shown because throughput is pa
 
 ## Runtime files
 
+Analysis working results accumulate in RAM. Startup playback, legacy-throughput, and Dispatcharr metadata imports are included in the final cache save instead of immediately rewriting the complete analysis history. Completion and cooperative cancellation persist finished work. An abrupt process or machine failure can lose the current scan's uncommitted observations; the previous completed snapshot remains available.
+
+System logs retain individual stream progress. UI progress is persisted at most once every ten seconds within a phase, with immediate phase changes and final job status. Combined content/throughput captures continue to use writable shared memory when available. PostgreSQL storage and shared FFprobe/content captures are under evaluation; this change does not migrate runtime data or change provider connections.
+
 - `/data/dispatcharr_stream_sort_analysis.json`: unified current analysis and throughput state.
 - `/data/dispatcharr_stream_sort_status.json`: current or latest analysis status.
 - `/data/dispatcharr_stream_sort_schedule_state.json`: schedule claim state.
