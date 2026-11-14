@@ -91,3 +91,14 @@ Before cleanup, the legacy `dev-test`, checkpoint, and duplicate `noop-check` br
 - Validation: 159 source tests on the release tree and public archive, Python compilation, manifest parsing, standards reconciliation, project validation, byte-verified manual ZIP and checksum, registry workflows `33138596704` and `33138696338`, public raw manifests, and managed installations pass; the attached ZIP also passed a controlled Dispatcharr manual import as trusted loaded `0.3.6`, followed by successful restoration to managed stable repository 3
 - Completion: tag `v0.3.6` remains pinned to `bbae86f2ded0a1bcd09d2906e0530e70380ce5a4`; source `main` promotion is `d16af98828fa8428cccea73e7dda672f7998fe24`; GitHub Release, `dev` and `main` registry publication, and stable repository 3 deployment are complete
 - Started: `2026-08-27`
+
+### `fix/manual/reliability-bounded-lock`
+
+- Type: short-lived local fix branch
+- Base: `dev` at `8d3afff3bdd0bc0dbc780f211065d81f4da75149` (`0.3.7-beta.1`)
+- Target: `dev`, only after separate publication/integration approval
+- Scope: bounded reliability-cache locking, safe nested event callbacks, contention and reentrancy regression tests
+- Evidence: operator reports four uWSGI workers blocked and one process holding and waiting on the reliability lock; actual Python stack unavailable
+- Causal limit: ORM-triggered reentry is a hypothesis until reproduced locally; no claim that the production callback path was captured
+- Exclusions: live operations, provider connections, scoring changes, settings, registry/version publication and deployment
+- Status: local completed candidate; 177 tests, compilation, diff checks and independent Astra review pass; source publication explicitly unapproved

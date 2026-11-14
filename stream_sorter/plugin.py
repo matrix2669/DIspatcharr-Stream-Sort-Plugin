@@ -1527,7 +1527,14 @@ def _run_reset_statistics_action(*, include_history: bool) -> dict:
                 continue
 
         if include_history:
-            reset_reliability_cache(RELIABILITY_PATH)
+            try:
+                reliability_reset = reset_reliability_cache(RELIABILITY_PATH)
+            except Exception as exc:
+                return {"status": "error", "message": f"Scan data reset, but runtime history reset failed: {exc}",
+                        "removed_paths": removed, "reliability_reset": False}
+            if not reliability_reset:
+                return {"status": "error", "message": "Scan data reset; runtime history reset was queued and is not yet persisted.",
+                        "removed_paths": removed, "reliability_reset": False}
 
         scope = "scan data and all runtime history" if include_history else "scan data only"
         return {

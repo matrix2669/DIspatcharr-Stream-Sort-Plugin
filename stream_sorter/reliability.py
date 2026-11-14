@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 import os
 import tempfile
+import time
+from collections import deque
 import threading
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
@@ -34,7 +36,57 @@ TRACKED_EVENTS = {
     "channel_failover",
     "stream_switch",
 }
-_FALLBACK_LOCK = threading.Lock()
+LOCK_TIMEOUT_SECONDS = 0.25
+LOCK_RETRY_SECONDS = 0.005
+MAX_QUEUED_OPERATIONS = 256
+
+
+class ReliabilityLockBusy(RuntimeError):
+    """The cache could not be acquired within the contention budget."""
+
+
+class ReliabilityQueueFull(RuntimeError):
+    """A reentrant callback exceeded the transaction queue limit."""
+
+
+_registry_guard = threading.Lock()
+_path_locks: dict[str, threading.Lock] = {}
+_transactions = threading.local()
+_open_lock_handles: set[Any] = set()
+
+
+def _after_fork_child() -> None:
+    # Close inherited references, but never LOCK_UN: flock ownership is shared
+    # with the parent's open file description after fork.
+    global _registry_guard, _path_locks, _transactions, _open_lock_handles
+    for handle in _open_lock_handles:
+        try:
+            handle.close()
+        except OSError:
+            pass
+    _registry_guard = threading.Lock()
+    _path_locks = {}
+    _transactions = threading.local()
+    _open_lock_handles = set()
+
+
+if hasattr(os, "register_at_fork"):
+    os.register_at_fork(
+        before=lambda: _registry_guard.acquire(),
+        after_in_parent=lambda: _registry_guard.release(),
+        after_in_child=_after_fork_child,
+    )
+
+
+def _normalized_path(path: str) -> str:
+    return os.path.realpath(os.path.abspath(os.fspath(path)))
+
+
+def _active_transactions() -> dict[str, dict[str, Any]]:
+    if not hasattr(_transactions, "paths"):
+        _transactions.paths = {}
+    return _transactions.paths
+
 
 
 def _now_utc(now: datetime | None = None) -> datetime:
@@ -124,19 +176,84 @@ def _save_reliability_cache(data: Mapping[str, Any], path: str) -> None:
 
 @contextmanager
 def _locked_cache(path: str):
-    directory = os.path.dirname(path) or "."
-    os.makedirs(directory, exist_ok=True)
-    if fcntl is None:
-        with _FALLBACK_LOCK:
-            yield
-        return
-    lock_path = f"{path}.lock"
-    with open(lock_path, "a+", encoding="utf-8") as handle:
-        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+    """Acquire thread and process locks against one monotonic deadline.
+
+    This budget does not bound a lock owner's resolver or filesystem work.
+    """
+    owner_pid = os.getpid()
+    deadline = time.monotonic() + LOCK_TIMEOUT_SECONDS
+    with _registry_guard:
+        local_lock = _path_locks.setdefault(path, threading.Lock())
+    if not local_lock.acquire(timeout=max(0.0, deadline - time.monotonic())):
+        raise ReliabilityLockBusy("reliability cache lock timed out")
+    handle = None
+    locked = False
+    try:
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        if fcntl is not None:
+            with _registry_guard:
+                handle = open(f"{path}.lock", "a+", encoding="utf-8")
+                _open_lock_handles.add(handle)
+            while True:
+                try:
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    locked = True
+                    break
+                except BlockingIOError:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise ReliabilityLockBusy("reliability cache lock timed out")
+                    time.sleep(min(LOCK_RETRY_SECONDS, remaining))
+        yield
+    finally:
+        if os.getpid() == owner_pid:
+            try:
+                if handle is not None:
+                    try:
+                        if locked:
+                            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+                    finally:
+                        with _registry_guard:
+                            _open_lock_handles.discard(handle)
+                            handle.close()
+            finally:
+                local_lock.release()
+
+
+def _run_transaction(path: str, operation: Callable[[dict[str, Any]], Any]) -> tuple[bool, Any]:
+    normalized = _normalized_path(path)
+    active = _active_transactions()
+    transaction = active.get(normalized)
+    if transaction is not None:
+        if transaction["queued_count"] >= MAX_QUEUED_OPERATIONS:
+            transaction["failed"] = True
+            raise ReliabilityQueueFull("reliability transaction queue is full")
+        transaction["queue"].append(operation)
+        transaction["queued_count"] += 1
+        return False, None
+    owner_pid = os.getpid()
+    with _locked_cache(normalized):
+        transaction = {"queue": deque(), "failed": False, "queued_count": 0}
+        active[normalized] = transaction
         try:
-            yield
+            data = load_reliability_cache(normalized)
+            result = operation(data)
+            if os.getpid() != owner_pid:
+                raise RuntimeError("inherited reliability transaction cannot commit after fork")
+            changed = not (isinstance(result, dict) and result.get("_cache_unchanged"))
+            while transaction["queue"]:
+                queued_result = transaction["queue"].popleft()(data)
+                if os.getpid() != owner_pid:
+                    raise RuntimeError("inherited reliability transaction cannot commit after fork")
+                changed |= not (isinstance(queued_result, dict) and queued_result.get("_cache_unchanged"))
+            if transaction["failed"]:
+                raise ReliabilityQueueFull("reliability transaction queue overflowed")
+            if changed:
+                _save_reliability_cache(data, normalized)
+            return True, result
         finally:
-            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            if os.getpid() == owner_pid:
+                del active[normalized]
 
 
 def _default_stream_resolver(stream_id: int | None, payload: Mapping[str, Any]) -> dict[str, Any] | None:
@@ -178,6 +295,8 @@ def _resolve_stream(
 ) -> dict[str, Any] | None:
     try:
         resolved = resolver(stream_id, payload)
+    except (ReliabilityLockBusy, ReliabilityQueueFull):
+        raise
     except Exception:
         resolved = None
     if isinstance(resolved, Mapping) and _as_int(resolved.get("stream_id")) is not None:
@@ -353,10 +472,14 @@ def _switch_context(channel_state: Mapping[str, Any], now: datetime) -> tuple[in
     )
 
 
-def reset_reliability_cache(path: str = RELIABILITY_PATH) -> None:
-    """Clear runtime history without racing the event-driven collector."""
-    with _locked_cache(path):
-        _save_reliability_cache(_empty_cache(), path)
+def reset_reliability_cache(path: str = RELIABILITY_PATH) -> bool:
+    """Clear history; return False if queued in a reentrant transaction."""
+    def clear(data: dict[str, Any]) -> None:
+        data.clear()
+        data.update(_empty_cache())
+
+    committed, _ = _run_transaction(path, clear)
+    return committed
 
 
 def record_runtime_event(
@@ -387,13 +510,16 @@ def record_runtime_event(
     event_counted = True
     event_classification: str | None = None
 
-    with _locked_cache(path):
-        data = load_reliability_cache(path)
+    def apply_event(data: dict[str, Any]) -> dict[str, Any]:
+        recorded_stream_id: int | None = None
+        event_counted = True
+        event_classification: str | None = None
         key = _channel_key(data, payload_dict)
         if key is None:
             return {
                 "status": "ok",
                 "message": f"Ignored {event}: event payload did not identify a channel.",
+                "_cache_unchanged": True,
                 "recorded": False,
                 "counted": False,
                 "classification": None,
@@ -618,8 +744,27 @@ def record_runtime_event(
         channel_state["updated_at"] = now_iso
         data["updated_at"] = now_iso
         data["scoring_enabled"] = True
-        _save_reliability_cache(data, path)
+        if recorded_stream_id is None:
+            event_counted = False
+        return {"stream_id": recorded_stream_id, "counted": event_counted,
+                "classification": event_classification}
 
+    try:
+        committed, result = _run_transaction(path, apply_event)
+    except ReliabilityLockBusy:
+        return {"status": "busy", "message": "Runtime reliability cache is busy; event was not recorded.",
+                "event": event, "recorded": False, "counted": False,
+                "classification": None, "scoring_applied": False, "path": path}
+    if not committed:
+        return {"status": "queued", "message": "Runtime reliability event queued; not yet persisted.",
+                "event": event, "recorded": False, "counted": False,
+                "classification": None, "scoring_applied": False, "path": path}
+    if "stream_id" not in result:
+        result.pop("_cache_unchanged", None)
+        return result
+    recorded_stream_id = result["stream_id"]
+    event_counted = result["counted"]
+    event_classification = result["classification"]
     if recorded_stream_id is None:
         event_counted = False
     if logger is not None:

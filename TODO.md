@@ -1,5 +1,7 @@
 # Stream Sort TODO
 
+- [ ] Obtain approval to publish the independently reviewed reliability-lock fix, run exact-commit CI, and prepare a separately approved beta. Local validation: 177 tests pass; no live change.
+
 - [ ] Add a Dispatcharr-supported playback exclusion mechanism if core exposes one; keep current dead-stream handling report-only and non-destructive.
 - [ ] Simplify the settings UI and scoring, possibly using select boxes with values from -5 to +5.
 - [ ] Add multi-line input boxes for prefix rules.

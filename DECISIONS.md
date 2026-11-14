@@ -837,3 +837,10 @@ The same review confirmed that known-placeholder probes average about 2.51 secon
 
 - Operator review of six days of scheduled Stream Sort evidence on 2026-09-02.
 - Operator clarification that 500 Kbps is the bitrate floor and 30 percent is the media-change trigger.
+
+
+# Reliability transaction correction — 2026-11-14
+
+Keep runtime attribution and scoring unchanged. Serialize cache updates using one normalized-path transaction and an ordered bounded queue for same-thread nested events/resets. Nested receipts mean queued, not persisted. This avoids both self-flock deadlock and stale outer snapshots overwriting inner writes. Use one 250 ms acquisition deadline across thread and process contention; busy events are explicitly not recorded, and reset failures must not claim success. The deadline does not bound owner ORM or filesystem work. Reject inherited transaction commits after fork and close inherited handles without unlocking the parent. Preserve cache bytes for ignored operations.
+
+The production self-wait was reported by the operator; the exact Python stack was not captured. Resolver callback reentry and an RLock-only lost update were reproduced locally, establishing reachable defects without claiming the unobserved production chain. The 256-operation queue aborts on overflow rather than silently discarding updates. Publication/deployment remain separately approved actions.

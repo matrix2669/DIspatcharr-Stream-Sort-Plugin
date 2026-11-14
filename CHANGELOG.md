@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Bound reliability-cache contention and safely queue nested runtime events/resets without losing updates. Preserve ignored-event files and parent lock ownership across forks. Report busy events and partial reset failures truthfully. Local candidate only; not published or deployed.
+
 ## 0.3.7-beta.1 - 2026-09-02
 
 ### Added
