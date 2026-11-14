@@ -101,4 +101,4 @@ Before cleanup, the legacy `dev-test`, checkpoint, and duplicate `noop-check` br
 - Evidence: operator reports four uWSGI workers blocked and one process holding and waiting on the reliability lock; actual Python stack unavailable
 - Causal limit: ORM-triggered reentry is a hypothesis until reproduced locally; no claim that the production callback path was captured
 - Exclusions: live operations, provider connections, scoring changes, settings, registry/version publication and deployment
-- Status: local completed candidate; 177 tests, compilation, diff checks and independent Astra review pass; source publication explicitly unapproved
+- Status: local completed candidate; 177 tests, compilation, diff checks and independent Astra review pass; publication/dev integration and deployment approved by operator on 2026-11-14; beta.2 exact-commit CI pending
