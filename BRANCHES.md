@@ -8,6 +8,7 @@ Before deleting a branch, record user-visible results in `CHANGELOG.md` and dura
 
 | Branch | Type | Status | Base | Target | Purpose |
 |---|---|---|---|---|---|
+| `release/v0.3.7` | release | local candidate | `dev` at `c29b9fa` | `dev` / `main` | Prepare stable version and display branding; publication and live validation remain pending. |
 | `main` | long-lived | active | historical repository root | approved stable releases | Reserved stable-release branch; currently carries the released `0.3.6` baseline. |
 | `dev` | long-lived | active | `main` | `main` | Integrates and validates the next beta and stable release. |
 | `feature/analysis-telemetry-retention` | short-lived | integrated | `dev` | `dev` | Retain direct throughput/media-change evidence and applied-sort movement history. |
@@ -102,3 +103,9 @@ Before cleanup, the legacy `dev-test`, checkpoint, and duplicate `noop-check` br
 - Causal limit: ORM-triggered reentry is a hypothesis until reproduced locally; no claim that the production callback path was captured
 - Exclusions: live operations, provider connections, scoring changes, settings, registry/version publication and deployment
 - Status: local completed candidate; 177 tests, compilation, diff checks and independent Astra review pass; publication/dev integration and deployment approved by operator on 2026-11-14; beta.2 exact-commit CI pending
+
+### `release/v0.3.7`
+
+- Base: source `dev` at `c29b9fa`; `main` is an ancestor.
+- Scope: stable version metadata, display-name change, compatibility statement, and current workspace standards reconciliation. Preserve package/registry identity and settings.
+- Validation: full local Python test suite and compilation pass; the dated test fixture was refreshed to use the real clock for retention. Release CI, exact registry archive, and Dispatcharr install/update validation are pending. No tag, remote push, registry change, Release, or live installation has occurred in this preparation.

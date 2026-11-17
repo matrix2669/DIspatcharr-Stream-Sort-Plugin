@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+## 0.3.7 - 2026-11-17
+
+- Rename the displayed plugin to Stream Sort without changing its package or saved-setting identity.
+- Include the telemetry retention and reliability locking fixes from 0.3.7 beta.1 and beta.2 below.
+- Support Dispatcharr 0.33 and 0.34 in this release; future changes target 0.34 and later.
+
 ## 0.3.7-beta.2 - 2026-11-14
 
 - Bound reliability-cache contention and safely queue nested runtime events/resets without losing updates. Preserve ignored-event files and parent lock ownership across forks. Report busy events and partial reset failures truthfully.

@@ -794,7 +794,8 @@ def test_nonhealthy_throughput_uses_status_specific_jittered_ttls():
 def test_provider_attributed_playback_reuses_profiles_but_not_other_providers():
     from stream_sorter import incremental
 
-    now = _now()
+    # Retention is evaluated against the real clock; use a fresh observation.
+    now = datetime.now(timezone.utc)
     item = {
         "id": 42,
         "name": "Example",

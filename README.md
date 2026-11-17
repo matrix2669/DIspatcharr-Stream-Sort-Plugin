@@ -1,6 +1,8 @@
-# Dispatcharr Stream Sort Plugin
+# Stream Sort Plugin
 
-Dispatcharr Stream Sort analyzes the streams already attached to Dispatcharr channels, scores them, and updates only `ChannelStream.order` when sorting is explicitly requested. It does not match/create/delete streams or channels, rename channels, or change EPG/group assignments.
+Stream Sort analyzes the streams already attached to Dispatcharr channels, scores them, and updates only `ChannelStream.order` when sorting is explicitly requested. It does not match/create/delete streams or channels, rename channels, or change EPG/group assignments.
+
+**Compatibility:** This release supports Dispatcharr 0.33 and 0.34. Future changes target Dispatcharr 0.34 and later. The package identity and saved settings are unchanged by the display-name update.
 
 ## Built-in incremental checker
 

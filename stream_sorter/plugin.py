@@ -606,7 +606,7 @@ def _notify(message: str) -> None:
         send_websocket_update(
             "updates",
             "update",
-            {"type": "plugin", "plugin": "Dispatcharr Stream Sort", "message": message},
+            {"type": "plugin", "plugin": "Stream Sort", "message": message},
         )
     except Exception:
         pass

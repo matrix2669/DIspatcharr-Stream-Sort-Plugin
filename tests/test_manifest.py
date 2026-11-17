@@ -8,7 +8,7 @@ def test_plugin_manifest_is_valid_and_matches_version():
     manifest = json.loads((root / "stream_sorter" / "plugin.json").read_text())
     project = tomllib.loads((root / "pyproject.toml").read_text())
     version = (root / "VERSION").read_text().strip()
-    assert manifest["name"] == "Dispatcharr Stream Sort"
+    assert manifest["name"] == "Stream Sort"
     assert version == manifest["version"] == project["project"]["version"]
     assert {a["id"] for a in manifest["actions"]} == {
         "analyze_streams",
